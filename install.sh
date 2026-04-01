@@ -25,9 +25,7 @@ BUILD_DIR=""
 
 # --- Cleanup on exit ---
 cleanup_build() {
-    if [ -n "$BUILD_DIR" ] && [ -d "$BUILD_DIR" ]; then
-        rm -rf "$BUILD_DIR"
-    fi
+    [ -n "$BUILD_DIR" ] && [ -d "$BUILD_DIR" ] && rm -rf "$BUILD_DIR"
 }
 trap cleanup_build EXIT
 
@@ -195,16 +193,13 @@ install_deps() {
     log_info "Dependencies OK"
 }
 
-# --- Extract embedded source files ---
+# --- Write embedded source files using heredocs ---
 extract_source() {
     BUILD_DIR=$(mktemp -d /tmp/app_amd_ws.XXXXXX)
     log_info "Extracting source to $BUILD_DIR"
 
-    # Extract app_amd_ws.c
-    sed -n '/^##APP_AMD_WS_C_BEGIN##$/,/^##APP_AMD_WS_C_END##$/{ /^##/d; p; }' "$0" > "$BUILD_DIR/app_amd_ws.c"
-
-    # Extract Makefile
-    sed -n '/^##MAKEFILE_BEGIN##$/,/^##MAKEFILE_END##$/{ /^##/d; p; }' "$0" > "$BUILD_DIR/Makefile"
+    write_source_file > "$BUILD_DIR/app_amd_ws.c"
+    write_makefile > "$BUILD_DIR/Makefile"
 
     if [ ! -s "$BUILD_DIR/app_amd_ws.c" ] || [ ! -s "$BUILD_DIR/Makefile" ]; then
         log_error "Failed to extract embedded source files"
@@ -228,7 +223,6 @@ build_module() {
         ast_src=$(download_asterisk_source "$ast_version") || exit 1
     fi
 
-    # Determine include path
     if [ -f "$ast_src/asterisk.h" ]; then
         include_path="$ast_src"
     elif [ -f "$ast_src/include/asterisk.h" ]; then
@@ -258,7 +252,6 @@ install_module() {
     local moddir
     moddir=$(find_ast_moddir) || { log_error "Module directory not found"; exit 1; }
 
-    # Unload old module if running
     if pgrep -x asterisk > /dev/null; then
         local use_count=$(asterisk -rx "module show like ${MODULE_NAME}" 2>/dev/null | grep "${MODULE_NAME}" | awk '{print $4}')
         if [ -n "$use_count" ] && [ "$use_count" != "0" ]; then
@@ -332,7 +325,8 @@ main() {
             install_deps
             build_module
             log_info "Module built at $BUILD_DIR/${MODULE_NAME}.so"
-            log_info "Run 'make install' to install manually"
+            # Don't cleanup BUILD_DIR on --build-only so user can access .so
+            BUILD_DIR=""
             ;;
         --help|-h)
             echo "Usage: bash install.sh [--uninstall|--deps-only|--build-only|--help]"
@@ -345,7 +339,6 @@ main() {
             install_deps
             build_module
             install_module
-            # BUILD_DIR cleaned up by trap
             ;;
         *)
             log_error "Unknown option: $1"
@@ -362,7 +355,12 @@ fi
 main "$@"
 exit 0
 
-##APP_AMD_WS_C_BEGIN##
+# ============================================================================
+# Embedded source files (written via heredoc functions - no sed needed)
+# ============================================================================
+
+write_source_file() {
+cat << 'EMBEDDED_C_EOF'
 /*
  * app_amd_ws.c - AMD via WebSocket
  * Sends audio chunks to external AMD server (compatible with amdy.io)
@@ -807,9 +805,11 @@ static int unload_module(void)
 }
 
 AST_MODULE_INFO_STANDARD(ASTERISK_GPL_KEY, "AMD via WebSocket");
-##APP_AMD_WS_C_END##
+EMBEDDED_C_EOF
+}
 
-##MAKEFILE_BEGIN##
+write_makefile() {
+cat << 'EMBEDDED_MK_EOF'
 # Makefile for app_amd_ws - AMD via WebSocket module for Asterisk
 
 STATIC ?= 1
@@ -893,4 +893,5 @@ load:
 	asterisk -rx "module load $(MODULE).so"
 
 .PHONY: all install clean reload unload load
-##MAKEFILE_END##
+EMBEDDED_MK_EOF
+}
