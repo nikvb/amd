@@ -23,7 +23,6 @@
 #define CHUNK_SAMPLES (SAMPLE_RATE * CHUNK_MS / 1000)  /* 4000 samples */
 #define CHUNK_BYTES (CHUNK_SAMPLES * 2)                 /* 8000 bytes */
 #define FRAME_MS 20
-#define FRAMES_PER_CHUNK (CHUNK_MS / FRAME_MS)          /* 25 frames */
 
 #define DEFAULT_WS_PORT 8080
 #define DEFAULT_TIMEOUT_MS 5000
@@ -154,10 +153,9 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
     struct timeval start_time;
     int timeout_ms = DEFAULT_TIMEOUT_MS;
     int total_ms;
-    int elapsed_ms = 0;
+    int elapsed_ms;
     char ws_host[256] = "127.0.0.1";
     int ws_port = DEFAULT_WS_PORT;
-    char ws_path[256] = "/";
     char vid[256] = "";
     char vid_escaped[512];
     char config_json[512];
@@ -272,7 +270,7 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
     conn_info.context = session.context;
     conn_info.address = ws_host;
     conn_info.port = ws_port;
-    conn_info.path = ws_path;
+    conn_info.path = "/";
     conn_info.host = ws_host;
     conn_info.protocol = "amd";
     conn_info.ssl_connection = 0;
@@ -376,25 +374,30 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
     elapsed_ms = ast_tvdiff_ms(ast_tvnow(), start_time);
 
     /* Set channel variables */
-    if (session.got_result) {
-        if (strstr(session.result, "HUMAN")) {
-            pbx_builtin_setvar_helper(chan, "AMDSTATUS", "HUMAN");
-        } else if (strstr(session.result, "MACHINE") || strstr(session.result, "AMD")) {
-            pbx_builtin_setvar_helper(chan, "AMDSTATUS", "MACHINE");
-        } else {
-            pbx_builtin_setvar_helper(chan, "AMDSTATUS", "NOTSURE");
-        }
-        pbx_builtin_setvar_helper(chan, "AMDCAUSE", session.result);
-    } else {
-        pbx_builtin_setvar_helper(chan, "AMDSTATUS", "NOTSURE");
-        pbx_builtin_setvar_helper(chan, "AMDCAUSE", "TIMEOUT");
-    }
+    {
+        const char *status;
+        const char *cause;
 
-    ast_verb(3, "AMD_WS: %s status=%s cause=%s elapsed=%dms\n",
-        ast_channel_name(chan),
-        session.got_result ? session.result : "NOTSURE",
-        session.got_result ? session.result : "TIMEOUT",
-        elapsed_ms);
+        if (session.got_result) {
+            if (strstr(session.result, "HUMAN")) {
+                status = "HUMAN";
+            } else if (strstr(session.result, "MACHINE") || strstr(session.result, "AMD")) {
+                status = "MACHINE";
+            } else {
+                status = "NOTSURE";
+            }
+            cause = session.result;
+        } else {
+            status = "NOTSURE";
+            cause = "TIMEOUT";
+        }
+
+        pbx_builtin_setvar_helper(chan, "AMDSTATUS", status);
+        pbx_builtin_setvar_helper(chan, "AMDCAUSE", cause);
+
+        ast_verb(3, "AMD_WS: %s status=%s cause=%s elapsed=%dms\n",
+            ast_channel_name(chan), status, cause, elapsed_ms);
+    }
 
 cleanup:
     if (session.context) {

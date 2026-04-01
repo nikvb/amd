@@ -6,6 +6,8 @@
 #   make clean              - Remove build artifacts
 #   make reload             - Reload module in Asterisk
 
+STATIC ?= 0
+
 # Auto-detect Asterisk include directory
 # Priority: ASTINCDIR > ASTTOPDIR/include > system headers > source tree
 ifeq ($(ASTINCDIR),)
@@ -41,10 +43,27 @@ CFLAGS += -DAST_MODULE_SELF_SYM=__internal_$(MODULE)_self
 CFLAGS += $(shell pkg-config --cflags libwebsockets 2>/dev/null)
 
 LDFLAGS = -pthread -shared
+
 LIBS = $(shell pkg-config --libs libwebsockets)
 
+ifeq ($(STATIC),1)
+  LWS_STATIC_LIB := $(firstword $(wildcard \
+      /usr/local/lib/libwebsockets.a \
+      /usr/lib64/libwebsockets.a \
+      /usr/lib/libwebsockets.a \
+      /usr/lib/x86_64-linux-gnu/libwebsockets.a))
+  ifneq ($(LWS_STATIC_LIB),)
+    LIBS = -Wl,--whole-archive $(LWS_STATIC_LIB) -Wl,--no-whole-archive -lm
+    $(info Building with STATIC libwebsockets: $(LWS_STATIC_LIB))
+  else
+    $(warning Static libwebsockets.a not found, falling back to dynamic linking)
+  endif
+else
+  $(info Building with DYNAMIC libwebsockets)
+endif
+
 # Asterisk module directory
-ASTMODDIR ?= $(shell if [ -d /usr/lib64/asterisk/modules ]; then echo /usr/lib64/asterisk/modules; else echo /usr/lib/asterisk/modules; fi)
+ASTMODDIR ?= $(firstword $(wildcard /usr/lib64/asterisk/modules /usr/lib/asterisk/modules))
 
 # Targets
 all: $(MODULE).so
