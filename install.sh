@@ -165,7 +165,7 @@ install_deps() {
             zypper ar -f http://download.opensuse.org/update/leap/15.5/oss/ repo-update 2>/dev/null || true
             zypper --gpg-auto-import-keys ref
         fi
-        for pkg in gcc cmake make curl; do
+        for pkg in gcc cmake make curl libmariadb-devel; do
             command -v $pkg > /dev/null 2>&1 || zypper -n install $pkg
         done
         check_static_lws || build_libwebsockets
@@ -175,6 +175,11 @@ install_deps() {
         for pkg in gcc cmake curl make; do
             command -v $pkg > /dev/null 2>&1 || yum install -y $pkg
         done
+        # MySQL/MariaDB dev headers (needed to compile DB lookup)
+        if ! mysql_config --cflags > /dev/null 2>&1 && ! mariadb_config --cflags > /dev/null 2>&1; then
+            yum install -y mariadb-devel 2>/dev/null || yum install -y mysql-devel 2>/dev/null || \
+                log_warn "MySQL dev headers not found - DB lookup will use fallback"
+        fi
         check_static_lws || build_libwebsockets
 
     elif [ -f /etc/debian_version ]; then
@@ -183,6 +188,11 @@ install_deps() {
         for pkg in gcc cmake curl make; do
             command -v $pkg > /dev/null 2>&1 || apt-get install -y $pkg
         done
+        # MySQL/MariaDB dev headers
+        if ! mysql_config --cflags > /dev/null 2>&1 && ! mariadb_config --cflags > /dev/null 2>&1; then
+            apt-get install -y libmariadb-dev 2>/dev/null || apt-get install -y libmysqlclient-dev 2>/dev/null || \
+                log_warn "MySQL dev headers not found - DB lookup will use fallback"
+        fi
         check_static_lws || build_libwebsockets
 
     else
@@ -344,6 +354,7 @@ cat << 'EMBEDDED_C_EOF'
 #undef pthread_cond_t
 
 #include <libwebsockets.h>
+#include <mysql.h>
 
 #define SAMPLE_RATE 8000
 #define CHUNK_MS 500
@@ -357,6 +368,9 @@ cat << 'EMBEDDED_C_EOF'
 #define CONFIG_SEND_TIMEOUT_MS 1000
 #define RESULT_WAIT_ITERATIONS 20
 #define SERVICE_INTERVAL_MS 50
+#define CONFIG_JSON_SIZE 1024
+
+#define ASTGUICLIENT_CONF "/etc/astguiclient.conf"
 
 static const char app[] = "AMD_WS";
 
@@ -368,7 +382,7 @@ struct amd_ws_session {
     struct lws *wsi;
     struct lws_context *context;
     unsigned char audio_buffer[LWS_PRE + CHUNK_BYTES];
-    unsigned char config_buffer[LWS_PRE + 512];
+    unsigned char config_buffer[LWS_PRE + CONFIG_JSON_SIZE];
     int buffer_pos;
     int config_len;
     int frames_collected;
@@ -377,6 +391,118 @@ struct amd_ws_session {
     int connected;
     int config_sent;
 };
+
+/* Parse /etc/astguiclient.conf for VARDB_* credentials */
+struct db_config {
+    char server[256];
+    char database[256];
+    char user[256];
+    char pass[256];
+    int port;
+};
+
+static void parse_astguiclient_conf(struct db_config *cfg)
+{
+    FILE *f;
+    char line[512];
+
+    ast_copy_string(cfg->server,   "localhost", sizeof(cfg->server));
+    ast_copy_string(cfg->database, "asterisk",  sizeof(cfg->database));
+    ast_copy_string(cfg->user,     "cron",      sizeof(cfg->user));
+    cfg->pass[0] = '\0';
+    cfg->port = 3306;
+
+    f = fopen(ASTGUICLIENT_CONF, "r");
+    if (!f)
+        return;
+
+    while (fgets(line, sizeof(line), f)) {
+        char *key, *val, *arrow, *end;
+
+        line[strcspn(line, "\n\r")] = '\0';
+        if (strncmp(line, "VARDB_", 6) != 0)
+            continue;
+        arrow = strstr(line, "=>");
+        if (!arrow)
+            continue;
+        *arrow = '\0';
+        key = line;
+        val = arrow + 2;
+        while (*val == ' ') val++;
+        end = key + strlen(key) - 1;
+        while (end > key && *end == ' ') *end-- = '\0';
+
+        if (!strcmp(key, "VARDB_server"))
+            ast_copy_string(cfg->server, val, sizeof(cfg->server));
+        else if (!strcmp(key, "VARDB_database"))
+            ast_copy_string(cfg->database, val, sizeof(cfg->database));
+        else if (!strcmp(key, "VARDB_user"))
+            ast_copy_string(cfg->user, val, sizeof(cfg->user));
+        else if (!strcmp(key, "VARDB_pass"))
+            ast_copy_string(cfg->pass, val, sizeof(cfg->pass));
+        else if (!strcmp(key, "VARDB_port"))
+            cfg->port = atoi(val);
+    }
+    fclose(f);
+}
+
+/* Query vicidial_auto_calls for phone_number and phone_code by callerid (VID).
+ * Returns 0 on success with phone/phone_code populated, -1 otherwise. */
+static int get_phone_from_db(const char *callerid,
+                              char *phone, size_t phone_size,
+                              char *phone_code, size_t phone_code_size)
+{
+    struct db_config cfg;
+    MYSQL *conn;
+    MYSQL_RES *res;
+    MYSQL_ROW row;
+    char escaped[512];
+    char query[768];
+    unsigned int timeout = 2;
+    int found = 0;
+
+    phone[0] = '\0';
+    phone_code[0] = '\0';
+
+    parse_astguiclient_conf(&cfg);
+
+    conn = mysql_init(NULL);
+    if (!conn)
+        return -1;
+
+    mysql_options(conn, MYSQL_OPT_CONNECT_TIMEOUT, &timeout);
+
+    if (!mysql_real_connect(conn, cfg.server, cfg.user, cfg.pass,
+                            cfg.database, cfg.port, NULL, 0)) {
+        ast_log(LOG_DEBUG, "AMD_WS: DB connect failed: %s\n", mysql_error(conn));
+        mysql_close(conn);
+        return -1;
+    }
+
+    mysql_real_escape_string(conn, escaped, callerid, strlen(callerid));
+    snprintf(query, sizeof(query),
+        "SELECT phone_code,phone_number FROM vicidial_auto_calls"
+        " WHERE callerid='%s' ORDER BY auto_call_id DESC LIMIT 1",
+        escaped);
+
+    if (!mysql_query(conn, query)) {
+        res = mysql_store_result(conn);
+        if (res) {
+            row = mysql_fetch_row(res);
+            if (row) {
+                if (row[0]) ast_copy_string(phone_code, row[0], phone_code_size);
+                if (row[1]) ast_copy_string(phone,      row[1], phone_size);
+                found = 1;
+            }
+            mysql_free_result(res);
+        }
+    } else {
+        ast_log(LOG_DEBUG, "AMD_WS: DB query failed: %s\n", mysql_error(conn));
+    }
+
+    mysql_close(conn);
+    return found ? 0 : -1;
+}
 
 /* Escape a string for safe JSON embedding. Writes to dst (including NUL).
  * Returns number of chars written (excluding NUL), or -1 if dst_size too small. */
@@ -485,7 +611,11 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
     int ws_port = DEFAULT_WS_PORT;
     char vid[256] = "";
     char vid_escaped[512];
-    char config_json[512];
+    char phone[64] = "";
+    char phone_code[16] = "";
+    char phone_escaped[128];
+    char phone_code_escaped[32];
+    char config_json[CONFIG_JSON_SIZE];
     int i;
     int format_changed = 0;
 
@@ -540,16 +670,33 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
         ast_channel_unlock(chan);
     }
 
-    ast_verb(3, "AMD_WS: %s host=%s port=%d vid=%s timeout=%d\n",
-        ast_channel_name(chan), ws_host, ws_port, vid, timeout_ms);
-
-    /* Build JSON config with escaped VID */
-    if (json_escape(vid_escaped, sizeof(vid_escaped), vid) < 0) {
-        ast_copy_string(vid_escaped, "Unknown", sizeof(vid_escaped));
+    /* DB lookup: phone_number and phone_code by VID (callerid) */
+    if (get_phone_from_db(vid, phone, sizeof(phone), phone_code, sizeof(phone_code)) == 0) {
+        ast_verb(3, "AMD_WS: DB found phone=%s code=%s\n", phone, phone_code);
+    } else {
+        ast_verb(3, "AMD_WS: DB lookup failed for VID=%s, continuing without phone\n", vid);
     }
-    snprintf(config_json, sizeof(config_json),
-        "{\"config\":{\"sample_rate\":%d,\"VID\":\"%s\"}}",
-        SAMPLE_RATE, vid_escaped);
+
+    ast_verb(3, "AMD_WS: %s host=%s port=%d vid=%s phone=%s timeout=%d\n",
+        ast_channel_name(chan), ws_host, ws_port, vid, phone, timeout_ms);
+
+    /* Build JSON config */
+    if (json_escape(vid_escaped, sizeof(vid_escaped), vid) < 0)
+        ast_copy_string(vid_escaped, "Unknown", sizeof(vid_escaped));
+
+    if (!ast_strlen_zero(phone)) {
+        if (json_escape(phone_escaped, sizeof(phone_escaped), phone) < 0)
+            phone_escaped[0] = '\0';
+        if (json_escape(phone_code_escaped, sizeof(phone_code_escaped), phone_code) < 0)
+            phone_code_escaped[0] = '\0';
+        snprintf(config_json, sizeof(config_json),
+            "{\"config\":{\"sample_rate\":%d,\"VID\":\"%s\",\"phone\":\"%s\",\"country_code\":\"%s\"}}",
+            SAMPLE_RATE, vid_escaped, phone_escaped, phone_code_escaped);
+    } else {
+        snprintf(config_json, sizeof(config_json),
+            "{\"config\":{\"sample_rate\":%d,\"VID\":\"%s\"}}",
+            SAMPLE_RATE, vid_escaped);
+    }
 
     session.config_len = strlen(config_json);
     memcpy(&session.config_buffer[LWS_PRE], config_json, session.config_len);
@@ -775,14 +922,24 @@ EMBEDDED_C_EOF
 write_makefile() {
 cat << 'EMBEDDED_MK_EOF'
 # Makefile for app_amd_ws - AMD via WebSocket module for Asterisk
+#
+# Usage:
+#   make                    - Build the module
+#   make install            - Install to Asterisk modules directory
+#   make clean              - Remove build artifacts
+#   make reload             - Reload module in Asterisk
 
 STATIC ?= 1
 
+# Auto-detect Asterisk include directory
+# Priority: ASTINCDIR > ASTTOPDIR/include > system headers > source tree
 ifeq ($(ASTINCDIR),)
   ifeq ($(ASTTOPDIR),)
+    # Check for system headers first (asterisk-dev package)
     ifneq ($(wildcard /usr/include/asterisk.h),)
       ASTINCDIR = /usr/include
     else
+      # Try to find source tree
       ASTTOPDIR := $(shell ls -d /usr/src/asterisk-* /usr/src/asterisk/asterisk-* 2>/dev/null | head -1)
       ifneq ($(ASTTOPDIR),)
         ASTINCDIR = $(ASTTOPDIR)/include
@@ -797,18 +954,22 @@ ifeq ($(ASTINCDIR),)
 $(error Cannot find Asterisk headers. Install asterisk-dev or set ASTINCDIR=/path/to/include)
 endif
 
+# Module name
 MODULE = app_amd_ws
 
+# Compiler settings
 CC = gcc
 CFLAGS = -pthread -O3 -fPIC -std=gnu99
 CFLAGS += -I$(ASTINCDIR)
 CFLAGS += -DAST_MODULE=\"$(MODULE)\"
 CFLAGS += -DAST_MODULE_SELF_SYM=__internal_$(MODULE)_self
 CFLAGS += $(shell pkg-config --cflags libwebsockets 2>/dev/null)
+CFLAGS += $(shell mysql_config --cflags 2>/dev/null || mariadb_config --cflags 2>/dev/null)
 
 LDFLAGS = -pthread -shared
 
 LIBS = $(shell pkg-config --libs libwebsockets)
+LIBS += $(shell mysql_config --libs_r 2>/dev/null || mariadb_config --libs 2>/dev/null || echo -lmysqlclient)
 
 ifeq ($(STATIC),1)
   LWS_STATIC_LIB := $(firstword $(wildcard \
@@ -826,8 +987,10 @@ else
   $(info Building with DYNAMIC libwebsockets)
 endif
 
+# Asterisk module directory
 ASTMODDIR ?= $(firstword $(wildcard /usr/lib64/asterisk/modules /usr/lib/asterisk/modules))
 
+# Targets
 all: $(MODULE).so
 
 $(MODULE).o: $(MODULE).c

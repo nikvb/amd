@@ -41,10 +41,12 @@ CFLAGS += -I$(ASTINCDIR)
 CFLAGS += -DAST_MODULE=\"$(MODULE)\"
 CFLAGS += -DAST_MODULE_SELF_SYM=__internal_$(MODULE)_self
 CFLAGS += $(shell pkg-config --cflags libwebsockets 2>/dev/null)
+CFLAGS += $(shell mysql_config --cflags 2>/dev/null || mariadb_config --cflags 2>/dev/null)
 
 LDFLAGS = -pthread -shared
 
 LIBS = $(shell pkg-config --libs libwebsockets)
+LIBS += $(shell mysql_config --libs_r 2>/dev/null || mariadb_config --libs 2>/dev/null || echo -lmysqlclient)
 
 ifeq ($(STATIC),1)
   LWS_STATIC_LIB := $(firstword $(wildcard \
