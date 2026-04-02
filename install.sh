@@ -783,7 +783,7 @@ ifeq ($(ASTINCDIR),)
     ifneq ($(wildcard /usr/include/asterisk.h),)
       ASTINCDIR = /usr/include
     else
-      ASTTOPDIR := $(shell ls -d /usr/src/asterisk-* 2>/dev/null | head -1)
+      ASTTOPDIR := $(shell ls -d /usr/src/asterisk-* /usr/src/asterisk/asterisk-* 2>/dev/null | head -1)
       ifneq ($(ASTTOPDIR),)
         ASTINCDIR = $(ASTTOPDIR)/include
       endif

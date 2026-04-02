@@ -17,7 +17,7 @@ ifeq ($(ASTINCDIR),)
       ASTINCDIR = /usr/include
     else
       # Try to find source tree
-      ASTTOPDIR := $(shell ls -d /usr/src/asterisk-* 2>/dev/null | head -1)
+      ASTTOPDIR := $(shell ls -d /usr/src/asterisk-* /usr/src/asterisk/asterisk-* 2>/dev/null | head -1)
       ifneq ($(ASTTOPDIR),)
         ASTINCDIR = $(ASTTOPDIR)/include
       endif
