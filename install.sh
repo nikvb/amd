@@ -53,11 +53,11 @@ find_ast_headers() {
         echo "/usr/include"
         return 0
     fi
-    for src in /usr/src/asterisk-${ast_version}*/; do
+    for src in /usr/src/asterisk-${ast_version}*/ /usr/src/asterisk/asterisk-${ast_version}*/; do
         [ -f "${src}include/asterisk.h" ] && echo "${src%/}" && return 0
     done
     if [ "$ast_base" != "$ast_version" ]; then
-        for src in /usr/src/asterisk-${ast_base}*/; do
+        for src in /usr/src/asterisk-${ast_base}*/ /usr/src/asterisk/asterisk-${ast_base}*/; do
             [ -f "${src}include/asterisk.h" ] && echo "${src%/}" && return 0
         done
     fi
