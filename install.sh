@@ -4,7 +4,7 @@
 # AMD (Answering Machine Detection) via WebSocket for Asterisk
 #
 # One-liner:
-#   curl -sf https://raw.githubusercontent.com/nikvb/app_amd_ws/main/install.sh | bash
+#   curl -sfL https://github.com/nikvb/amd/raw/main/install.sh | sudo bash
 #
 # Usage: bash install.sh [--uninstall|--deps-only|--build-only|--help]
 #
@@ -873,7 +873,7 @@ main() {
             echo "Usage: bash install.sh [--uninstall|--deps-only|--build-only|--help]"
             echo ""
             echo "One-liner install:"
-            echo "  curl -sf https://raw.githubusercontent.com/nikvb/app_amd_ws/main/install.sh | bash"
+            echo "  curl -sfL https://github.com/nikvb/amd/raw/main/install.sh | sudo bash"
             ;;
         "")
             extract_source
