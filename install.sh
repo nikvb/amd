@@ -309,54 +309,8 @@ uninstall_module() {
     log_info "Uninstall complete"
 }
 
-# --- Main ---
-main() {
-    log_info "=== app_amd_ws installer ==="
-
-    case "${1:-}" in
-        --uninstall)
-            uninstall_module
-            ;;
-        --deps-only)
-            install_deps
-            ;;
-        --build-only)
-            extract_source
-            install_deps
-            build_module
-            log_info "Module built at $BUILD_DIR/${MODULE_NAME}.so"
-            # Don't cleanup BUILD_DIR on --build-only so user can access .so
-            BUILD_DIR=""
-            ;;
-        --help|-h)
-            echo "Usage: bash install.sh [--uninstall|--deps-only|--build-only|--help]"
-            echo ""
-            echo "One-liner install:"
-            echo "  curl -sf https://raw.githubusercontent.com/nikvb/app_amd_ws/main/install.sh | bash"
-            ;;
-        "")
-            extract_source
-            install_deps
-            build_module
-            install_module
-            ;;
-        *)
-            log_error "Unknown option: $1"
-            exit 1
-            ;;
-    esac
-}
-
-if [ "$(id -u)" != "0" ]; then
-    log_error "Must run as root"
-    exit 1
-fi
-
-main "$@"
-exit 0
-
 # ============================================================================
-# Embedded source files (written via heredoc functions - no sed needed)
+# Embedded source files (written via heredoc functions)
 # ============================================================================
 
 write_source_file() {
@@ -895,3 +849,48 @@ load:
 .PHONY: all install clean reload unload load
 EMBEDDED_MK_EOF
 }
+
+# --- Main ---
+main() {
+    log_info "=== app_amd_ws installer ==="
+
+    case "${1:-}" in
+        --uninstall)
+            uninstall_module
+            ;;
+        --deps-only)
+            install_deps
+            ;;
+        --build-only)
+            extract_source
+            install_deps
+            build_module
+            log_info "Module built at $BUILD_DIR/${MODULE_NAME}.so"
+            # Don't cleanup BUILD_DIR on --build-only so user can access .so
+            BUILD_DIR=""
+            ;;
+        --help|-h)
+            echo "Usage: bash install.sh [--uninstall|--deps-only|--build-only|--help]"
+            echo ""
+            echo "One-liner install:"
+            echo "  curl -sf https://raw.githubusercontent.com/nikvb/app_amd_ws/main/install.sh | bash"
+            ;;
+        "")
+            extract_source
+            install_deps
+            build_module
+            install_module
+            ;;
+        *)
+            log_error "Unknown option: $1"
+            exit 1
+            ;;
+    esac
+}
+
+if [ "$(id -u)" != "0" ]; then
+    log_error "Must run as root"
+    exit 1
+fi
+
+main "$@"
