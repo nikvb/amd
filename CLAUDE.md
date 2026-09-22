@@ -7,9 +7,10 @@ Guidance for Claude Code (claude.ai/code) when working in this repository.
 `app_amd_ws` is a single-file Asterisk dialplan application module,
 `AMD_WS()`, that streams the first seconds of an answered call to the amdy.io
 Answering Machine Detection service over WebSocket and sets `AMDSTATUS` /
-`AMDCAUSE` (plus `AMDRESPONSE`, `AMDELAPSED`) for ViciDial's extension 8370.
-Version 2 uses Asterisk's own `res_http_websocket` client (no libwebsockets),
-bounded waits everywhere, token-based result classification, optional
+`AMDCAUSE` / `AMDSTATS` (plus `AMDRESPONSE`, `AMDELAPSED`) for ViciDial's
+extension 8370 and `VD_amd.agi`. Version 2 uses Asterisk's own
+`res_http_websocket` client (no libwebsockets), bounded waits everywhere,
+the production `amd.py` (July 2026) protocol and vocabulary, optional
 parallel playback and an optional MySQL lookup of phone/country from
 `vicidial_auto_calls`.
 
@@ -22,8 +23,12 @@ developer. Precise commands, tables, no marketing.
   configuration), `docs/protocol.md` (wire protocol), `docs/architecture.md`.
 - Build/headers: `docs/build-and-headers.md`. Installer: `docs/installer.md`.
 - Reference implementations of the protocol: the production EAGI client
-  `amd.py` (wire behaviour to match) — the 1.x module's lws loop is **not** a
-  reference; its failure modes are listed in `docs/architecture.md`.
+  `amd.py` as shipped in July 2026 (`gw.724care.com/amdy.tar.gz`) — wire
+  behaviour and status/cause vocabulary to match; stock `apps/app_amd.c`
+  and ViciDial's `VD_amd.agi` for the two ViciDial-facing values (`HANGUP`,
+  `NOAUDIODATA-<ms>`) and the `AMDSTATS` shape. The 1.x module's lws loop is
+  **not** a reference; its failure modes are listed in
+  `docs/architecture.md`.
 - Tests are the executable spec: `test/run.sh`, `test/README.md`,
   `docs/testing.md`.
 
@@ -85,11 +90,15 @@ Installer checks without touching the system: `./install.sh --dry-run`,
    `ast_websocket_client_create_with_options` with `.timeout =
    connect_timeout_ms`; per-host cap `max_pending_connects`), main loop on
    `ast_waitfor_nandfds(chan, ws fd, <= 20 ms)` from the first iteration,
-   config TEXT once the helper hands the socket over, heap accumulator,
-   schedule sends, `ast_websocket_read` with fragment reassembly and a
-   bounded drain of already-buffered frames, token classifier, playback
-   start/stop, result grace, uniform exit path (`{"eof":1}`, close 1000,
-   unref, restore format, set 4 variables, verbose-3 summary, counters).
+   config TEXT (`sample_rate`, `VID`, `phone`, `country_code`, `caller_id`)
+   once the helper hands the socket over, heap accumulator, schedule sends
+   (11 marks, then `chunk_bytes` / `fallback_interval_ms`), empty-mark
+   streak → EOF finalisation (`{"eof":1}`, one reply within `eof_wait_ms`),
+   `ast_websocket_read` with fragment reassembly and a bounded drain of
+   already-buffered frames, `amd.py` substring classifier with the `AMDY`
+   guard, playback start/stop, result grace (default 0), uniform exit path
+   (`{"eof":1}`, close 1000, unref, restore format, set 5 variables,
+   verbose-3 summary, counters).
 4. CLI `amd_ws show settings`; counters via `ast_atomic_fetchadd_int`;
    `connects in flight` (atomic) and `parked connects` per host under
    `pending_lock`.
@@ -103,17 +112,23 @@ Installer checks without touching the system: `./install.sh --dry-run`,
 ## Frozen contracts (do not change without a CHANGELOG + migration note)
 
 - `AMD_WS([host[,port[,vid[,timeout_ms[,playfile[,options]]]]]])`; options
-  `n s d(ms) c(ms) p(phone) k(code) a A`.
-- `AMDSTATUS` ∈ {`HUMAN`, `MACHINE`, `NOTSURE`, `HANGUP`, server token
-  uppercased}; `AMDCAUSE` ∈ {token, `INTERR`, `NETERR`, `AUDIO_TIMEOUT`,
-  `NO_AUDIO_TIMEOUT`, `HANGUP`}. The ViciDial fallback
-  `GotoIf($["${AMDCAUSE}"="NETERR" | "${AMDCAUSE}"="INTERR"]?amd_fallback)`
-  must keep working.
-- Wire: config frame `{"config":{"sample_rate":8000,"VID":"..."[,"phone":..][,"country_code":..]}}`,
-  binary slin chunks on `send_schedule` then every `chunk_bytes`, `{"eof":1}`,
-  CLOSE 1000. Classification: first terminal token (`HUMAN`; `MACHINE`/`AMD`;
-  `extra_statuses`) after splitting on non-`[A-Za-z0-9_]`; JSON
-  `status`/`result`/`classification` value only.
+  `n s d(ms) c(ms) p(phone) k(code) i(cid) a A`.
+- `AMDSTATUS` ∈ {`HUMAN`, `MACHINE`, `NOTSURE`, `HANGUP`}; `AMDCAUSE` ∈
+  {`HUMAN`, reply text (machine), `CONNECTION_ERROR`, `PROCESSING_ERROR`,
+  `FATAL_ERROR` (all three with `AMDSTATUS=HUMAN`), `SERVER_TIMEOUT`,
+  `NOAUDIODATA-<ms>`, `EOF_INCONCLUSIVE`, `EOF_ERROR` (with `NOTSURE`),
+  `HANGUP`}; `AMDSTATS=<elapsed_ms>-<audio_ms_sent>-<chunks_sent>-<bytes_sent>`
+  on every exit. The ViciDial fallback
+  `GotoIf($["${AMDCAUSE}" = "CONNECTION_ERROR" | "${AMDCAUSE}" = "PROCESSING_ERROR" | "${AMDCAUSE}" = "FATAL_ERROR"]?amd_fallback:continue)`
+  must keep working. Full table with sources: README "Channel variables".
+- Wire: config frame `{"config":{"sample_rate":8000,"VID":"..."[,"phone":..][,"country_code":..][,"caller_id":..]}}`
+  (keys in this order), binary slin chunks at `send_schedule`
+  (`500,...,9000`) then every `chunk_bytes` or `fallback_interval_ms`, EOF
+  finalisation after `eof_no_audio_streak` empty marks, `{"eof":1}`, CLOSE
+  1000. Classification exactly as `amd.py`: `'HUMAN' in text` → HUMAN, else
+  `'AMD' in text or 'MACHINE' in text` → MACHINE (cause = text), else ack;
+  case-sensitive substring; the one guard is that `AMD` followed by `Y` does
+  not count. No extra-status list, no token parser.
 - Return value 0 always. Two verbose-3 lines per call:
   `AMD_WS: <chan> vid=<vid> host=<h>:<p> play=<file|none>` and
   `AMD_WS: <chan> status=<S> cause=<C> elapsed=<ms> sent=<bytes> chunks=<n>`.
@@ -126,14 +141,18 @@ Installer checks without touching the system: `./install.sh --dry-run`,
 - Never drop or truncate audio. Per-call stack < 32 KB.
 - Never log credentials; no phone numbers at normal verbosity.
 - Do not version-gate on `ASTERISK_VERSION_NUM` (not in the headers); rely on
-  OPTIONAL_API stubs returning NULL → `INTERR` with a clear log line.
+  OPTIONAL_API stubs returning NULL → `HUMAN`/`CONNECTION_ERROR` with a clear
+  log line.
 - Do not edit `install.sh`; regenerate it. Do not add package repositories or
   upgrade Asterisk in the installer. Never hang up channels to unload.
 - Never install headers or modules into the system on the development box as
   part of a test; `test/run.sh` uses a scratch run directory and a module
   directory of symlinks.
 - Documentation must trace to actual behaviour; where something is open,
-  point to `amd_ws.conf.sample` rather than inventing a default.
+  point to `amd_ws.conf.sample` rather than inventing a default. Status and
+  cause words are frozen; the words of earlier branch builds may appear only
+  in the "was" columns of `docs/migration-v1-to-v2.md` (grep the docs for
+  them before committing).
 - When a change touches behaviour: update `README.md`, the relevant `docs/`
   page, `CHANGELOG.md`, add a scenario to `test/run.sh`, and run
   `make installer`.
