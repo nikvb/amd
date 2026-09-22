@@ -77,8 +77,9 @@ All flags, exit codes and the header-resolution order are in
 ```bash
 git clone https://github.com/nikvb/amd.git && cd amd
 make show-config     # what Asterisk, version, headers and MySQL client were detected
-make                 # builds app_amd_ws.so against the detected headers
-make check           # post-link gates: no unresolved symbols, correct build-option sum
+make                 # builds app_amd_ws.so against the detected headers; the gates run here:
+                     #   no unresolved symbols Asterisk cannot provide, correct build-option sum
+make check           # the build plus a compile-only matrix against header bundles under ./bundles
 sudo make install    # backs up the old .so, installs into the module directory
 sudo make load       # or: make reload (unload + load, refused by Asterisk while a call is inside AMD_WS)
 ```
@@ -119,7 +120,7 @@ AMD_WS([host[,port[,vid[,timeout_ms[,playfile[,options]]]]]])
 |---|---|
 | `n` | No DB lookup for this call (phone/country are not sent unless given with `p()`/`k()`). |
 | `s` | TLS: connect with `wss://` (needs Asterisk built with TLS; certificate verification per `tls_verify`). |
-| `d(ms)` | Start playback `ms` milliseconds after detection starts (overrides `playdelay_ms`). |
+| `d(ms)` | Start playback `ms` milliseconds after the application starts (overrides `playdelay_ms`). |
 | `c(ms)` | Connect timeout in milliseconds (overrides `connect_timeout_ms`, default 2000). |
 | `p(phone)` | Send this phone number as `phone` (skips the DB lookup for the phone). |
 | `k(code)` | Send this country/phone code as `country_code`. |
@@ -138,7 +139,7 @@ Set on every exit path:
 | `AMDSTATUS` | `HUMAN`, `MACHINE`, `NOTSURE`, `HANGUP`, or any other classification the server returned, uppercased (`HONEYPOT`, `FAS`, `FASAMD`, `AUDIO`). |
 | `AMDCAUSE` | The classification token on a result (`HUMAN`, `MACHINE`, `HONEYPOT`, ...), otherwise one of `INTERR`, `NETERR`, `AUDIO_TIMEOUT`, `NO_AUDIO_TIMEOUT`, `HANGUP`. |
 | `AMDRESPONSE` | Raw last text the server sent, sanitised to printable ASCII, at most 255 characters. New in 2.0.0. |
-| `AMDELAPSED` | Milliseconds from the first captured audio frame to exit. New in 2.0.0. |
+| `AMDELAPSED` | Milliseconds from the first captured audio frame to exit (from the application start when no audio was ever captured). New in 2.0.0. |
 
 Status/cause matrix:
 
@@ -175,7 +176,7 @@ exten => 8370,n,AGI(agi-VDAD_ALL_outbound.agi,NORMAL-----LB-----${CONNECTEDLINE(
 ```
 
 Parallel-playback variant (plays `/var/lib/asterisk/sounds/amdy/insert.wav`
-into the call 2 s after detection starts, while audio keeps streaming to the
+into the call 2 s after AMD_WS starts, while audio keeps streaming to the
 AMD service):
 
 ```text
@@ -232,6 +233,7 @@ port=2700
 tls=no
 tls_verify=yes
 tls_cafile=
+tls_check_hostname=no
 timeout_ms=10000
 connect_timeout_ms=2000
 result_grace_ms=1000
@@ -250,14 +252,15 @@ astguiclient_conf=/etc/astguiclient.conf
 | `port` | `2700` | Default TCP port. |
 | `tls` | `no` | `yes` connects with `wss://` for every call (same as option `s`). |
 | `tls_verify` | `yes` | Verify the server certificate when TLS is used. |
-| `tls_cafile` | empty | CA file used to verify the server certificate when TLS is on; see `amd_ws.conf.sample`. |
+| `tls_cafile` | empty | CA bundle used to verify the server certificate when TLS is on. Empty = the first existing system bundle (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem`), else the directory `/etc/ssl/certs`. |
+| `tls_check_hostname` | `no` | Also require the certificate's CN/subjectAltName to match `host`. Keep `no` on Asterisk 16 (its WebSocket client does not hand the hostname to the check, so every `wss://` connect would fail with `did not match ()`); works on 18+. |
 | `timeout_ms` | `10000` | Default detection window. |
 | `connect_timeout_ms` | `2000` | WebSocket connect (DNS + TCP + handshake) timeout. |
 | `result_grace_ms` | `1000` | After `timeout_ms` with no result, the remaining audio is sent and the module waits this long for a reply (still detecting hangup). |
 | `send_schedule` | `500,1000,1500,2000,3000,4000` | Milliseconds from the first captured frame at which everything accumulated so far is sent. A single value such as `500` means plain fixed-interval chunks. |
 | `chunk_bytes` | `8000` | After the last schedule mark, send whenever this many bytes have accumulated (8000 B = 500 ms of 8 kHz 16-bit audio). |
 | `extra_statuses` | `HONEYPOT,FAS,FASAMD,AUDIO,NOTSURE` | Server statuses other than `HUMAN`/`MACHINE`/`AMD` that end detection and are passed through verbatim. |
-| `playdelay_ms` | `0` | Delay before `playfile` starts. |
+| `playdelay_ms` | `0` | Delay from the application start before `playfile` starts. |
 | `db` | `yes` | Enable the ViciDial phone/country lookup (only when compiled with MySQL support). |
 | `db_timeout_ms` | `1000` | Connect/read/write timeout for the lookup (rounded up to whole seconds, minimum 1). |
 | `astguiclient_conf` | `/etc/astguiclient.conf` | Where to read `VARDB_*` credentials. |
@@ -282,7 +285,9 @@ the detection window without blinding detection:
 ## TLS
 
 Option `s` or `tls=yes` connects with `wss://` using Asterisk's own TLS support;
-`tls_verify` and `tls_cafile` control certificate verification. Use TLS only
+`tls_verify`, `tls_cafile` and `tls_check_hostname` control certificate
+verification (chain verification works on every supported Asterisk; hostname
+matching only on 18+, see the table above). Use TLS only
 against an endpoint that offers it; the production endpoint documented for the
 amdy.io service is plain `ws://api.amdy.io:2700`. If Asterisk was built
 without TLS, a `wss://` connection cannot be made; the call ends `NOTSURE`

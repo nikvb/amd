@@ -13,69 +13,102 @@ dialplan: AMD_WS(host,port,vid,timeout_ms,playfile,options)
    v
 [1] parse arguments + options, apply amd_ws.conf defaults
    |  invalid port -> warning + default; timeout <= 0 -> default; vid empty -> CALLERID(name) or "Unknown"
+   |  verbose(3): AMD_WS: <chan> vid=... host=...:... play=...
    v
 [2] answer the channel if not up          (default; option A: do not answer -> INTERR if not up)
    |
    v
-[3] phone/country lookup (optional)        skipped with db=no, option n, or p()/k()
-   |  one persistent MySQL connection under a module mutex, bounded by db_timeout_ms,
-   |  fails soft -> continue without phone
+[3] set channel read format to slin (8 kHz 16-bit mono); remember the old format
+   |  allocate the heap accumulator (sized for connect_timeout + largest schedule gap + 2 frames)
    v
-[4] set channel read format to slin (8 kHz 16-bit mono); remember the old format
-   |
+[4] start the WebSocket connect on a helper thread
+   |  ast_websocket_client_create_with_options(.timeout = connect_timeout_ms) blocks for
+   |  DNS + TCP + HTTP upgrade, so it never runs on the PBX thread (see "Threading model")
+   |  more than 64 connects already pending -> fail fast, NETERR
    v
-[5] WebSocket connect  ast_websocket_client_create_with_options(.timeout = connect_timeout_ms)
-   |  failure / timeout -> NETERR;  res_http_websocket missing -> INTERR
+[5] phone/country lookup (optional), on the PBX thread while the connect is in flight
+   |  skipped with db=no, option n, or p()/k(); one persistent MySQL connection under a
+   |  module mutex, bounded by db_timeout_ms, fails soft -> continue without phone
    v
-[6] send TEXT {"config":{...}}
-   |
-   v
-[7] main loop  (until result | timeout_ms | hangup | ws closed)
+[6] main loop  (until result | timeout_ms | hangup | ws closed)
    |   ast_waitfor_nandfds(channel, ws fd, <= 20 ms)
    |   channel readable  -> ast_read(); NULL or ast_check_hangup -> HANGUP
    |                        voice frame -> append to heap accumulator (never dropped)
-   |                        first frame starts the clock (t = 0) and, after playdelay_ms, the playfile
-   |   schedule mark hit  -> send everything accumulated as one BINARY frame
-   |   after last mark    -> send when >= chunk_bytes accumulated
+   |                        first frame starts the clock (t = 0 for the schedule and AMDELAPSED)
+   |   CONNECT phase      -> poll the helper: connected -> send TEXT {"config":{...}}, flush what
+   |                        was captured meanwhile (all due marks at once); failed -> NETERR;
+   |                        res_http_websocket missing -> INTERR; connect_timeout_ms or the
+   |                        detection window over -> abandon the job (the helper closes a late
+   |                        socket), NETERR
+   |   STREAM phase       -> schedule mark hit: send everything accumulated as one BINARY frame
+   |                        after the last mark: send when >= chunk_bytes accumulated
    |   ws fd readable     -> ast_websocket_read(); reassemble fragments; TEXT -> classify tokens
-   |                        CLOSE -> NETERR (if no result yet)
+   |                        CLOSE / error -> NETERR (if no result yet)
+   |   playback           -> after playdelay_ms (from application start) start the playfile list;
+   |                        end of a file starts the next one; end of the list changes nothing
    v
-[8] result grace (only after timeout_ms without result): send remaining audio,
+[7] result grace (only after timeout_ms without result): send remaining audio,
    |  wait <= result_grace_ms for a TEXT reply, still servicing the channel
+   |  (no audio ever captured -> NO_AUDIO_TIMEOUT immediately, no grace)
    v
-[9] exit path (always the same, whatever the reason)
+[8] exit path (always the same, whatever the reason)
       stop playback (ast_stopstream)
+      abandon a still-pending connect job
       TEXT {"eof":1} best effort, ast_websocket_close(ws, 1000), unref
       restore the channel read format
       set AMDSTATUS, AMDCAUSE, AMDRESPONSE, AMDELAPSED
-      verbose(3) summary line, counters++
+      verbose(3): AMD_WS: <chan> status=... cause=... elapsed=... sent=... chunks=...; counters++
       return 0
 ```
 
-Every wait in [5], [7] and [8] is bounded by a deadline computed with
+Every wait in [6] and [7] is bounded by a deadline computed with
 `ast_tvdiff_ms`; there are no fixed sleeps and no loops that count iterations
-instead of time. The channel is serviced during connect-wait and result-wait
-wherever the API allows, so a hangup is noticed within one iteration.
+instead of time. The channel is read in every phase, including while the
+connect is still pending, so a hangup is noticed within one iteration and the
+Local channel's frame queue never overflows.
+
+Clocks: the send schedule and `AMDELAPSED` start at the first captured voice
+frame; the detection deadline is that instant (or the application start while
+no audio has arrived) plus `timeout_ms`; the connect deadline is the
+application start plus `connect_timeout_ms`, capped by the detection deadline
+(a detection window that expires while still connecting ends in `NETERR`, so
+the dialplan fallback applies); `playdelay_ms` counts from the application
+start.
 
 ## Threading model
 
-- **No threads of its own.** Everything runs on the channel's PBX thread, like
-  every other dialplan application. One `AMD_WS()` invocation = one call = one
-  WebSocket connection.
+- **The PBX thread does all the work on the channel.** Reading audio, sending
+  chunks, reading replies, playback and every timeout run on the channel's PBX
+  thread, like every other dialplan application. One `AMD_WS()` invocation =
+  one call = one WebSocket connection.
+- **One short-lived helper thread per connect.** `ast_websocket_client_create_with_options()`
+  is blocking: only its TCP connect honours `.timeout`; the DNS lookup and the
+  HTTP upgrade have no timeout, so a server that accepts TCP and never answers
+  would block the caller for as long as the peer likes. The connect therefore
+  runs on a detached helper thread (`ast_pthread_create_detached_background`)
+  that holds a module reference; the PBX thread polls a reference-counted job
+  while it services the channel, and abandons the job at its deadline. A late
+  socket is closed by the helper. At most 64 helpers may be in flight
+  (`amd_ws show settings` prints `connects in flight`); beyond that a call
+  fails fast with `NETERR`. Running the connect on the PBX thread is not an
+  option even as a fallback: the core's TCP/TLS client marks the calling
+  thread with `ast_thread_inhibit_escalations()`, which would break a later
+  `System()` in the same dialplan.
 - **Per-call state** lives in a stack struct plus a heap-allocated audio
-  accumulator (sized for the largest schedule gap + 2 frames). Per-call stack
-  usage stays under 32 KB.
-- **Shared state** is limited to counters (`ast_atomic_fetchadd_int`) and the
-  single MySQL connection (module mutex, `AST_MUTEX_DEFINE_STATIC`). Nothing
-  else is global; 25 concurrent calls are part of the test matrix.
+  accumulator and receive buffer. Per-call stack usage stays under 32 KB.
+- **Shared state** is limited to counters (`ast_atomic_fetchadd_int`), the
+  pending-connect count and the single MySQL connection (module mutex,
+  `AST_MUTEX_DEFINE_STATIC`). Nothing else is global; 25 concurrent calls and
+  a 300-call soak (no fd growth, RSS flat) are part of the test matrix.
 - **Module lifecycle.** `load_module` reads `amd_ws.conf` and
   `astguiclient.conf`, initialises the MySQL client library once, registers the
   application and the CLI command, and returns `AST_MODULE_LOAD_DECLINE` on any
   failure (never `FAILURE`, which would abort Asterisk startup).
   `module reload app_amd_ws.so` re-reads both files. Unload relies on the
   core's use count (`pbx_exec` holds a module reference for the duration of
-  each call), so `module unload` is refused while any call is inside `AMD_WS()`
-  and nothing is ever hung up to make room for an upgrade. The module declares
+  each call, a pending connect helper holds another), so `module unload` is
+  refused while any call is inside `AMD_WS()` and nothing is ever hung up to
+  make room for an upgrade. The module declares
   `.requires = "res_http_websocket"` and `AST_MODULE_SUPPORT_EXTENDED`.
 
 ## Why `res_http_websocket`
@@ -87,7 +120,7 @@ is loaded. What it gives the module:
 
 | Need | `res_http_websocket` |
 |---|---|
-| Connect with a real timeout | `ast_websocket_client_create_with_options()` with `.timeout` in ms (present in 16.30.1, 18, 20) |
+| Connect with a real timeout | `ast_websocket_client_create_with_options()` with `.timeout` in ms (present in 16.30.1, 18, 20) bounds the TCP connect; DNS and the HTTP upgrade are bounded by the module's helper-thread deadline |
 | Wait on channel **and** socket together | `ast_websocket_fd()` plugs into `ast_waitfor_nandfds()`; the same pattern `res_agi` and `app_externalivr` use |
 | Non-blocking reads, fragment handling | `ast_websocket_read()` reports opcode and fragmentation |
 | TLS | `wss://` through Asterisk's own TLS configuration; no extra library build |

@@ -89,16 +89,22 @@ Overrides honoured by `make` (all optional):
 | `ASTNOCHECK=1` | Turn the build-option-sum mismatch into a warning. Only for experiments; the loader will still refuse a real mismatch. |
 | `MYSQL=auto\|1\|0` | `auto` (default): first of `pkg-config libmariadb`, `pkg-config mariadb`, `pkg-config mysqlclient`, `mariadb_config`, `mysql_config`; `1` requires it; `0` disables the DB lookup. Prints `MySQL: yes (<how>)` or `MySQL: no`. Defines `-DHAVE_MYSQL` when found. |
 | `MYSQL_CFLAGS=... MYSQL_LIBS=...` | Explicit flags, bypassing detection. |
-| `BUNDLES=DIR` | Extra header bundles for `make check`. |
+| `BUNDLES=DIR` | Extra header bundles for `make check` (default `./bundles`). |
+| `WERROR=1` | Treat compiler warnings as errors (CI uses it). |
+| `ASTETCDIR=DIR`, `DESTDIR=` | Where `make install` puts `amd_ws.conf.sample` (default `/etc/asterisk`) and a staging prefix. |
+
+Further overrides for unusual boxes are listed in the Makefile header
+(`make help`): `ASTERISK=`, `ASTVERSION=`, `ASTBUILDSUM=`, `AST_SRC_ROOTS=`,
+`AST_INC_ROOTS=`, `AST_TIMEOUT=`, `CFLAGS=`, `EXTRA_CPPFLAGS=`, `EXTRA_LIBS=`.
 
 ## Makefile targets
 
 | Target | What it does |
 |---|---|
-| `all` (default) | Detect, compile with `-MMD -MP` dependency tracking, link. A `.buildflags` stamp forces a rebuild when `ASTINCDIR` or `CFLAGS` change. |
-| `check` | Post-link gates: `ldd -r app_amd_ws.so` must show no undefined symbols other than `ast_*`, `__ast_*`, `ao2_*`, `__ao2_*`, `pbx_*`, `ast_websocket_*` (OPTIONAL_API symbols are resolved at load); `strings` must show the core's `AST_BUILDOPT_SUM` in the object. Also a compile-only matrix against every header bundle found under `$(BUNDLES)` or `./bundles/asterisk-*/include`. |
-| `install` | Backs up an existing `app_amd_ws.so` to `app_amd_ws.so.bak.<timestamp>` and installs the new one into `ASTMODDIR`. Refuses an empty/`/` target. |
-| `uninstall` | Removes the module from `ASTMODDIR`. |
+| `all` (default) | Detect, compile with `-MD -MP` dependency tracking (system headers included, so a silent fall-through to `/usr/include/asterisk` is caught), link. A `.buildflags` stamp forces a rebuild when `ASTINCDIR`, the version, the sum or `CFLAGS` change. Every build runs four gates: (1) every Asterisk header used came from `ASTINCDIR`; (2) the object embeds the core's `AST_BUILDOPT_SUM`; (3) `ldd -r app_amd_ws.so` leaves no undefined symbol that Asterisk does not provide: when the core binary is readable its `nm -D` export list decides (plus `ast_websocket_*` from `res_http_websocket.so`), otherwise the name pattern `ast_*`, `__ast_*`, `ao2_*`, `__ao2_*`, `pbx_*`, `ast_websocket_*`, `option_debug`, `option_verbose`; (4) the `.so` embeds the sum. A failed gate deletes the output. |
+| `check` | `all` plus a compile-only matrix against every header bundle found under `$(BUNDLES)` (`asterisk-*-headers.tar.gz` are extracted, `buildopts.h` is synthesised for the core's sum). |
+| `install` | Backs up an existing `app_amd_ws.so` to `app_amd_ws.so.bak.<timestamp>`, installs the new one atomically into `ASTMODDIR` and `amd_ws.conf.sample` into `ASTETCDIR`. Refuses an empty/`/` target. |
+| `uninstall` | Removes the module from `ASTMODDIR` (backups and `amd_ws.conf` are kept). |
 | `clean` | Removes objects, dependency files, the `.so` and stamps. Does not run detection. |
 | `show-config` | Prints the detected binary, version, sum, header directory, module directory and MySQL client. |
 | `installer` | Regenerates `install.sh` via `tools/gen-installer.sh`. |

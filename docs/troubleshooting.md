@@ -44,7 +44,7 @@ only while debugging and lower it again. Credentials are never logged.
 |---|---|
 | `asterisk -rx 'module show like app_amd_ws'` | Is it loaded? The use-count column is the number of calls inside `AMD_WS()` right now. |
 | `asterisk -rx 'core show application AMD_WS'` | Parameter and option reference from the running module. |
-| `asterisk -rx 'amd_ws show settings'` | Effective configuration (after `amd_ws.conf`), DB `available`/`unavailable`, counters: calls, human, machine, other, neterr, interr, timeouts, hangups. Counters are since module load. |
+| `asterisk -rx 'amd_ws show settings'` | Effective configuration (after `amd_ws.conf`), `db : Yes (available)` / `No (available)` (disabled with `db=no`) / `No (unavailable (built without MySQL))`, the DB server in use, counters: calls, human, machine, other, neterr, interr, timeouts, hangups, and `connects in flight` (helper threads still waiting for a server that accepted TCP but never finished the WebSocket handshake; capped at 64). Counters are since module load. |
 | `asterisk -rx 'module reload app_amd_ws.so'` | Re-read `/etc/asterisk/amd_ws.conf` and `/etc/astguiclient.conf`. |
 | `asterisk -rx 'module load app_amd_ws.so'` | Load after install. Parse the reply, not the exit code (`asterisk -rx` always exits 0). |
 | `asterisk -rx 'module unload app_amd_ws.so'` | Refused while a call is inside `AMD_WS()`. Retry when idle. |
@@ -88,6 +88,8 @@ so calls are still classified, but by the local algorithm.
 | Is the connect budget too small for your RTT? | ping the host; compare with `connect_timeout_ms` | Raise `connect_timeout_ms` in `amd_ws.conf` or `c(ms)` per call. Do not go beyond a few seconds; the callee is waiting. |
 | Wrong host/port in the dialplan? | `dialplan show 8370@default` | Fix the `AMD_WS(host,port,...)` arguments or `amd_ws.conf`. |
 | Using `s` / `tls=yes` against a plain `ws://` endpoint? | log shows TLS/handshake failure | Remove `s` / set `tls=no`. |
+| `wss://` fails with `did not match ()` | `tls_check_hostname=yes` on Asterisk 16, whose WebSocket client does not pass the hostname to the check | Set `tls_check_hostname=no` (the default); chain verification (`tls_verify`) still applies. |
+| Log says `64 connects to <host> still pending, failing fast` and `amd_ws show settings` shows `connects in flight : 64` | The server accepts TCP but never completes the handshake (or a middlebox black-holes it); each such call leaves a helper thread waiting until the server closes. Calls fail fast with `NETERR` instead of piling up. | Fix the server / firewall. The threads end when the peer closes; `module unload` is refused while they exist. |
 
 ### `AMDCAUSE=INTERR`
 
@@ -154,9 +156,9 @@ Normal: the callee hung up before a result. Frequent `HANGUP` at very low
 
 | Check | Fix |
 |---|---|
-| `amd_ws show settings` says `db: unavailable` | Built without the MySQL client (`MYSQL=0`, `--no-db`, or dev package missing at build time). Rebuild with the client dev package installed, or accept: detection works without enrichment. |
+| `amd_ws show settings` says `db : No (unavailable (built without MySQL))` | Built without the MySQL client (`MYSQL=0`, `--no-db`, or dev package missing at build time). Rebuild with the client dev package installed, or accept: detection works without enrichment. |
 | `db=no` in `amd_ws.conf`, or option `n` / `p()` / `k()` in the dialplan | Intentional skip. |
-| Warning in the log about the DB (at most once per minute) | Credentials or host in `/etc/astguiclient.conf` (`VARDB_server`, `VARDB_database`, `VARDB_user`, `VARDB_pass`, `VARDB_port`) wrong for this box, or the DB is unreachable. Test (prompts for `VARDB_pass`): `mysql -h "$(sed -n 's/^VARDB_server *=> *//p' /etc/astguiclient.conf)" -u "$(sed -n 's/^VARDB_user *=> *//p' /etc/astguiclient.conf)" -p asterisk -e 'SELECT 1'`. After fixing the file: `module reload app_amd_ws.so` (it is parsed at load/reload, not per call). |
+| `AMD_WS: DB connect to <host>:<port> failed: ... (further DB warnings suppressed for 60 s)` in the log | Credentials or host in `/etc/astguiclient.conf` (`VARDB_server`, `VARDB_database`, `VARDB_user`, `VARDB_pass`, `VARDB_port`) wrong for this box, or the DB is unreachable. Test (prompts for `VARDB_pass`): `mysql -h "$(sed -n 's/^VARDB_server *=> *//p' /etc/astguiclient.conf)" -u "$(sed -n 's/^VARDB_user *=> *//p' /etc/astguiclient.conf)" -p asterisk -e 'SELECT 1'`. After fixing the file: `module reload app_amd_ws.so` (it is parsed at load/reload, not per call). |
 | Lookups slow down calls | They are bounded by `db_timeout_ms` (default 1000 ms) and fail soft, but a slow DB still adds up to that per call. Lower `db_timeout_ms`, or set `db=no` and let the server work without `phone`. |
 
 ### Concurrency / performance

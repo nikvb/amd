@@ -48,6 +48,7 @@ Usage: bash install.sh [options]
   --uninstall         unload and remove the module (+ header cache); keeps amd_ws.conf and packages
   --deps-only         only install the build dependencies
   --build-only        only build; write the module to --output (default ./app_amd_ws.so); no root needed
+  --output FILE       with --build-only: where to write the built module
   --no-db             build without the ViciDial phone/country lookup (no MySQL client needed)
   --no-load           install the file but do not unload/load the module in the running Asterisk
   --headers DIR       use this Asterisk include dir (must hold asterisk.h, asterisk/autoconfig.h, buildopts.h)

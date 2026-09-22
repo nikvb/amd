@@ -31,7 +31,7 @@ upgrading from 1.x: read [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md
 - JSON results (`{"status":...}`, `{"result":...}`, `{"classification":...}`)
   are recognised.
 - Configuration file `/etc/asterisk/amd_ws.conf` with `host`, `port`, `tls`,
-  `tls_verify`, `tls_cafile`, `timeout_ms`, `connect_timeout_ms`,
+  `tls_verify`, `tls_cafile`, `tls_check_hostname`, `timeout_ms`, `connect_timeout_ms`,
   `result_grace_ms`, `send_schedule`, `chunk_bytes`, `extra_statuses`,
   `playdelay_ms`, `db`, `db_timeout_ms`, `astguiclient_conf`; all optional;
   shipped as `amd_ws.conf.sample`.
@@ -39,7 +39,11 @@ upgrading from 1.x: read [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md
   `/etc/astguiclient.conf`.
 - CLI command `amd_ws show settings`: effective configuration, DB
   availability, counters (calls, human, machine, other, neterr, interr,
-  timeouts, hangups).
+  timeouts, hangups) and the number of connects in flight.
+- The blocking WebSocket connect runs on a helper thread per call so the
+  channel is serviced during the whole `connect_timeout_ms`, including a
+  server that accepts TCP but never answers the handshake; at most 64 such
+  connects are in flight, further calls fail fast with `NETERR`.
 - `core show application AMD_WS` shows a full synopsis and description.
 - Two verbose-3 log lines per call (`AMD_WS: <chan> vid=... host=... play=...`
   and `AMD_WS: <chan> status=... cause=... elapsed=... sent=... chunks=...`).
@@ -48,8 +52,10 @@ upgrading from 1.x: read [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md
 - Result grace period (`result_grace_ms`) after `timeout_ms`: the remaining
   audio is sent and a reply awaited while still detecting hangup.
 - `Makefile`: detection of the running Asterisk (binary, version, build-option
-  sum) and validation of every header candidate via `ast-detect.sh`; targets
-  `check` (post-link symbol gate + embedded build-option sum), `show-config`,
+  sum) and validation of every header candidate via `ast-detect.sh`; every
+  build runs four gates (headers only from the chosen tree, embedded
+  build-option sum, `ldd -r` against the core's exported symbols); targets
+  `check` (compile matrix against header bundles), `show-config`,
   `uninstall`, `installer`, `test`; header dependency tracking and a
   `.buildflags` stamp; `MYSQL=auto|1|0` with `pkg-config`/`mariadb_config`/
   `mysql_config` discovery; `install` backs up the previous `.so` to
@@ -57,7 +63,9 @@ upgrading from 1.x: read [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md
 - `install.sh` is now generated (`tools/gen-installer.sh`, `make installer`)
   and self-contained; new flags `-y`, `--dry-run`, `--no-db`, `--no-load`,
   `--headers`, `--asterisk-src`, `--version`, `--allow-configure`,
-  `--bundle-url`, `--wait`, `--help`; header resolution via local trees →
+  `--bundle-url`, `--tarball-file`, `--output`, `--keep-build`,
+  `--remove-backups`, `--wait`, `--help`; exit codes 0-6 documented in
+  [docs/installer.md](docs/installer.md); header resolution via local trees →
   pinned distro devel package → header bundle → tarball headers with a
   synthesised `buildopts.h`; backup and verified load; exit code 3 when the
   module swap must wait for idle; log in `/var/log/app_amd_ws-install.log`.
@@ -65,7 +73,9 @@ upgrading from 1.x: read [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md
   `.sha256`), `tools/check-embedded.sh` (CI guard against a stale
   `install.sh`), GitHub Actions workflow.
 - Test harness under `test/`: mock AMD server, minimal Asterisk configuration,
-  `test/run.sh` with the scenario matrix in [docs/testing.md](docs/testing.md).
+  data-driven `test/scenarios.txt`, `test/run.sh` with the scenario matrix in
+  [docs/testing.md](docs/testing.md), including a 300-call fd/RSS soak and a
+  log-noise check (no unexpected `WARNING`/`ERROR` lines).
 - Documentation set under `docs/`, `CONTRIBUTING.md`, this changelog, and the
   GPL-2.0 `LICENSE` file.
 

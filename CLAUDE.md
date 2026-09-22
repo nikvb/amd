@@ -44,7 +44,7 @@ developer. Precise commands, tables, no marketing.
 ```bash
 make show-config                 # detected Asterisk binary, version, build-option sum, headers, MySQL client
 make                             # build app_amd_ws.so
-make check                       # ldd -r symbol gate + embedded AST_BUILDOPT_SUM (+ compile matrix over ./bundles)
+make check                       # the build (its ldd -r / AST_BUILDOPT_SUM gates) + compile matrix over $(BUNDLES)
 sudo make install                # backs up old .so to .so.bak.<timestamp>, installs into ASTMODDIR
 make load | make unload | make reload   # asterisk -rx with reply parsing (exit code of -rx is always 0)
 make installer                   # regenerate install.sh

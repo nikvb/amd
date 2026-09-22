@@ -70,13 +70,13 @@ strings (`CONNECTION_TIMEOUT`, `CONNECT_FAILED`, ...) replace them with
 | Close | TCP drop (server saw `1006`) | WebSocket CLOSE `1000` |
 | Grace after timeout | 20 iterations of `lws_service()` (0 ms to minutes, depending on lws) | `result_grace_ms` (1000 ms), still detecting hangup |
 | Non-UTF-8 caller id name | sent raw (invalid TEXT frame) | invalid bytes replaced by `?` |
-| TLS | not available (compiled out) | `wss://` via option `s` / `tls=yes`, `tls_verify`, `tls_cafile` |
+| TLS | not available (compiled out) | `wss://` via option `s` / `tls=yes`, `tls_verify`, `tls_cafile`, `tls_check_hostname` |
 
 ## Configuration file (new)
 
 1.x had no configuration file; every default was compiled in.
 2.0 reads the optional `/etc/asterisk/amd_ws.conf` (`[general]`) with the
-keys `host`, `port`, `tls`, `tls_verify`, `tls_cafile`, `timeout_ms`,
+keys `host`, `port`, `tls`, `tls_verify`, `tls_cafile`, `tls_check_hostname`, `timeout_ms`,
 `connect_timeout_ms`, `result_grace_ms`, `send_schedule`, `chunk_bytes`,
 `extra_statuses`, `playdelay_ms`, `db`, `db_timeout_ms`, `astguiclient_conf`.
 All keys are optional; see `amd_ws.conf.sample` and the

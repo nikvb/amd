@@ -22,9 +22,10 @@ server that runs Asterisk. It logs everything it prints to
 | Flag | Effect |
 |---|---|
 | `-y` | Assume yes to any confirmation prompt. Use it when piping into `bash`. |
-| `--dry-run` | Print every step and decision, change nothing. |
+| `--dry-run` | Detect and print the plan (distro, Asterisk, headers, module directory, what would be installed), change nothing. No root needed. |
 | `--deps-only` | Install build dependencies only. |
-| `--build-only` | Detect, resolve headers and build in a temporary directory; do not install or load. |
+| `--build-only` | Detect, resolve headers and build in a temporary directory; do not install or load. Writes the module to `--output` (default `./app_amd_ws.so`). No root needed. |
+| `--output FILE` | With `--build-only`: where to write the built module. |
 | `--no-db` | Do not install the MariaDB/MySQL client dev package and build without the DB lookup (`MYSQL=0`). |
 | `--no-load` | Install the file but do not unload/load the module in the running Asterisk. |
 | `--headers DIR` | Use this header directory (`asterisk.h` inside), skipping detection. |
@@ -32,9 +33,20 @@ server that runs Asterisk. It logs everything it prints to
 | `--version VER` | Override the detected Asterisk version (e.g. `18.21.0-vici`) for header lookup and downloads. |
 | `--allow-configure` | Permit running `./configure` inside a downloaded source tarball when no `autoconfig.h` is available otherwise (slow; the installer names the extra packages `./configure` needs). Off by default. |
 | `--bundle-url URL` | Base URL for header bundles (default `https://download.amdy.io/asterisk-headers`; env `AMD_WS_BUNDLE_URL`). |
+| `--tarball-file F` | Use this local Asterisk source tarball instead of downloading one (resolution step 4). |
 | `--wait N` | Seconds to keep retrying a soft `module unload` that is refused because calls are inside `AMD_WS()` (default 30). |
-| `--uninstall` | Remove the installed module (see below). |
+| `--keep-build` | Keep the temporary build directory (for debugging a build failure). |
+| `--uninstall` | Remove the installed module and the header cache (see below). |
+| `--remove-backups` | With `--uninstall`: also delete `app_amd_ws.so.bak.*`. |
 | `--help` | Usage text, exit 0. |
+
+Environment overrides (all optional): the `ast-detect.sh` set (`ASTERISK`,
+`ASTVERSION`, `ASTBUILDSUM`, `ASTINCDIR`, `ASTTOPDIR`, `ASTMODDIR`,
+`AST_SRC_ROOTS`, `AST_INC_ROOTS`, `ASTNOCHECK=1`), `AMD_WS_BUNDLE_URL`,
+`AMD_WS_CACHE_DIR` (default `/var/cache/app_amd_ws`), `AMD_WS_LOG_FILE`
+(default `/var/log/app_amd_ws-install.log`), `AMD_WS_ETCDIR` (default
+`/etc/asterisk`), `MYSQL_CFLAGS`/`MYSQL_LIBS`. Non-root runs (`--dry-run`,
+`--build-only`) use a per-user cache and log under `$TMPDIR`.
 
 ## What it does, in order
 
@@ -64,7 +76,8 @@ server that runs Asterisk. It logs everything it prints to
       (verified with the published `.sha256`); only `*/include/*` and
       `.version` are extracted; `autoconfig.h` comes from the bundle if one
       exists, otherwise `./configure` runs only with `--allow-configure`;
-      `buildopts.h` is synthesised from the running core's sum.
+      `buildopts.h` is synthesised from the running core's sum. Downloaded
+      headers are cached in `/var/cache/app_amd_ws` (never `/usr/src`).
 
    If all four fail the installer stops with a message naming every rejected
    candidate and the exact `--headers` / `--asterisk-src` / `--version` to
@@ -99,8 +112,12 @@ a truncated download executes nothing and every successful path (including
 | Code | Meaning | What to do |
 |---|---|---|
 | `0` | Success (also for `--help`, `--dry-run`, `--deps-only`, `--build-only`, `--uninstall`). | Nothing. Check `module show like app_amd_ws`. |
+| `1` | A step failed (download, checksum, unsupported distro, ...). | Read the last lines of the output or `/var/log/app_amd_ws-install.log`; the message names the failing step and the override or fix. |
+| `2` | Usage error, or not running as root without `--dry-run`/`--build-only`. | Fix the command line; run with `sudo`. |
 | `3` | Built and installed, but the previous module is still loaded because calls were inside `AMD_WS()` for the whole `--wait` period. | Run the printed command when the dialer is idle (a `module unload app_amd_ws.so` followed by `module load app_amd_ws.so`, or an Asterisk restart at the next maintenance window). The new code is active after that. |
-| other non-zero | A step failed: unsupported distro, package install failure, no matching headers, build or gate failure, module failed to load. | Read the last lines of the output or `/var/log/app_amd_ws-install.log`; the message names the failing step and the override or fix. |
+| `4` | No Asterisk headers matching the running Asterisk could be found or obtained. | The message lists every rejected candidate; pass `--headers DIR`, `--asterisk-src DIR`, `--version VER`, `--tarball-file F` or `--allow-configure`. |
+| `5` | Build or gate failure, or the new module failed to load (the backup is restored and reloaded). | Read the compiler/gate output in the log. |
+| `6` | Build dependencies could not be installed. | Install `gcc make pkg-config binutils tar curl` (and the MariaDB/MySQL client dev package unless `--no-db`) by hand, or fix the package manager. |
 
 ## What it changes on the system
 
@@ -110,10 +127,11 @@ a truncated download executes nothing and every successful path (including
 | Distro `asterisk-devel` / `asterisk-dev`, only in resolution step 2 | package manager | No. |
 | Header bundle / tarball extraction | temporary directory, removed after the build | n/a |
 | `app_amd_ws.so` | Asterisk module directory | Yes. |
-| `app_amd_ws.so.bak.<timestamp>` | Asterisk module directory | Backups are not touched by an install; see `--help` for the current uninstall behaviour regarding backups. |
+| `app_amd_ws.so.bak.<timestamp>` | Asterisk module directory | Kept by default; deleted with `--uninstall --remove-backups`. |
+| Header cache (bundle / tarball headers) | `/var/cache/app_amd_ws` | Yes. |
 | Loaded module | running Asterisk | Unloaded on `--uninstall` (soft; refused while in use). |
 | Log | `/var/log/app_amd_ws-install.log` | Kept. |
-| Sample configuration | The installer embeds `amd_ws.conf.sample`; its output states where, if anywhere, it placed a copy. An existing `/etc/asterisk/amd_ws.conf` is never overwritten. | n/a |
+| `amd_ws.conf.sample` | `/etc/asterisk/amd_ws.conf.sample` (copy it to `amd_ws.conf` to change defaults). An existing `/etc/asterisk/amd_ws.conf` is never created, touched or overwritten. | No. |
 
 It does **not** modify `/etc/asterisk/extensions.conf`, an existing
 `/etc/asterisk/amd_ws.conf`, `/etc/asterisk/modules.conf`,
@@ -159,9 +177,11 @@ recommended (see [migration-v1-to-v2.md](migration-v1-to-v2.md)).
 curl -fsSL https://raw.githubusercontent.com/nikvb/amd/main/install.sh | sudo bash -s -- --uninstall
 ```
 
-Unloads the module (softly; refused while in use) and removes
-`app_amd_ws.so` from the module directory. It restores nothing else: packages,
-dialplan, `amd_ws.conf`, and the install log stay. Remove the `AMD_WS(...)`
+Unloads the module (softly; refused while in use), removes `app_amd_ws.so`
+from the module directory and the header cache `/var/cache/app_amd_ws`.
+Backups `app_amd_ws.so.bak.*` stay unless `--remove-backups` is added. It
+restores nothing else: packages, dialplan, `amd_ws.conf`,
+`amd_ws.conf.sample` and the install log stay. Remove the `AMD_WS(...)`
 line from extension 8370 yourself (or point the campaign back to extension
 8369 in ViciDial) before uninstalling, otherwise calls hit an unknown
 application.

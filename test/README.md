@@ -28,7 +28,7 @@ test/run.sh
 
 # useful variants
 test/run.sh --list                         # scenarios + checks
-test/run.sh --only human,playback          # a subset (checks like unload_busy can be named too)
+test/run.sh --only human,playback          # a subset (checks like unload_busy, soak_fd_rss, log_noise can be named too)
 test/run.sh --keep                         # leave Asterisk + mock running for a look
 test/run.sh --module /path/app_amd_ws.so   # test a prebuilt module (skips make)
 test/run.sh --no-build                     # use ../app_amd_ws.so as it is
@@ -166,6 +166,7 @@ AMD_WS (need the built module):
 | `hangup` | HANGUP/HANGUP ~1.5 s | callee hangup mid-detection; AMDELAPSED counts from the first audio frame |
 | `no_audio` | NOTSURE/NO_AUDIO_TIMEOUT | not a single frame captured; connection still opened/closed cleanly |
 | `silence_frames` | NOTSURE/AUDIO_TIMEOUT | frames of digital silence are still audio |
+| `schedule_full` | HUMAN after 9 chunks | all six schedule marks (500..4000 ms) then 8000-byte chunks every 500 ms |
 | `playback` | HUMAN | playfile audible on the farside during detection (RMS), *stopped on result* (silence after ~2.7 s although the file is 6 s), mix has both sides |
 | `playback_list` | HUMAN | `a&b` plays sequentially |
 | `playdelay` | HUMAN | `d(1500)`: first 0.8 s heard is silent, audible later |
@@ -176,7 +177,9 @@ AMD_WS (need the built module):
 | `bad_port_default` | HUMAN | invalid port -> warning + conf default |
 | `default_vid` | HUMAN | vid defaults to CALLERID(name) |
 | `concurrent` | 25 x HUMAN | 25 simultaneous calls, all results, Asterisk alive |
+| `soak_fd_rss` | - | 100 warm-up + 200 measured calls (bursts of 25 through the `soak` probe row): the daemon's fd count must not grow, RSS must grow < `SOAK_RSS_LIMIT_KB` (1024). The test daemon runs with `MALLOC_ARENA_MAX=1` so RSS tracks live allocations instead of per-thread malloc arena high-water marks (measured here: default malloc +3 MB/200 calls and still creeping, one arena +136 kB and flat) |
 | `log_lines` | - | the SPEC section 6 start/end verbose lines exist |
+| `log_noise` | - | every WARNING/ERROR line in the Asterisk log matches `LOG_NOISE_ALLOW` in run.sh (intentionally provoked: unload busy, bad port, option A, connect refused/timeout, HTTP 403, dead DB); anything else fails, listed in `log-noise-unexpected.txt` |
 | `cli_show_application`, `cli_show_settings` | - | `core show application AMD_WS` and `amd_ws show settings` are useful |
 | `unload_busy_refused`, `unload_idle`, `load_again`, `module_reload` | - | unload refused while a call is inside AMD_WS, succeeds when idle, module works after reload |
 | `build_nomysql`, `build_mysql` | - | `make MYSQL=0` and `make MYSQL=1 ...` both build; no undefined non-Asterisk symbols |
@@ -192,15 +195,21 @@ AMD_WS (need the built module):
   `astguiclient_conf=<run>/etc/astguiclient.conf`, which points VARDB_* at
   `127.0.0.1:<dead port>` with deliberately messy syntax (tabs, comments,
   `=>` in a value). Never the real DB credentials.
-* Timing bounds were calibrated with a stub module; tune `min_ms`/`max_ms` in
-  `scenarios.txt` if the real module's clock origin differs (see the note
-  about the 500 ms Answer wait above). The whole suite has a 240 s budget
-  (`SUITE_BUDGET_S`).
+* Timing bounds were confirmed against the real module (all scenarios land
+  within 1-3 ms of the expected AMD clock); `min_ms`/`max_ms` in
+  `scenarios.txt` include the 500 ms Answer wait described above. The chunk
+  schedule assertion is anchored on TA (`--audio-start` of protocol_test.py):
+  the module clocks the schedule from its first captured frame, not from the
+  WebSocket connect. The whole suite has a 240 s budget (`SUITE_BUDGET_S`);
+  a full run takes about 150 s here.
+* `TEST_MALLOC_ARENA_MAX` (default 1) is exported to the test daemon only;
+  `SOAK_RSS_LIMIT_KB` (default 1024) is the allowed RSS growth of the soak.
 * `test/run/` is gitignored; delete it to start clean. A unix socket path is
   limited to ~107 bytes, so for very deep checkouts run.sh moves only
   `astrundir` to `$TMPDIR/amd_ws_test-<uid>/run`.
 * Lessons learned about this Asterisk (kept here so nobody rediscovers them):
-  `[directories](!)` in asterisk.conf is ignored (template), the core needs
+  a `[directories]` section carrying the `(!)` template marker in asterisk.conf
+  is ignored, the core needs
   its XML documentation dir to boot, `n`/`x`/`z` are wildcards in patterns,
   `channel originate` returns immediately (`AST_OUTGOING_NO_WAIT`), and
   `asterisk -rx` needs an absolute `-C` path.
