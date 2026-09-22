@@ -2,6 +2,9 @@
 ; Every directory lives under the scratch run dir @RUN@ (test/run/ast, gitignored)
 ; so the real 16.30.1-vici binary runs as an unprivileged user with no
 ; network listeners and without touching /etc/asterisk or /var/lib/asterisk.
+; astrundir (CLI socket + pid file) is normally @RUN@/var/run too; run.sh moves
+; it to a short $TMPDIR path when the checkout is so deep that the unix socket
+; path would exceed the kernel's ~107 byte limit.
 [directories]
 astetcdir => @RUN@/etc
 astmoddir => @RUN@/modules
@@ -11,7 +14,7 @@ astkeydir => @RUN@/var/lib
 astdatadir => @RUN@/var/lib
 astagidir => @RUN@/var/lib/agi-bin
 astspooldir => @RUN@/var/spool
-astrundir => @RUN@/var/run
+astrundir => @RUNDIR@
 astlogdir => @LOGDIR@
 astsbindir => /usr/sbin
 

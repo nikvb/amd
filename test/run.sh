@@ -96,21 +96,28 @@ print_table() {
 		echo "=================================================================================================="
 		printf '%-4s %-20s %-24s %7s %7s  %s\n' RESULT SCENARIO STATUS/CAUSE WALLms AMDms DETAIL
 		echo "--------------------------------------------------------------------------------------------------"
-		local r
+		local r a b c d e f
 		for r in "${ROWS[@]}"; do
 			IFS='|' read -r a b c d e f <<<"$r"
-			printf '%-4s %-20s %-24s %7s %7s  %s\n' "$a" "$b" "$c" "$d" "$e" "$f"
+			printf '%-4s %-20s %-24s %7s %7s  %s\n' "$a" "$b" "$c" "$d" "$e" "${f:0:${1:-100000}}"
 		done
 		echo "--------------------------------------------------------------------------------------------------"
 		printf 'PASS %d  FAIL %d  SKIP %d   (mode=%s, %ds, logs: %s)\n' "$N_PASS" "$N_FAIL" "$N_SKIP" "$MODE" "$(($(date +%s) - SUITE_T0))" "$LOGDIR"
 		echo "=================================================================================================="
-	} | tee "$LOGDIR/summary.txt"
+	}
 }
+print_tables() { print_table >"$LOGDIR/summary.txt"; print_table 150; echo "(full details: $LOGDIR/summary.txt)"; }
 
 # ---------------------------------------------------------------------------
 # asterisk helpers
 # ---------------------------------------------------------------------------
 AST_CONF=$AST_RUN/etc/asterisk.conf
+# unix socket paths are limited to ~107 bytes; a deep checkout would make the
+# CLI socket unbindable, so astrundir falls back to a short directory
+AST_RUNDIR=$AST_RUN/var/run
+if [ ${#AST_RUNDIR} -gt 85 ]; then
+	AST_RUNDIR=${TMPDIR:-/tmp}/amd_ws_test-$(id -u)/run
+fi
 AST_PID=""
 MOCK_PID=""
 MOCK_PORT=""
@@ -121,7 +128,9 @@ RESULTS=$RUN/results.txt
 CONTROL=$RUN/mock.control
 
 ast_bin() { LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH "$ASTERISK_BIN" "$@"; }
-ast_cli() { LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH timeout 15 "$ASTERISK_BIN" -C "$AST_CONF" -rx "$*" 2>&1; }
+ast_cli() { # run one CLI command on our instance; strip ANSI colour codes
+	LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH timeout 15 "$ASTERISK_BIN" -C "$AST_CONF" -rx "$*" 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
+}
 # NOTE: never pipe a live command into 'grep -q' here: with pipefail the SIGPIPE
 # on early exit makes a matching pipeline report failure.  Capture, then test.
 has() { grep -q -- "$2" <<<"$1"; }       # has "$haystack" 'regex'
@@ -331,7 +340,9 @@ prepare_rundir() {
 	ln -sfn "run-$TS" "$LOGROOT/latest"
 	rm -rf "$AST_RUN"
 	mkdir -p "$AST_RUN/etc" "$AST_RUN/modules" "$AST_RUN/var/lib/sounds/en" "$AST_RUN/var/lib/agi-bin" \
-	         "$AST_RUN/var/spool/monitor" "$AST_RUN/var/run" "$AST_RUN/var/lib/keys"
+	         "$AST_RUN/var/spool/monitor" "$AST_RUNDIR" "$AST_RUN/var/lib/keys"
+	rm -f "$AST_RUNDIR"/asterisk.ctl "$AST_RUNDIR"/asterisk.pid
+	[ "$AST_RUNDIR" = "$AST_RUN/var/run" ] || log "note: astrundir is $AST_RUNDIR (test/run path too long for a unix socket)"
 	rm -f "$RESULTS"; : >"$RESULTS"
 	rm -f "$REC"/*.wav 2>/dev/null
 	: >"$CONTROL"
@@ -369,7 +380,7 @@ prepare_rundir() {
 		printf '; stub written by test/run.sh\n[general]\n' >"$AST_RUN/etc/$f.conf"
 	done
 	printf '; manager (AMI) stays off: no network listeners in the test instance\n[general]\nenabled = no\n' >"$AST_RUN/etc/manager.conf"
-	sed -e "s|@RUN@|$AST_RUN|g" -e "s|@LOGDIR@|$LOGDIR|g" "$TESTDIR/asterisk/asterisk.conf.in" >"$AST_CONF"
+	sed -e "s|@RUN@|$AST_RUN|g" -e "s|@LOGDIR@|$LOGDIR|g" -e "s|@RUNDIR@|$AST_RUNDIR|g" "$TESTDIR/asterisk/asterisk.conf.in" >"$AST_CONF"
 	sed -e "s|@DBPORT@|$DB_PORT|g" "$TESTDIR/asterisk/astguiclient.conf.in" >"$AST_RUN/etc/astguiclient.conf"
 	FULL_LOG=$LOGDIR/full
 }
@@ -408,22 +419,26 @@ start_asterisk() {
 	log "starting asterisk: LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH${EXTRA_LD:+:$EXTRA_LD} $ASTERISK_BIN -C $AST_CONF -F -mq"
 	LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH${EXTRA_LD:+:$EXTRA_LD} "$ASTERISK_BIN" -C "$AST_CONF" -F -mq >"$LOGDIR/asterisk-console.log" 2>&1
 	for i in $(seq 1 100); do
-		[ -S "$AST_RUN/var/run/asterisk.ctl" ] && break
+		[ -S "$AST_RUNDIR/asterisk.ctl" ] && break
 		sleep 0.1
 	done
-	[ -S "$AST_RUN/var/run/asterisk.ctl" ] || die "asterisk control socket did not appear (see $LOGDIR/asterisk-console.log, $FULL_LOG)"
+	[ -S "$AST_RUNDIR/asterisk.ctl" ] || die "asterisk control socket $AST_RUNDIR/asterisk.ctl did not appear (see $LOGDIR/asterisk-console.log, $FULL_LOG)"
 	for i in $(seq 1 150); do
 		local o; o=$(ast_cli 'core waitfullybooted'); has "$o" 'fully booted' && break
 		[ -n "$(our_asterisk_pids)" ] || die "asterisk exited during startup (see $LOGDIR/asterisk-console.log, $FULL_LOG)"
 		sleep 0.2
 	done
 	ast_alive || die "asterisk did not boot within 30 s"
-	AST_PID=$(cat "$AST_RUN/var/run/asterisk.pid" 2>/dev/null || our_asterisk_pids | head -1)
+	AST_PID=$(cat "$AST_RUNDIR/asterisk.pid" 2>/dev/null || our_asterisk_pids | head -1)
 	log "asterisk pid=$AST_PID booted ($(ast_cli 'core show version' | head -1))"
 }
 
 stop_asterisk() {
-	[ -n "$AST_PID" ] || return 0
+	if [ -z "$AST_PID" ]; then
+		local p
+		for p in $(our_asterisk_pids); do log "killing half-started asterisk pid $p"; kill "$p" 2>/dev/null || true; done
+		return 0
+	fi
 	local i
 	ast_cli 'core stop now' >/dev/null 2>&1 || true
 	for i in $(seq 1 150); do
@@ -464,7 +479,7 @@ cleanup() {
 		stop_asterisk
 		stop_mock
 	fi
-	[ -n "${LOGDIR:-}" ] && [ -d "$LOGDIR" ] && [ ${#ROWS[@]} -gt 0 ] && print_table
+	[ -n "${LOGDIR:-}" ] && [ -d "$LOGDIR" ] && [ ${#ROWS[@]} -gt 0 ] && print_tables
 	[ "$FINAL_RC" != 0 ] && exit "$FINAL_RC"
 	[ "$N_FAIL" -gt 0 ] && exit 1
 	exit "$rc"
@@ -548,12 +563,11 @@ EOF
 }
 
 check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
-	local vid=$1 list=$2 tok checks extra phone country v thr seg st ln pat rc
+	local vid=$1 list=$2 tok checks extra v thr seg st ln pat rc rest toks parts
 	A_FAIL=""; A_NOTE=""
 	[ -z "$list" ] && return 0
-	local IFS=','
-	for tok in $list; do
-		unset IFS
+	IFS=',' read -r -a toks <<<"$list"
+	for tok in "${toks[@]}"; do
 		tok=$(trim "$tok")
 		[ -z "$tok" ] && continue
 		case "$tok" in
@@ -565,15 +579,14 @@ check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 			;;
 		proto:*)
 			checks=""; extra=()
-			local IFS=';'
-			for v in ${tok#proto:}; do
+			IFS=';' read -r -a parts <<<"${tok#proto:}"
+			for v in "${parts[@]}"; do
 				case "$v" in
 				phone=*) extra+=(--phone "${v#phone=}") ;;
 				country=*) extra+=(--country "${v#country=}") ;;
 				*) checks+="$v," ;;
 				esac
 			done
-			unset IFS
 			[ ${#extra[@]} = 0 ] && extra=(--no-phone)
 			v=$("$PYTHON" "$TESTDIR/protocol_test.py" --record "$LOGDIR/mock-record.jsonl" --vid "$vid" --checks "${checks%,}" "${extra[@]}" 2>&1); rc=$?
 			printf '%s\n' "$v" >>"$LOGDIR/scenario-$vid.log"
@@ -637,7 +650,6 @@ check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 		*) A_FAIL+="unknown assert '$tok' " ;;
 		esac
 	done
-	unset IFS
 	return 0
 }
 
@@ -667,25 +679,37 @@ run_call_scenario() { # index [mock-override]
 		note+="launched $count in $((t_launch1 - t_launch0))ms "
 		[ $((t_launch1 - t_launch0)) -le 1000 ] || fail+="originates took $((t_launch1 - t_launch0))ms (>1000) "
 	fi
-	local got=0 wall_max="" el_show="" sc_show="" first_line=""
+	local got=0 wall_max="" el_show="" sc_show="" first_line="" bad_s=0 bad_c=0 bad_t=0 missing=0 example=""
 	for vid in "${vids[@]}"; do
 		if line=$(wait_result "$vid" "$deadline"); then
 			got=$((got + 1))
 			printf '%s\n' "$line" >>"$scen_log"
 			parse_result "$line"
 			[ -z "$first_line" ] && first_line=$line
-			[ "$exp_s" != '*' ] && [ "$R_STATUS" != "$exp_s" ] && fail+="$vid status=${R_STATUS:-<empty>} "
-			[ "$exp_c" != '*' ] && [ "$R_CAUSE" != "$exp_c" ] && fail+="$vid cause=${R_CAUSE:-<empty>} "
+			if [ "$exp_s" != '*' ] && [ "$R_STATUS" != "$exp_s" ]; then bad_s=$((bad_s + 1)); example=${example:-"$vid status=${R_STATUS:-<empty>}"}; fi
+			if [ "$exp_c" != '*' ] && [ "$R_CAUSE" != "$exp_c" ]; then bad_c=$((bad_c + 1)); example=${example:-"$vid cause=${R_CAUSE:-<empty>}"}; fi
 			if [ -n "$R_WALL" ]; then
-				[ "$R_WALL" -ge "$min" ] && [ "$R_WALL" -le "$max" ] || fail+="$vid wall=${R_WALL}ms(not in $min..$max) "
+				if [ "$R_WALL" -lt "$min" ] || [ "$R_WALL" -gt "$max" ]; then bad_t=$((bad_t + 1)); example=${example:-"$vid wall=${R_WALL}ms"}; fi
 				[ -z "$wall_max" ] || [ "$R_WALL" -gt "$wall_max" ] && wall_max=$R_WALL
 			else
-				fail+="$vid no T0/T1 timestamps "
+				bad_t=$((bad_t + 1)); example=${example:-"$vid no T0/T1 timestamps"}
 			fi
 		else
-			fail+="$vid no result within ${deadline}s "
+			missing=$((missing + 1)); example=${example:-"$vid no result within ${deadline}s"}
 		fi
 	done
+	if [ "$count" -le 1 ]; then
+		[ "$bad_s" = 0 ] || fail+="status=${R_STATUS:-<empty>}(want $exp_s) "
+		[ "$bad_c" = 0 ] || fail+="cause=${R_CAUSE:-<empty>}(want $exp_c) "
+		[ "$bad_t" = 0 ] || fail+="wall=${R_WALL:-?}ms(want $min..$max) "
+		[ "$missing" = 0 ] || fail+="no result within ${deadline}s "
+	else
+		[ "$missing" = 0 ] || fail+="$missing/$count without result "
+		[ "$bad_s" = 0 ] || fail+="$bad_s/$count wrong status "
+		[ "$bad_c" = 0 ] || fail+="$bad_c/$count wrong cause "
+		[ "$bad_t" = 0 ] || fail+="$bad_t/$count outside $min..${max}ms "
+		[ -z "$example" ] || fail+="(e.g. $example) "
+	fi
 	if [ -n "$first_line" ]; then
 		parse_result "$first_line"
 		sc_show="${R_STATUS:-?}/${R_CAUSE:-?}"; el_show=${R_ELAPSED:--}
