@@ -115,9 +115,11 @@ LDFLAGS  += -pthread -shared
 # LIBS is composed from independent parts; nothing ever re-assigns it
 LIBS      = $(if $(filter 1,$(HAVE_MYSQL)),$(MYSQL_LIBS)) $(EXTRA_LIBS)
 
-# symbols an Asterisk module may leave undefined: provided by the core at dlopen (ast_*, ao2, pbx_*)
-# or by res_http_websocket.so (ast_websocket_*, a required module that exports global symbols)
-CORE_SYM_RE := ^(ast_|__ast_|ao2_|__ao2_|pbx_|ast_websocket_)
+# symbols an Asterisk module may leave undefined: provided by the core at dlopen (ast_*, ao2, pbx_*,
+# plus the two option_* globals the ast_debug()/ast_verb() macros read; stock app_amd.so has the same)
+# or by res_http_websocket.so (ast_websocket_*, a required module that exports global symbols).
+# The pattern is only the fallback: when the core binary is readable, its 'nm -D' export list decides.
+CORE_SYM_RE := ^(ast_|__ast_|ao2_|__ao2_|pbx_|ast_websocket_|option_debug$$|option_verbose$$)
 
 # stamp with everything that influences the object: a change of headers/version/sum/flags rebuilds
 BUILDFLAGS := $(ASTVERSION) $(ASTINCDIR) $(ASTBUILDSUM) $(CC) $(CFLAGS) $(CPPFLAGS) $(LDFLAGS) $(LIBS)
@@ -145,7 +147,7 @@ $(MODULE).so: $(MODULE).o
 	@und=$$(ldd -r $@ 2>&1 | awk '/undefined symbol/{sub(/[[:space:]]*\(.*/,"",$$3); print $$3}' | sort -u); \
 	 if [ -n '$(ASTERISK)' ] && [ -r '$(ASTERISK)' ] && nm -D --defined-only '$(ASTERISK)' >/dev/null 2>&1; then \
 	   core=$$(nm -D --defined-only '$(ASTERISK)' | awk '{print $$NF}' | sed 's/@.*//' | sort -u); \
-	   missing=$$(printf '%s\n' "$$und" | grep -v -E '$(CORE_SYM_RE)' ; printf '%s\n' "$$und" | grep -E '$(CORE_SYM_RE)' | grep -v '^ast_websocket_' | grep -vxF "$$core" ); \
+	   missing=$$(printf '%s\n' "$$und" | grep -v '^ast_websocket_' | grep -vxF "$$core"); \
 	 else \
 	   echo "  [..] no readable core binary - symbol check limited to the name pattern"; \
 	   missing=$$(printf '%s\n' "$$und" | grep -v -E '$(CORE_SYM_RE)'); \
