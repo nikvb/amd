@@ -56,21 +56,42 @@
  *                 deadline and the helper disposes of whatever it produces.
  *                 The optional DB enrichment (bounded by db_timeout_ms) runs
  *                 on the same helper right before the connect, so a stalled
- *                 DB can cost that call its connect window (NETERR) but never
- *                 stops the PBX thread from reading the channel.  The config
- *                 JSON is built when the helper hands the socket over.
+ *                 DB can cost that call its connect window (CONNECTION_ERROR)
+ *                 but never stops the PBX thread from reading the channel.
+ *                 The config JSON is built when the helper hands the socket
+ *                 over.
  *   3. STREAM     ast_waitfor_nandfds(chan + ws fd, <= 20 ms budget).
  *                 Voice frames are appended to the accumulator (never
  *                 truncated).  Sends follow the time schedule measured from
  *                 the first captured frame (amd.py SEND_TIMES); after the
  *                 last mark a send happens whenever >= chunk_bytes are
- *                 pending.  Server TEXT frames are classified as they arrive.
- *   4. GRACE      when timeout_ms expires without a result the remaining
- *                 audio is flushed and we wait up to result_grace_ms for the
- *                 server's reply, still servicing the channel.
- *   5. EXIT       stop playback, send {"eof":1}, CLOSE 1000, unref, restore
- *                 the read format, set AMDSTATUS/AMDCAUSE/AMDRESPONSE/
- *                 AMDELAPSED, bump counters, one verbose summary line.
+ *                 pending or fallback_interval_ms passed since the last send
+ *                 with something pending (amd.py's fallback rule).  A mark at
+ *                 which nothing is pending is a "no audio data" mark; after
+ *                 eof_no_audio_streak of them in a row, with audio sent
+ *                 before, the EOF finalisation starts (phase 4).  Server TEXT
+ *                 frames are classified as they arrive, exactly like amd.py:
+ *                 'HUMAN' in text -> HUMAN, else 'AMD'/'MACHINE' in text ->
+ *                 MACHINE (the brand "AMDY" does not count), else an ack.
+ *   4. EOF_WAIT   {"eof":1} was sent to make the server finalise; wait up to
+ *                 eof_wait_ms for ONE reply, still servicing the channel
+ *                 (amd.py:404-435).  HUMAN/MACHINE are honoured, any other
+ *                 reply is EOF_INCONCLUSIVE, no reply/error is EOF_ERROR.
+ *   5. GRACE      when timeout_ms expires without a result and
+ *                 result_grace_ms > 0 (default 0 = return at once like amd.py
+ *                 at MAX_WAIT_TIME) the remaining audio is flushed and we wait
+ *                 that long for the server's reply, still servicing the channel.
+ *   6. EXIT       stop playback, send {"eof":1} (again, as amd.py's cleanup
+ *                 does), CLOSE 1000, unref, restore the read format, set
+ *                 AMDSTATUS/AMDCAUSE/AMDSTATS/AMDRESPONSE/AMDELAPSED, bump
+ *                 counters, one verbose summary line.
+ *
+ * Outcome vocabulary (production amd.py Jul 2026 + stock app_amd/VD_amd.agi):
+ *   HUMAN/HUMAN, MACHINE/<raw reply>, HUMAN/CONNECTION_ERROR (cannot connect),
+ *   HUMAN/PROCESSING_ERROR (ws lost after connect), HUMAN/FATAL_ERROR
+ *   (internal: alloc, format, thread, option A), NOTSURE/SERVER_TIMEOUT, NOTSURE/NOAUDIODATA-<ms>, HANGUP/HANGUP,
+ *   NOTSURE/EOF_INCONCLUSIVE, NOTSURE/EOF_ERROR.  Errors default to HUMAN
+ *   "for safety" (the call reaches an agent), as amd.py does.
  *
  * Parallel playback: the optional playfile list is started with
  * ast_streamfile() after playdelay_ms; the file stream is driven by the
@@ -83,12 +104,19 @@
  *   t_app     application entry
  *   t_connect the moment the connect job is started (after answer/format)
  *   t_first   first captured voice frame (0 if none)
- *   marks     conf send_schedule, measured from t_first
+ *   marks     conf send_schedule, measured from t_first (amd.py measures from
+ *             its stream start, which on a Local/SIP leg delivering audio at
+ *             once is the same instant)
+ *   t_last_send  last successful audio send (fallback interval runs from it)
  *   detection deadline  = (t_first ? t_first : t_app) + timeout_ms
  *   connect deadline    = min(t_connect + connect_timeout_ms, detection deadline)
+ *   eof deadline        = t_eof + eof_wait_ms (not capped by the detection
+ *                         deadline: amd.py's 3 s recv timeout is independent)
  *   grace deadline      = detection deadline + result_grace_ms
  *   playback start      = t_app + playdelay_ms
  *   AMDELAPSED          = exit - (t_first ? t_first : t_app)
+ *   AMDSTATS            = <AMDELAPSED>-<ms of audio sent>-<chunks>-<bytes sent>
+ *                         (VD_amd.agi reads the first field as run_time)
  *
  * File layout: config -> db -> json/escape -> ws helpers -> audio
  * accumulator -> playback helpers -> exec -> cli -> load/unload/reload.
@@ -170,7 +198,7 @@
 					</option>
 					<option name="c">
 						<argument name="ms" required="true" />
-						<para>Override the connect timeout (amd_ws.conf <literal>connect_timeout_ms</literal>, default 2000).</para>
+						<para>Override the connect timeout (amd_ws.conf <literal>connect_timeout_ms</literal>, default 10000).</para>
 					</option>
 					<option name="p">
 						<argument name="phone" required="true" />
@@ -180,35 +208,46 @@
 						<argument name="code" required="true" />
 						<para>Supply the country/phone code explicitly (sent as <literal>country_code</literal>; p() or k() skips the DB lookup).</para>
 					</option>
+					<option name="i">
+						<argument name="cid" required="true" />
+						<para>Supply the caller id explicitly (sent as <literal>caller_id</literal>). Default: CALLERID(num) of the channel when non-empty and not "Unknown", unless amd_ws.conf <literal>send_caller_id=no</literal>.</para>
+					</option>
 					<option name="a">
 						<para>Answer the channel if it is not up (default).</para>
 					</option>
 					<option name="A">
-						<para>Do NOT answer; if the channel is not up, fail with AMDCAUSE=INTERR.</para>
+						<para>Do NOT answer; if the channel is not up, fail with AMDSTATUS=HUMAN, AMDCAUSE=FATAL_ERROR.</para>
 					</option>
 				</optionlist>
 			</parameter>
 		</syntax>
 		<description>
 			<para>Streams 8 kHz signed-linear audio from the channel to the AMD service over a WebSocket and
-			sets channel variables with the classification. The connection is made with Asterisk's own
+			sets channel variables with the classification, using the vocabulary of the production amdy.io
+			EAGI client (amd.py) and of the stock AMD() application. The connection is made with Asterisk's own
 			WebSocket client (res_http_websocket).</para>
 			<para>Channel variables set on every exit path:</para>
 			<variablelist>
 				<variable name="AMDSTATUS">
-					<value name="HUMAN" />
-					<value name="MACHINE" />
-					<value name="NOTSURE" />
-					<value name="HANGUP" />
-					<para>Or any other server classification (uppercased), e.g. HONEYPOT, FAS, FASAMD, AUDIO.</para>
+					<value name="HUMAN">the server said HUMAN, or an error occurred (errors default to HUMAN for safety, as amd.py does)</value>
+					<value name="MACHINE">the server said MACHINE or AMD</value>
+					<value name="NOTSURE">no decision (timeout, EOF finalisation inconclusive)</value>
+					<value name="HANGUP">the channel hung up before a result</value>
 				</variable>
 				<variable name="AMDCAUSE">
-					<value name="HUMAN|MACHINE|...">the classification token</value>
-					<value name="INTERR">res_http_websocket not loaded / internal failure (format, alloc, not answered with option A)</value>
-					<value name="NETERR">DNS/connect/handshake failure, connect timeout, WebSocket error or close before a result</value>
-					<value name="AUDIO_TIMEOUT">timeout_ms elapsed, audio was sent, no result</value>
-					<value name="NO_AUDIO_TIMEOUT">timeout_ms elapsed and no audio was ever captured</value>
+					<value name="HUMAN">with AMDSTATUS=HUMAN: the server's decision</value>
+					<value name="raw reply">with AMDSTATUS=MACHINE: the server's reply text (printable ASCII, max 255 chars), e.g. MACHINE or AMD</value>
+					<value name="CONNECTION_ERROR">cannot connect: DNS/TCP/upgrade/TLS failure, connect timeout, per-host connect cap, res_http_websocket not loaded (AMDSTATUS=HUMAN)</value>
+					<value name="PROCESSING_ERROR">WebSocket error or close after the connect, before a result (AMDSTATUS=HUMAN)</value>
+					<value name="FATAL_ERROR">internal failure: allocation, read format, thread creation, config unusable, not answered with option A (AMDSTATUS=HUMAN)</value>
+					<value name="SERVER_TIMEOUT">timeout_ms elapsed, audio was sent, no result (AMDSTATUS=NOTSURE)</value>
+					<value name="NOAUDIODATA-ms">timeout_ms elapsed and no audio was ever captured, ms = the elapsed window (AMDSTATUS=NOTSURE; like the stock AMD())</value>
 					<value name="HANGUP">channel hung up before a result</value>
+					<value name="EOF_INCONCLUSIVE">no audio at eof_no_audio_streak consecutive schedule marks, {"eof":1} was sent and the server's reply was neither HUMAN nor MACHINE (AMDSTATUS=NOTSURE)</value>
+					<value name="EOF_ERROR">as above, but no reply within eof_wait_ms or the WebSocket failed (AMDSTATUS=NOTSURE)</value>
+				</variable>
+				<variable name="AMDSTATS">
+					<para><literal>elapsed_ms-audio_ms_sent-chunks_sent-bytes_sent</literal> (integers; ViciDial reads the first field as run_time).</para>
 				</variable>
 				<variable name="AMDRESPONSE">
 					<para>Raw last server text (printable ASCII only, max 255 chars).</para>
@@ -253,34 +292,59 @@ static const char description[] =
 "  options     n         no DB lookup for this call\n"
 "              s         TLS (wss://); verification per conf tls_verify\n"
 "              d(ms)     playdelay_ms override\n"
-"              c(ms)     connect timeout override (conf connect_timeout_ms, 2000)\n"
+"              c(ms)     connect timeout override (conf connect_timeout_ms, 10000)\n"
 "              p(phone)  phone number sent as \"phone\" (p or k skips the DB lookup)\n"
 "              k(code)   country/phone code sent as \"country_code\"\n"
+"              i(cid)    caller id sent as \"caller_id\" (default: CALLERID(num)\n"
+"                        when non-empty and not Unknown; conf send_caller_id=no\n"
+"                        turns the default off)\n"
 "              a         answer the channel if not up (default)\n"
-"              A         do NOT answer; fail with INTERR if the channel is not up\n"
+"              A         do NOT answer; HUMAN/FATAL_ERROR if the channel is not up\n"
 "\n"
-"Channel variables set on EVERY exit path:\n"
-"  AMDSTATUS    HUMAN | MACHINE | NOTSURE | HANGUP | <other server\n"
-"               classification uppercased, e.g. HONEYPOT, FAS, FASAMD, AUDIO>\n"
-"  AMDCAUSE     the classification token (HUMAN, MACHINE, HONEYPOT, ...), or\n"
-"               INTERR            res_http_websocket missing / internal failure\n"
-"               NETERR            DNS/connect/handshake failure, connect timeout,\n"
-"                                 WebSocket error or close before a result\n"
-"               AUDIO_TIMEOUT     timeout_ms elapsed, audio sent, no result\n"
-"               NO_AUDIO_TIMEOUT  timeout_ms elapsed, no audio ever captured\n"
-"               HANGUP            channel hung up before a result\n"
+"Channel variables set on EVERY exit path (vocabulary of the production amdy.io\n"
+"EAGI client amd.py and of the stock AMD(); errors default to HUMAN for safety):\n"
+"  AMDSTATUS / AMDCAUSE\n"
+"    HUMAN   / HUMAN             the server said HUMAN\n"
+"    MACHINE / <raw reply>       the server said MACHINE or AMD; AMDCAUSE is the\n"
+"                                reply text itself (printable ASCII, max 255)\n"
+"    HUMAN   / CONNECTION_ERROR  cannot connect: DNS, TCP, HTTP upgrade or TLS\n"
+"                                failure, connect timeout, per-host connect cap,\n"
+"                                res_http_websocket not loaded\n"
+"    HUMAN   / PROCESSING_ERROR  WebSocket error or close after the connect,\n"
+"                                before a result\n"
+"    HUMAN   / FATAL_ERROR       internal failure: allocation, read format,\n"
+"                                thread creation, config unusable, option A on\n"
+"                                a channel that is not up\n"
+"    NOTSURE / SERVER_TIMEOUT    timeout_ms elapsed, audio was sent, no result\n"
+"    NOTSURE / NOAUDIODATA-<ms>  timeout_ms elapsed, no audio ever captured\n"
+"                                (<ms> = elapsed window, like the stock AMD())\n"
+"    HANGUP  / HANGUP            channel hung up before a result\n"
+"    NOTSURE / EOF_INCONCLUSIVE  EOF finalisation reply was neither HUMAN nor\n"
+"                                MACHINE\n"
+"    NOTSURE / EOF_ERROR         EOF finalisation: no reply within eof_wait_ms\n"
+"                                or WebSocket failure\n"
+"  AMDSTATS     <elapsed_ms>-<audio_ms_sent>-<chunks_sent>-<bytes_sent>\n"
+"               (ViciDial's VD_amd.agi reads the first field as run_time)\n"
 "  AMDRESPONSE  raw last server text (printable ASCII, max 255 chars)\n"
 "  AMDELAPSED   ms from the first captured audio frame to exit (from start if none)\n"
 "\n"
-"Wire protocol (matches the amdy.io EAGI client): on connect a TEXT frame\n"
-"  {\"config\":{\"sample_rate\":8000,\"VID\":\"<vid>\"[,\"phone\":\"..\"][,\"country_code\":\"..\"]}}\n"
-"then BINARY slin chunks at conf send_schedule marks (default 500,1000,1500,\n"
-"2000,3000,4000 ms from the first frame), then every chunk_bytes (8000).  The\n"
-"server answers each chunk with a TEXT ack or a result; the first token\n"
-"HUMAN / MACHINE|AMD / <extra_statuses> decides.  {\"eof\":1} + CLOSE 1000 on exit.\n"
+"Wire protocol (amd.py, Jul 2026): on connect a TEXT frame\n"
+"  {\"config\":{\"sample_rate\":8000,\"VID\":\"<vid>\"[,\"phone\":\"..\"][,\"country_code\":\"..\"]\n"
+"   [,\"caller_id\":\"..\"]}}\n"
+"then BINARY slin chunks at the conf send_schedule marks (default 500,1000,1500,\n"
+"2000,3000,...,9000 ms from the first frame), then whenever chunk_bytes (8000)\n"
+"are pending or fallback_interval_ms (1000) passed since the last send.  Each\n"
+"server TEXT reply is classified exactly like amd.py: 'HUMAN' in the text ->\n"
+"HUMAN; else 'AMD' or 'MACHINE' in the text -> MACHINE (the brand \"AMDY\" does\n"
+"not count); anything else is an ack (case-sensitive; HONEYPOT etc. are acks).\n"
+"When nothing was captured at eof_no_audio_streak (2) consecutive marks after\n"
+"audio was sent, {\"eof\":1} is sent and ONE reply is awaited for eof_wait_ms\n"
+"(3000) -> HUMAN / MACHINE / EOF_INCONCLUSIVE / EOF_ERROR.  {\"eof\":1} + CLOSE\n"
+"1000 on exit.\n"
 "\n"
 "Always returns 0.  Fallback to the stock AMD() in the dialplan with\n"
-"  GotoIf($[\"${AMDCAUSE}\"=\"NETERR\" | \"${AMDCAUSE}\"=\"INTERR\"]?amd_fallback)\n"
+"  GotoIf($[\"${AMDCAUSE}\"=\"CONNECTION_ERROR\" | \"${AMDCAUSE}\"=\"PROCESSING_ERROR\"\n"
+"          | \"${AMDCAUSE}\"=\"FATAL_ERROR\"]?amd_fallback)\n"
 "CLI: amd_ws show settings.   See also: AMD, Playback.\n";
 
 /* ------------------------------------------------------------------------
@@ -290,22 +354,23 @@ static const char description[] =
 #define SAMPLE_RATE            8000
 #define BYTES_PER_MS           16          /* 8 kHz * 16 bit mono */
 #define MAX_SCHEDULE           16          /* entries in send_schedule */
-#define MAX_EXTRA_STATUSES     16
-#define STATUS_TOKEN_LEN       32
+#define STATUS_TOKEN_LEN       32          /* AMDSTATUS */
 #define LOOP_BUDGET_MS         20          /* max ast_waitfor_nandfds budget */
 /*
  * Per-write bound on the socket.  res_http_websocket turns a write that does
- * not complete within this time into a CLOSE 1011 (= NETERR for us), so it
- * must cover one RTT of ACK clocking for a multi-frame flush on a fresh
- * connection over a WAN, while staying far below the ~1.9 s after which the
- * Local channel's read queue overflows.
+ * not complete within this time into a CLOSE 1011 (= PROCESSING_ERROR for
+ * us), so it must cover one RTT of ACK clocking for a multi-frame flush on a
+ * fresh connection over a WAN, while staying far below the ~1.9 s after which
+ * the Local channel's read queue overflows.
  */
 #define WS_WRITE_TIMEOUT_MS    500
 #define WS_MAX_FRAME_BYTES     16000       /* split larger sends (1 s of audio); the core alloca()s a frame copy */
 #define WS_READ_DRAIN_MAX      8           /* frames read per readiness before the channel is serviced again */
 #define ACC_HARD_CAP           (1024 * 1024)
 #define RX_CAP                 16384       /* server text buffer */
-#define MAX_RESPONSE           255         /* AMDRESPONSE length */
+#define MAX_RESPONSE           255         /* AMDRESPONSE length; also AMDCAUSE for MACHINE (raw reply) */
+#define CAUSE_LEN              (MAX_RESPONSE + 1)
+#define MAX_CALLERID_LEN       127         /* caller_id sent in the config JSON */
 #define CONNECT_WARN_S         10          /* connect failure warning per host */
 #define PENDING_WARN_S         60          /* "cap reached" warning per host */
 #define DEF_MAX_PENDING        64          /* default max_pending_connects (per host) */
@@ -331,8 +396,10 @@ struct amd_ws_conf {
 	int schedule[MAX_SCHEDULE];
 	int n_schedule;
 	int chunk_bytes;
-	char extra_statuses[MAX_EXTRA_STATUSES][STATUS_TOKEN_LEN];
-	int n_extra;
+	int fallback_interval_ms;
+	int eof_no_audio_streak;      /* 0 = EOF finalisation disabled */
+	int eof_wait_ms;
+	int send_caller_id;
 	int playdelay_ms;
 	int db;
 	int db_timeout_ms;
@@ -343,8 +410,10 @@ struct amd_ws_conf {
 static struct amd_ws_conf g_conf;
 AST_MUTEX_DEFINE_STATIC(conf_lock);
 
-/* Statistics (ast_atomic_fetchadd_int) */
-static int cnt_calls, cnt_human, cnt_machine, cnt_other, cnt_neterr, cnt_interr, cnt_timeouts, cnt_hangups;
+/* Statistics (ast_atomic_fetchadd_int), one per outcome of the vocabulary */
+static int cnt_calls, cnt_human, cnt_machine, cnt_hangups;
+static int cnt_connection_error, cnt_processing_error, cnt_fatal_error;
+static int cnt_server_timeout, cnt_noaudiodata, cnt_eof_inconclusive, cnt_eof_error;
 
 /*
  * Connect helper threads.  inflight_helpers counts every live helper (a
@@ -353,9 +422,10 @@ static int cnt_calls, cnt_human, cnt_machine, cnt_other, cnt_neterr, cnt_interr,
  * upgrade (and never closes) keeps its helper blocked in the core's handshake
  * read (res_http_websocket gives that read no timeout) after the call gave up
  * at connect_timeout_ms: such PARKED helpers are counted per host, and beyond
- * max_pending_connects new calls to THAT host fail fast with NETERR instead of
- * piling up threads; one dead test host cannot disable production.  A parked
- * helper ends only when the peer closes the socket or Asterisk restarts.
+ * max_pending_connects new calls to THAT host fail fast with CONNECTION_ERROR
+ * instead of piling up threads; one dead test host cannot disable production.
+ * A parked helper ends only when the peer closes the socket or Asterisk
+ * restarts.
  */
 static int inflight_helpers;
 struct pending_slot {
@@ -377,8 +447,8 @@ AST_MUTEX_DEFINE_STATIC(warn_lock);
 
 static void conf_set_defaults(struct amd_ws_conf *c)
 {
-	static const int def_sched[] = { 500, 1000, 1500, 2000, 3000, 4000 };
-	static const char *def_extra[] = { "HONEYPOT", "FAS", "FASAMD", "AUDIO", "NOTSURE" };
+	/* amd.py SEND_TIMES (Jul 2026), MAX_WAIT_TIME, CONNECTION_TIMEOUT, FALLBACK_CHUNK_SIZE */
+	static const int def_sched[] = { 500, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000 };
 	int i;
 
 	memset(c, 0, sizeof(*c));
@@ -388,17 +458,17 @@ static void conf_set_defaults(struct amd_ws_conf *c)
 	c->tls_verify = 1;
 	c->tls_check_hostname = 0;
 	c->timeout_ms = 10000;
-	c->connect_timeout_ms = 2000;
-	c->result_grace_ms = 1000;
+	c->connect_timeout_ms = 10000;
+	c->result_grace_ms = 0;
 	for (i = 0; i < (int) ARRAY_LEN(def_sched); i++) {
 		c->schedule[i] = def_sched[i];
 	}
 	c->n_schedule = ARRAY_LEN(def_sched);
 	c->chunk_bytes = 8000;
-	for (i = 0; i < (int) ARRAY_LEN(def_extra); i++) {
-		ast_copy_string(c->extra_statuses[i], def_extra[i], STATUS_TOKEN_LEN);
-	}
-	c->n_extra = ARRAY_LEN(def_extra);
+	c->fallback_interval_ms = 1000;
+	c->eof_no_audio_streak = 2;
+	c->eof_wait_ms = 3000;
+	c->send_caller_id = 1;
 	c->playdelay_ms = 0;
 #ifdef HAVE_MYSQL
 	c->db = 1;
@@ -456,34 +526,6 @@ static int parse_schedule(const char *val, int *sched, int *n)
 	return 1;
 }
 
-static void str_toupper(char *s)
-{
-	for (; *s; s++) {
-		*s = toupper((unsigned char) *s);
-	}
-}
-
-static int parse_extra_statuses(const char *val, struct amd_ws_conf *c)
-{
-	char *copy = ast_strdupa(S_OR(val, ""));
-	char *tok;
-	int count = 0;
-
-	while ((tok = strsep(&copy, ", "))) {
-		if (ast_strlen_zero(tok)) {
-			continue;
-		}
-		if (count >= MAX_EXTRA_STATUSES || strlen(tok) >= STATUS_TOKEN_LEN) {
-			return 0;
-		}
-		ast_copy_string(c->extra_statuses[count], tok, STATUS_TOKEN_LEN);
-		str_toupper(c->extra_statuses[count]);
-		count++;
-	}
-	c->n_extra = count; /* an empty list is legal: only HUMAN/MACHINE terminate */
-	return 1;
-}
-
 /*! \brief Load amd_ws.conf into g_conf.  Missing file = defaults. */
 static int load_config(int reload)
 {
@@ -534,8 +576,14 @@ static int load_config(int reload)
 			ok = parse_schedule(val, c.schedule, &c.n_schedule);
 		} else if (!strcasecmp(name, "chunk_bytes")) {
 			ok = parse_int(val, 320, 1000000, &c.chunk_bytes);
-		} else if (!strcasecmp(name, "extra_statuses")) {
-			ok = parse_extra_statuses(val, &c);
+		} else if (!strcasecmp(name, "fallback_interval_ms")) {
+			ok = parse_int(val, 1, 600000, &c.fallback_interval_ms);
+		} else if (!strcasecmp(name, "eof_no_audio_streak")) {
+			ok = parse_int(val, 0, MAX_SCHEDULE, &c.eof_no_audio_streak);
+		} else if (!strcasecmp(name, "eof_wait_ms")) {
+			ok = parse_int(val, 1, 600000, &c.eof_wait_ms);
+		} else if (!strcasecmp(name, "send_caller_id")) {
+			c.send_caller_id = ast_false(val) ? 0 : 1;
 		} else if (!strcasecmp(name, "playdelay_ms")) {
 			ok = parse_int(val, 0, 600000, &c.playdelay_ms);
 		} else if (!strcasecmp(name, "db")) {
@@ -555,7 +603,7 @@ static int load_config(int reload)
 		} else if (!strcasecmp(name, "max_pending_connects")) {
 			ok = parse_int(val, 8, 1024, &c.max_pending_connects);
 		} else {
-			ast_log(LOG_WARNING, "AMD_WS: amd_ws.conf: unknown option '%s' at line %d\n", name, v->lineno);
+			ast_log(LOG_WARNING, "AMD_WS: amd_ws.conf: unknown option '%s' at line %d, ignored (removed in 2.0? see amd_ws.conf.sample)\n", name, v->lineno);
 		}
 		if (!ok) {
 			ast_log(LOG_WARNING, "AMD_WS: amd_ws.conf: invalid value '%s' for '%s' at line %d, ignored\n",
@@ -1062,140 +1110,58 @@ static int json_escape(char *dst, size_t dst_size, const char *src)
 	return (int) pos;
 }
 
-/*!
- * \brief Find a JSON string/bare value for "key" in text (cheap manual scan).
- *
- * Looks for  "key" <ws> : <ws> ( "value" | bare-token ).  Returns 1 and copies
- * the (unescaped-as-is) value when found.
- */
-static int json_find_value(const char *text, size_t len, const char *key, char *out, size_t out_sz)
+/*! \brief Case-sensitive substring search over a byte range (embedded NULs allowed, like python's "in") */
+static const char *find_sub(const char *hay, size_t len, const char *needle)
 {
-	size_t klen = strlen(key);
-	const char *end = text + len;
-	const char *p = text;
+	size_t nlen = strlen(needle);
+	const char *p, *end;
 
-	while (p + klen + 2 <= end) {
-		const char *q;
-		size_t n;
-
-		if (*p != '"' || strncasecmp(p + 1, key, klen) || p[klen + 1] != '"') {
-			p++;
-			continue;
-		}
-		q = p + klen + 2;
-		while (q < end && isspace((unsigned char) *q)) {
-			q++;
-		}
-		if (q >= end || *q != ':') {
-			p = q;
-			continue;
-		}
-		q++;
-		while (q < end && isspace((unsigned char) *q)) {
-			q++;
-		}
-		if (q >= end) {
-			return 0;
-		}
-		if (*q == '"') {
-			const char *v = ++q;
-
-			while (q < end && *q != '"') {
-				if (*q == '\\' && q + 1 < end) {
-					q++;
-				}
-				q++;
-			}
-			n = q - v;
-			if (n >= out_sz) {
-				n = out_sz - 1;
-			}
-			memcpy(out, v, n);
-			out[n] = '\0';
-			return 1;
-		} else {
-			const char *v = q;
-
-			while (q < end && !strchr(",}] \t\r\n", *q)) {
-				q++;
-			}
-			n = q - v;
-			if (n >= out_sz) {
-				n = out_sz - 1;
-			}
-			memcpy(out, v, n);
-			out[n] = '\0';
-			return 1;
+	if (nlen > len) {
+		return NULL;
+	}
+	for (p = hay, end = hay + len - nlen; p <= end; p++) {
+		if (*p == needle[0] && !memcmp(p, needle, nlen)) {
+			return p;
 		}
 	}
-	return 0;
+	return NULL;
 }
 
+enum classification {
+	CLASS_ACK = 0,      /* keep going */
+	CLASS_HUMAN,
+	CLASS_MACHINE,
+};
+
 /*!
- * \brief Classify a server TEXT message.
+ * \brief Classify a server TEXT message exactly like amd.py (Jul 2026):
  *
- * Tokenise on any char not in [A-Za-z0-9_], uppercase, and let the FIRST
- * terminal token decide: HUMAN -> HUMAN; MACHINE or AMD -> MACHINE; any token
- * in extra_statuses -> that token verbatim.  If the text is JSON with a
- * "status"/"result"/"classification" key, only that value is tokenised.
- * Tokens like AMDY, NOT_HUMAN, HUMANOID, ACK, OK never match.
+ *   if 'HUMAN' in text:                       HUMAN
+ *   elif 'AMD' in text or 'MACHINE' in text:  MACHINE
+ *   else:                                     ack, keep going
  *
- * \retval 1 terminal result copied into status; 0 = ack / no decision.
+ * Case-sensitive substring semantics, so "NOT_HUMAN" is HUMAN and "amd" is an
+ * ack, as in production.  One guard on top of amd.py: an "AMD" immediately
+ * followed by 'Y' is the brand name ("AMDY ack") and does not count.  Any
+ * other reply (HONEYPOT, "{}", "ack", ...) is an acknowledgement.
  */
-static int classify_text(const char *text, size_t len, const struct amd_ws_conf *conf, char *status, size_t status_sz)
+static enum classification classify_text(const char *text, size_t len)
 {
-	static const char *json_keys[] = { "status", "result", "classification" };
-	char value[512];
-	const char *p, *end;
-	size_t i;
+	const char *p = text, *end = text + len;
 
-	for (i = 0; i < ARRAY_LEN(json_keys); i++) {
-		if (json_find_value(text, len, json_keys[i], value, sizeof(value))) {
-			text = value;
-			len = strlen(value);
-			break;
-		}
+	if (find_sub(text, len, "HUMAN")) {
+		return CLASS_HUMAN;
 	}
-
-	p = text;
-	end = text + len;
-	while (p < end) {
-		char tok[STATUS_TOKEN_LEN];
-		size_t tlen = 0;
-		int truncated = 0;
-
-		while (p < end && !(isalnum((unsigned char) *p) || *p == '_')) {
-			p++;
+	while ((p = find_sub(p, end - p, "AMD"))) {
+		if (p + 3 >= end || p[3] != 'Y') {
+			return CLASS_MACHINE;
 		}
-		while (p < end && (isalnum((unsigned char) *p) || *p == '_')) {
-			if (tlen < sizeof(tok) - 1) {
-				tok[tlen++] = toupper((unsigned char) *p);
-			} else {
-				truncated = 1;
-			}
-			p++;
-		}
-		if (!tlen || truncated) {
-			continue;
-		}
-		tok[tlen] = '\0';
-
-		if (!strcmp(tok, "HUMAN")) {
-			ast_copy_string(status, "HUMAN", status_sz);
-			return 1;
-		}
-		if (!strcmp(tok, "MACHINE") || !strcmp(tok, "AMD")) {
-			ast_copy_string(status, "MACHINE", status_sz);
-			return 1;
-		}
-		for (i = 0; i < (size_t) conf->n_extra; i++) {
-			if (!strcmp(tok, conf->extra_statuses[i])) {
-				ast_copy_string(status, tok, status_sz);
-				return 1;
-			}
-		}
+		p += 3;
 	}
-	return 0;
+	if (find_sub(text, len, "MACHINE")) {
+		return CLASS_MACHINE;
+	}
+	return CLASS_ACK;
 }
 
 /*! \brief Copy printable ASCII only (max MAX_RESPONSE chars) for AMDRESPONSE */
@@ -1485,6 +1451,7 @@ enum {
 	OPT_CODE      = (1 << 5),
 	OPT_ANSWER    = (1 << 6),
 	OPT_NOANSWER  = (1 << 7),
+	OPT_CALLERID  = (1 << 8),
 };
 
 enum {
@@ -1492,6 +1459,7 @@ enum {
 	OPT_ARG_CONNTO,
 	OPT_ARG_PHONE,
 	OPT_ARG_CODE,
+	OPT_ARG_CALLERID,
 	OPT_ARG_ARRAY_SIZE,
 };
 
@@ -1502,6 +1470,7 @@ AST_APP_OPTIONS(amd_ws_options, {
 	AST_APP_OPTION_ARG('c', OPT_CONNTO, OPT_ARG_CONNTO),
 	AST_APP_OPTION_ARG('p', OPT_PHONE, OPT_ARG_PHONE),
 	AST_APP_OPTION_ARG('k', OPT_CODE, OPT_ARG_CODE),
+	AST_APP_OPTION_ARG('i', OPT_CALLERID, OPT_ARG_CALLERID),
 	AST_APP_OPTION('a', OPT_ANSWER),
 	AST_APP_OPTION('A', OPT_NOANSWER),
 });
@@ -1509,6 +1478,7 @@ AST_APP_OPTIONS(amd_ws_options, {
 enum call_phase {
 	PHASE_CONNECT = 0,   /* helper thread connecting; channel already read */
 	PHASE_STREAM,        /* connected, config sent, sending on schedule */
+	PHASE_EOF_WAIT,      /* {"eof":1} sent after empty marks; waiting eof_wait_ms for ONE reply */
 	PHASE_GRACE,         /* timeout_ms elapsed; waiting result_grace_ms for a reply */
 };
 
@@ -1533,6 +1503,7 @@ struct amd_call {
 	int use_tls;
 	char phone[64];
 	char country[32];
+	char caller_id[MAX_CALLERID_LEN + 1];
 	char *playlist;                   /* '&'-separated, consumed by strsep */
 	const char *playfile_display;
 
@@ -1546,6 +1517,8 @@ struct amd_call {
 	struct timeval t_app;
 	struct timeval t_connect;         /* connect job started (connect deadline runs from here) */
 	struct timeval t_first;           /* first voice frame; zero if none yet */
+	struct timeval t_last_send;       /* last audio send (t_first until then): fallback interval */
+	struct timeval t_eof;             /* EOF finalisation started */
 	int have_audio;
 
 	/* audio accumulator (heap) */
@@ -1553,6 +1526,7 @@ struct amd_call {
 	size_t acc_cap;
 	size_t acc_len;
 	int sched_idx;                    /* next schedule mark to fire */
+	int no_audio_streak;              /* consecutive marks with nothing pending (amd.py no_audio_streak) */
 
 	/* server text (heap) */
 	char *rx;
@@ -1562,14 +1536,15 @@ struct amd_call {
 	long bytes_captured;
 	long bytes_sent;
 	long bytes_dropped;
-	int chunks;
-	int acks;
+	int chunks;                       /* binary frames sent */
+	int acks;                         /* non-terminal replies */
+	int replies;                      /* complete text replies of any kind */
 
 	/* outcome */
 	enum call_phase phase;
 	int got_result;
 	char status[STATUS_TOKEN_LEN];
-	char cause[STATUS_TOKEN_LEN];
+	char cause[CAUSE_LEN];
 	char response[MAX_RESPONSE + 1];
 
 	/* playback */
@@ -1609,13 +1584,14 @@ static void acc_append(struct amd_call *c, const unsigned char *data, size_t len
 	}
 	memcpy(c->acc + c->acc_len, data, len);
 	c->acc_len += len;
+	c->no_audio_streak = 0;   /* amd.py: "Reset streak when audio arrives" */
 }
 
 /*!
  * \brief Send everything accumulated as BINARY frame(s).
  * \retval 0 ok, -1 write error (connection is lost).
  */
-static int acc_flush(struct amd_call *c)
+static int acc_flush(struct amd_call *c, struct timeval now)
 {
 	size_t off = 0;
 
@@ -1641,47 +1617,84 @@ static int acc_flush(struct amd_call *c)
 	ast_debug(3, "AMD_WS: %s sent %zu bytes (total %ld in %d chunks)\n",
 		ast_channel_name(c->chan), c->acc_len, c->bytes_sent, c->chunks);
 	c->acc_len = 0;
+	c->t_last_send = now;
 	return 0;
 }
 
+enum sched_result {
+	SCHED_OK = 0,        /* nothing decisive (sent or not) */
+	SCHED_EOF = 1,       /* start the EOF finalisation */
+	SCHED_LOST = -1,     /* write error: connection lost */
+};
+
 /*!
- * \brief Fire due schedule marks / size-based sends.  Called when connected.
+ * \brief Fire due schedule marks / fallback sends.  Called when connected.
  *
- * At each mark send everything accumulated so far (a mark with nothing
- * accumulated is simply consumed); after the last mark send whenever
- * >= chunk_bytes are pending.
+ * amd.py (Jul 2026) semantics: at each mark send everything accumulated so
+ * far; a mark with nothing pending is a "NO AUDIO DATA" mark and counts
+ * toward no_audio_streak (any captured audio resets it); when the streak
+ * reaches eof_no_audio_streak and audio was sent before, the EOF
+ * finalisation starts.  After the last mark a send happens whenever
+ * >= chunk_bytes are pending, or fallback_interval_ms passed since the last
+ * send with anything pending.
+ *
+ * Several marks can be due at once only right after a slow connect (the
+ * schedule clock started at the first captured frame, before the socket was
+ * up): they are one event then - one flush covers them all and none of them
+ * is an empty mark.  In steady state the loop runs every <= 20 ms, so marks
+ * are processed one at a time exactly like amd.py.
  */
-static int acc_service_schedule(struct amd_call *c, struct timeval now)
+static enum sched_result acc_service_schedule(struct amd_call *c, struct timeval now)
 {
 	int64_t since_first;
-	int due = 0;
+	int sent_now = 0;
 
 	if (!c->have_audio) {
-		return 0;
+		return SCHED_OK;
 	}
 	since_first = ast_tvdiff_ms(now, c->t_first);
 	while (c->sched_idx < c->conf.n_schedule && since_first >= c->conf.schedule[c->sched_idx]) {
-		c->sched_idx++;
-		due = 1;
+		int mark = c->conf.schedule[c->sched_idx++];
+
+		if (c->acc_len) {
+			if (acc_flush(c, now)) {
+				return SCHED_LOST;
+			}
+			sent_now = 1;
+		} else if (!sent_now) {
+			c->no_audio_streak++;
+			ast_debug(2, "AMD_WS: %s mark %d ms: no audio data (streak %d, sent %ld)\n",
+				ast_channel_name(c->chan), mark, c->no_audio_streak, c->bytes_sent);
+			if (c->conf.eof_no_audio_streak && c->no_audio_streak >= c->conf.eof_no_audio_streak && c->bytes_sent > 0) {
+				return SCHED_EOF;
+			}
+		}
 	}
-	if (c->sched_idx >= c->conf.n_schedule && c->acc_len >= (size_t) c->conf.chunk_bytes) {
-		due = 1;
+	if (c->sched_idx >= c->conf.n_schedule && c->acc_len
+		&& (c->acc_len >= (size_t) c->conf.chunk_bytes
+			|| ast_tvdiff_ms(now, c->t_last_send) >= c->conf.fallback_interval_ms)) {
+		if (acc_flush(c, now)) {
+			return SCHED_LOST;
+		}
 	}
-	if (due && c->acc_len) {
-		return acc_flush(c);
-	}
-	return 0;
+	return SCHED_OK;
 }
 
-/*! \brief ms until the next scheduled send (or -1 if none pending) */
+/*! \brief ms until the next time-driven send: schedule mark or fallback interval (-1 if none pending) */
 static int acc_ms_to_next_mark(const struct amd_call *c, struct timeval now)
 {
 	int64_t ms;
 
-	if (!c->have_audio || c->sched_idx >= c->conf.n_schedule) {
+	if (!c->have_audio) {
 		return -1;
 	}
-	ms = c->conf.schedule[c->sched_idx] - ast_tvdiff_ms(now, c->t_first);
+	if (c->sched_idx < c->conf.n_schedule) {
+		ms = c->conf.schedule[c->sched_idx] - ast_tvdiff_ms(now, c->t_first);
+	} else if (c->acc_len) {
+		ms = c->conf.fallback_interval_ms - ast_tvdiff_ms(now, c->t_last_send);
+	} else {
+		return -1;
+	}
 	return ms < 0 ? 0 : (int) ms;
 }
 
@@ -1785,45 +1798,43 @@ static void set_outcome(struct amd_call *c, const char *status, const char *caus
 	ast_copy_string(c->cause, cause, sizeof(c->cause));
 }
 
-/*! \brief Build the config JSON; returns 0 on success */
+/*! \brief Append ,"key":"<escaped value>" when value is non-empty; returns the new length or -1 */
+static int json_append_kv(char *out, size_t out_sz, int n, const char *key, const char *value)
+{
+	char esc[MAX_VID_LEN * 6 + 1];   /* the longest value we ever pass is the vid */
+	int m;
+
+	if (ast_strlen_zero(value) || json_escape(esc, sizeof(esc), value) < 0) {
+		return n;   /* omitted, as amd.py omits a missing value */
+	}
+	m = snprintf(out + n, out_sz - n, ",\"%s\":\"%s\"", key, esc);
+	if (m < 0 || (size_t) m >= out_sz - n) {
+		return -1;
+	}
+	return n + m;
+}
+
+/*!
+ * \brief Build the config JSON (amd.py Jul 2026, keys in this order):
+ *   {"config":{"sample_rate":8000,"VID":"<vid>"[,"phone":".."][,"country_code":".."][,"caller_id":".."]}}
+ * Returns 0 on success.
+ */
 static int build_config_json(struct amd_call *c, char *out, size_t out_sz)
 {
 	char vid_esc[MAX_VID_LEN * 6 + 1];
-	char phone_esc[sizeof(c->phone) * 6 + 1];
-	char code_esc[sizeof(c->country) * 6 + 1];
 	int n;
 
 	if (json_escape(vid_esc, sizeof(vid_esc), c->vid) < 0) {
 		ast_copy_string(vid_esc, "Unknown", sizeof(vid_esc));
 	}
-	phone_esc[0] = '\0';
-	code_esc[0] = '\0';
-	if (!ast_strlen_zero(c->phone) && json_escape(phone_esc, sizeof(phone_esc), c->phone) < 0) {
-		phone_esc[0] = '\0';
-	}
-	if (!ast_strlen_zero(c->country) && json_escape(code_esc, sizeof(code_esc), c->country) < 0) {
-		code_esc[0] = '\0';
-	}
-
 	n = snprintf(out, out_sz, "{\"config\":{\"sample_rate\":%d,\"VID\":\"%s\"", SAMPLE_RATE, vid_esc);
 	if (n < 0 || (size_t) n >= out_sz) {
 		return -1;
 	}
-	if (phone_esc[0]) {
-		int m = snprintf(out + n, out_sz - n, ",\"phone\":\"%s\"", phone_esc);
-
-		if (m < 0 || (size_t) m >= out_sz - n) {
-			return -1;
-		}
-		n += m;
-	}
-	if (code_esc[0]) {
-		int m = snprintf(out + n, out_sz - n, ",\"country_code\":\"%s\"", code_esc);
-
-		if (m < 0 || (size_t) m >= out_sz - n) {
-			return -1;
-		}
-		n += m;
+	if ((n = json_append_kv(out, out_sz, n, "phone", c->phone)) < 0
+		|| (n = json_append_kv(out, out_sz, n, "country_code", c->country)) < 0
+		|| (n = json_append_kv(out, out_sz, n, "caller_id", c->caller_id)) < 0) {
+		return -1;
 	}
 	if ((size_t) n + 3 > out_sz) {
 		return -1;
@@ -1834,7 +1845,8 @@ static int build_config_json(struct amd_call *c, char *out, size_t out_sz)
 
 /*!
  * \brief Attach a freshly connected websocket: non-blocking fd, write timeout,
- *        config TEXT frame.  Returns 0 on success (-1 = NETERR).
+ *        config TEXT frame.  Returns 0 on success (-1 = CONNECTION_ERROR: amd.py
+ *        sends the config inside its connect try-block).
  */
 static int ws_attach(struct amd_call *c, struct ast_websocket *ws, const char *config_json)
 {
@@ -1919,12 +1931,23 @@ static int ws_service_read(struct amd_call *c)
 
 	sanitize_response(c->rx, c->rx_len, c->response, sizeof(c->response));
 	ast_debug(2, "AMD_WS: %s server text: %s\n", ast_channel_name(c->chan), c->response);
+	c->replies++;
 
-	if (classify_text(c->rx, c->rx_len, &c->conf, c->status, sizeof(c->status))) {
-		ast_copy_string(c->cause, c->status, sizeof(c->cause));
+	switch (classify_text(c->rx, c->rx_len)) {
+	case CLASS_HUMAN:
+		/* amd.py:293 - AMDCAUSE is the literal HUMAN, the reply goes to AMDRESPONSE */
+		set_outcome(c, "HUMAN", "HUMAN");
 		c->got_result = 1;
 		c->rx_len = 0;
 		return 1;
+	case CLASS_MACHINE:
+		/* amd.py:298 - AMDCAUSE is the raw reply text (sanitised, <= 255) */
+		set_outcome(c, "MACHINE", c->response);
+		c->got_result = 1;
+		c->rx_len = 0;
+		return 1;
+	case CLASS_ACK:
+		break;
 	}
 	c->acks++;
 	c->rx_len = 0;
@@ -1989,7 +2012,7 @@ static void ws_release(struct amd_call *c)
  * which would break a later System() in the same dialplan.
  *
  * \retval 0 started, 1 refused because too many connects to this host are in
- *         flight (NETERR), -1 internal failure (INTERR)
+ *         flight (CONNECTION_ERROR), -1 internal failure (FATAL_ERROR)
  */
 static int start_connect(struct amd_call *c, int do_db)
 {
@@ -2018,7 +2041,7 @@ static int start_connect(struct amd_call *c, int do_db)
 
 	if (pending_cap_reached(c->host, c->conf.max_pending_connects, &warn)) {
 		if (warn) {
-			ast_log(LOG_WARNING, "AMD_WS: %d connects to %s still pending (max_pending_connects), failing fast with NETERR until the server closes them (suppressed for %d s)\n",
+			ast_log(LOG_WARNING, "AMD_WS: %d connects to %s still pending (max_pending_connects), failing fast with CONNECTION_ERROR until the server closes them (suppressed for %d s)\n",
 				c->conf.max_pending_connects, c->host, PENDING_WARN_S);
 		}
 		return 1;
@@ -2082,23 +2105,38 @@ static void job_take_db(struct amd_call *c)
 	}
 }
 
+/*! \brief One counter per outcome of the vocabulary (MACHINE by status: its cause is the raw reply) */
 static void count_outcome(const struct amd_call *c)
 {
+	static const struct {
+		const char *cause;
+		int *counter;
+	} by_cause[] = {
+		{ "HUMAN",            &cnt_human },
+		{ "HANGUP",           &cnt_hangups },
+		{ "CONNECTION_ERROR", &cnt_connection_error },
+		{ "PROCESSING_ERROR", &cnt_processing_error },
+		{ "FATAL_ERROR",      &cnt_fatal_error },
+		{ "SERVER_TIMEOUT",   &cnt_server_timeout },
+		{ "EOF_INCONCLUSIVE", &cnt_eof_inconclusive },
+		{ "EOF_ERROR",        &cnt_eof_error },
+	};
+	size_t i;
+
 	ast_atomic_fetchadd_int(&cnt_calls, 1);
-	if (!strcmp(c->cause, "NETERR")) {
-		ast_atomic_fetchadd_int(&cnt_neterr, 1);
-	} else if (!strcmp(c->cause, "INTERR")) {
-		ast_atomic_fetchadd_int(&cnt_interr, 1);
-	} else if (!strcmp(c->cause, "HANGUP")) {
-		ast_atomic_fetchadd_int(&cnt_hangups, 1);
-	} else if (!strcmp(c->cause, "AUDIO_TIMEOUT") || !strcmp(c->cause, "NO_AUDIO_TIMEOUT")) {
-		ast_atomic_fetchadd_int(&cnt_timeouts, 1);
-	} else if (!strcmp(c->status, "HUMAN")) {
-		ast_atomic_fetchadd_int(&cnt_human, 1);
-	} else if (!strcmp(c->status, "MACHINE")) {
+	if (!strcmp(c->status, "MACHINE")) {
 		ast_atomic_fetchadd_int(&cnt_machine, 1);
-	} else {
-		ast_atomic_fetchadd_int(&cnt_other, 1);
+		return;
+	}
+	if (!strncmp(c->cause, "NOAUDIODATA-", 12)) {
+		ast_atomic_fetchadd_int(&cnt_noaudiodata, 1);
+		return;
+	}
+	for (i = 0; i < ARRAY_LEN(by_cause); i++) {
+		if (!strcmp(c->cause, by_cause[i].cause)) {
+			ast_atomic_fetchadd_int(by_cause[i].counter, 1);
+			return;
+		}
 	}
 }
 
@@ -2113,9 +2151,10 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 	struct ast_flags opts = { 0 };
 	char *opt_args[OPT_ARG_ARRAY_SIZE] = { NULL };
 	char *parse;
-	char config_json[MAX_VID_LEN * 6 + sizeof(c.phone) * 6 + sizeof(c.country) * 6 + 128];
+	char config_json[(MAX_VID_LEN + sizeof(c.phone) + sizeof(c.country) + sizeof(c.caller_id)) * 6 + 128];
 	int64_t elapsed_ms;
 	char elapsed_str[24];
+	char stats_str[96];
 	int v;
 	AST_DECLARE_APP_ARGS(args,
 		AST_APP_ARG(host);
@@ -2131,7 +2170,8 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 	c.wsfd = -1;
 	c.t_app = ast_tvnow();
 	conf_snapshot(&c.conf);
-	set_outcome(&c, "NOTSURE", "INTERR");
+	/* amd.py:537 - anything that goes wrong before the connect is FATAL_ERROR, and errors are HUMAN */
+	set_outcome(&c, "HUMAN", "FATAL_ERROR");
 
 	/* ---- arguments -------------------------------------------------- */
 	parse = ast_strdupa(S_OR(data, ""));
@@ -2199,6 +2239,24 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 	if (ast_test_flag(&opts, OPT_CODE) && !ast_strlen_zero(opt_args[OPT_ARG_CODE])) {
 		ast_copy_string(c.country, opt_args[OPT_ARG_CODE], sizeof(c.country));
 	}
+	/*
+	 * caller_id (amd.py:197-200): i(cid), else CALLERID(num) unless the conf says
+	 * send_caller_id=no.  amd.py skips "Unknown"; the AGI environment spells a
+	 * missing number "unknown", so both spellings are skipped here.
+	 */
+	if (ast_test_flag(&opts, OPT_CALLERID)) {
+		ast_copy_string(c.caller_id, S_OR(opt_args[OPT_ARG_CALLERID], ""), sizeof(c.caller_id));
+	} else if (c.conf.send_caller_id) {
+		const char *cid_num;
+
+		ast_channel_lock(chan);
+		cid_num = S_COR(ast_channel_caller(chan)->id.number.valid, ast_channel_caller(chan)->id.number.str, NULL);
+		ast_copy_string(c.caller_id, S_OR(cid_num, ""), sizeof(c.caller_id));
+		ast_channel_unlock(chan);
+	}
+	if (!strcasecmp(c.caller_id, "unknown")) {
+		c.caller_id[0] = '\0';
+	}
 	if (!ast_strlen_zero(args.playfile)) {
 		c.playlist = ast_strdupa(args.playfile);
 		c.playfile_display = args.playfile;
@@ -2260,14 +2318,15 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 	v = start_connect(&c, v);
 	if (v) {
 		if (v > 0) {
-			set_outcome(&c, "NOTSURE", "NETERR");
+			set_outcome(&c, "HUMAN", "CONNECTION_ERROR");
 		}
 		goto finish;
 	}
 
 	/* ---- main loop -------------------------------------------------- */
 	c.phase = PHASE_CONNECT;
-	set_outcome(&c, "NOTSURE", "NETERR");
+	/* amd.py:214 - "AMD service unavailable - defaulting to HUMAN for safety" */
+	set_outcome(&c, "HUMAN", "CONNECTION_ERROR");
 
 	for (;;) {
 		struct timeval now = ast_tvnow();
@@ -2310,51 +2369,85 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 				c.job = NULL;
 				if (!ws) {
 					if ((int) wr == -1) {
-						ast_log(LOG_ERROR, "AMD_WS: %s res_http_websocket is not loaded\n", ast_channel_name(chan));
-						set_outcome(&c, "NOTSURE", "INTERR");
+						/* the OPTIONAL_API stub ran: no client at all = cannot connect (addendum table A) */
+						ast_log(LOG_ERROR, "AMD_WS: %s res_http_websocket is not loaded, cannot connect\n", ast_channel_name(chan));
 					} else if (connect_warn_allowed(c.host)) {
 						ast_log(LOG_WARNING, "AMD_WS: connect to %s://%s:%d failed: %s (suppressed for %d s)\n",
 							c.use_tls ? "wss" : "ws", c.host, c.port, ws_result_str(wr), CONNECT_WARN_S);
 					}
-					break;
+					break;   /* CONNECTION_ERROR */
 				}
 				if (build_config_json(&c, config_json, sizeof(config_json))) {
 					ast_log(LOG_WARNING, "AMD_WS: %s config JSON too large\n", ast_channel_name(chan));
 					c.ws = ws;
 					c.ws_lost = 1;   /* nothing was sent; ws_release() still closes it */
-					set_outcome(&c, "NOTSURE", "INTERR");
+					set_outcome(&c, "HUMAN", "FATAL_ERROR");
 					break;
 				}
 				if (ws_attach(&c, ws, config_json)) {
-					break;
+					break;   /* CONNECTION_ERROR */
 				}
 				c.phase = PHASE_STREAM;
+				/* amd.py:310,476 - from here on a lost socket is a PROCESSING_ERROR */
+				set_outcome(&c, "HUMAN", "PROCESSING_ERROR");
 				ast_debug(1, "AMD_WS: %s connected after %" PRId64 " ms\n", ast_channel_name(chan), ast_tvdiff_ms(now, c.t_connect));
 			}
 		}
 
 		if (c.phase == PHASE_STREAM) {
 			if (detect_left <= 0) {
+				/* amd.py:377-388 - MAX_WAIT_TIME; stock app_amd vocabulary for the no-audio case */
 				if (!c.have_audio) {
-					set_outcome(&c, "NOTSURE", "NO_AUDIO_TIMEOUT");
+					char cause[STATUS_TOKEN_LEN];
+
+					snprintf(cause, sizeof(cause), "NOAUDIODATA-%" PRId64, ast_tvdiff_ms(now, t_ref));
+					set_outcome(&c, "NOTSURE", cause);
 					break;
 				}
-				/* flush what is left and give the server result_grace_ms */
-				if (c.acc_len && acc_flush(&c)) {
-					break;   /* NETERR */
+				set_outcome(&c, "NOTSURE", "SERVER_TIMEOUT");
+				if (c.conf.result_grace_ms <= 0) {
+					break;   /* amd.py returns at once */
+				}
+				/* v2 extra: flush what is left and give the server result_grace_ms */
+				if (c.acc_len && acc_flush(&c, now)) {
+					set_outcome(&c, "HUMAN", "PROCESSING_ERROR");
+					break;
 				}
 				c.phase = PHASE_GRACE;
-				set_outcome(&c, "NOTSURE", "AUDIO_TIMEOUT");
 				ast_debug(1, "AMD_WS: %s timeout, waiting %d ms grace for a result\n",
 					ast_channel_name(chan), c.conf.result_grace_ms);
-			} else if (acc_service_schedule(&c, now)) {
-				break;   /* NETERR */
+			} else {
+				enum sched_result sr = acc_service_schedule(&c, now);
+
+				if (sr == SCHED_LOST) {
+					break;   /* PROCESSING_ERROR */
+				}
+				if (sr == SCHED_EOF) {
+					/* amd.py:408-416 - force the server to finalise, then wait for ONE reply */
+					ast_debug(1, "AMD_WS: %s no audio at %d consecutive marks after %ld bytes sent: sending eof to force finalisation\n",
+						ast_channel_name(chan), c.no_audio_streak, c.bytes_sent);
+					set_outcome(&c, "NOTSURE", "EOF_ERROR");
+					if (ast_websocket_write_string(c.ws, "{\"eof\":1}")) {
+						ast_debug(1, "AMD_WS: %s eof write failed\n", ast_channel_name(chan));
+						c.ws_lost = 1;
+						break;   /* EOF_ERROR */
+					}
+					c.phase = PHASE_EOF_WAIT;
+					c.t_eof = now;
+				}
+			}
+		}
+
+		if (c.phase == PHASE_EOF_WAIT) {
+			if (ast_tvdiff_ms(now, c.t_eof) >= c.conf.eof_wait_ms) {
+				ast_debug(1, "AMD_WS: %s no eof finalisation reply within %d ms\n", ast_channel_name(chan), c.conf.eof_wait_ms);
+				break;   /* EOF_ERROR */
 			}
 		}
 
 		if (c.phase == PHASE_GRACE) {
 			if (-detect_left >= c.conf.result_grace_ms) {
-				break;   /* AUDIO_TIMEOUT */
+				break;   /* SERVER_TIMEOUT */
 			}
 		}
 
@@ -2365,6 +2458,8 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 		ms = LOOP_BUDGET_MS;
 		if (c.phase == PHASE_GRACE) {
 			m = c.conf.result_grace_ms + (int) detect_left;
+		} else if (c.phase == PHASE_EOF_WAIT) {
+			m = c.conf.eof_wait_ms - (int) ast_tvdiff_ms(now, c.t_eof);
 		} else {
 			m = (int) detect_left;
 		}
@@ -2403,12 +2498,24 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 			int r = ws_service(&c);
 
 			if (r > 0) {
-				break;   /* result */
+				break;   /* result (HUMAN / MACHINE), in any phase */
 			}
 			if (r < 0) {
-				if (!c.got_result) {
-					set_outcome(&c, "NOTSURE", "NETERR");
+				if (!c.got_result && c.phase != PHASE_EOF_WAIT) {
+					set_outcome(&c, "HUMAN", "PROCESSING_ERROR");
 				}
+				break;   /* EOF_WAIT keeps EOF_ERROR (amd.py:431-433) */
+			}
+			/*
+			 * amd.py's send->recv lockstep has consumed every chunk reply before
+			 * it sends the eof, so the next reply is the finalisation answer.
+			 * Replies are read asynchronously here: a text that is still owed
+			 * for a chunk is a chunk ack; the first one beyond that answers
+			 * the eof, and when it was not HUMAN/MACHINE it is inconclusive.
+			 */
+			if (c.phase == PHASE_EOF_WAIT && c.replies > c.chunks) {
+				ast_debug(1, "AMD_WS: %s eof finalisation inconclusive: %s\n", ast_channel_name(chan), c.response);
+				set_outcome(&c, "NOTSURE", "EOF_INCONCLUSIVE");
 				break;
 			}
 		}
@@ -2429,10 +2536,11 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 				if (!c.have_audio) {
 					c.have_audio = 1;
 					c.t_first = ast_tvnow();
+					c.t_last_send = c.t_first;   /* amd.py last_send_time = 0 */
 				}
 				c.bytes_captured += f->datalen;
-				/* in GRACE nothing is sent any more: count, do not accumulate */
-				if (c.phase != PHASE_GRACE) {
+				/* in GRACE / EOF_WAIT nothing is sent any more: count, do not accumulate */
+				if (c.phase != PHASE_GRACE && c.phase != PHASE_EOF_WAIT) {
 					acc_append(&c, f->data.ptr, f->datalen);
 				}
 			}
@@ -2478,9 +2586,13 @@ finish:
 
 	elapsed_ms = ast_tvdiff_ms(ast_tvnow(), c.have_audio ? c.t_first : c.t_app);
 	snprintf(elapsed_str, sizeof(elapsed_str), "%" PRId64, elapsed_ms);
+	/* stock app_amd style dash-separated integers; VD_amd.agi takes the first field as run_time */
+	snprintf(stats_str, sizeof(stats_str), "%" PRId64 "-%ld-%d-%ld",
+		elapsed_ms, c.bytes_sent / BYTES_PER_MS, c.chunks, c.bytes_sent);
 
 	pbx_builtin_setvar_helper(chan, "AMDSTATUS", c.status);
 	pbx_builtin_setvar_helper(chan, "AMDCAUSE", c.cause);
+	pbx_builtin_setvar_helper(chan, "AMDSTATS", stats_str);
 	pbx_builtin_setvar_helper(chan, "AMDRESPONSE", c.response);
 	pbx_builtin_setvar_helper(chan, "AMDELAPSED", elapsed_str);
 
@@ -2541,11 +2653,10 @@ static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	}
 	ast_cli(a->fd, "  send_schedule       : %s\n", buf);
 	ast_cli(a->fd, "  chunk_bytes         : %d\n", c.chunk_bytes);
-	buf[0] = '\0';
-	for (i = 0, n = 0; i < c.n_extra && n < (int) sizeof(buf) - STATUS_TOKEN_LEN - 2; i++) {
-		n += snprintf(buf + n, sizeof(buf) - n, "%s%s", i ? "," : "", c.extra_statuses[i]);
-	}
-	ast_cli(a->fd, "  extra_statuses      : %s\n", buf);
+	ast_cli(a->fd, "  fallback_interval_ms: %d\n", c.fallback_interval_ms);
+	ast_cli(a->fd, "  eof_no_audio_streak : %d%s\n", c.eof_no_audio_streak, c.eof_no_audio_streak ? "" : " (EOF finalisation disabled)");
+	ast_cli(a->fd, "  eof_wait_ms         : %d\n", c.eof_wait_ms);
+	ast_cli(a->fd, "  send_caller_id      : %s\n", AST_CLI_YESNO(c.send_caller_id));
 	ast_cli(a->fd, "  playdelay_ms        : %d\n", c.playdelay_ms);
 	ast_cli(a->fd, "  db                  : %s (%s)\n", AST_CLI_YESNO(c.db), db_availability());
 	ast_cli(a->fd, "  db_timeout_ms       : %d\n", c.db_timeout_ms);
@@ -2553,15 +2664,18 @@ static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 		creds.loaded ? "read" : "NOT READ - DB lookup skipped");
 	ast_cli(a->fd, "  db server           : %s:%d/%s user=%s\n", creds.server, creds.port, creds.database, creds.user);
 	ast_cli(a->fd, "  max_pending_connects: %d (per host)\n", c.max_pending_connects);
-	ast_cli(a->fd, "\nCounters\n");
+	ast_cli(a->fd, "\nCounters (AMDSTATUS/AMDCAUSE)\n");
 	ast_cli(a->fd, "  calls               : %d\n", cnt_calls);
-	ast_cli(a->fd, "  human               : %d\n", cnt_human);
-	ast_cli(a->fd, "  machine             : %d\n", cnt_machine);
-	ast_cli(a->fd, "  other               : %d\n", cnt_other);
-	ast_cli(a->fd, "  neterr              : %d\n", cnt_neterr);
-	ast_cli(a->fd, "  interr              : %d\n", cnt_interr);
-	ast_cli(a->fd, "  timeouts            : %d\n", cnt_timeouts);
-	ast_cli(a->fd, "  hangups             : %d\n", cnt_hangups);
+	ast_cli(a->fd, "  human               : %d  (HUMAN/HUMAN)\n", cnt_human);
+	ast_cli(a->fd, "  machine             : %d  (MACHINE/<reply>)\n", cnt_machine);
+	ast_cli(a->fd, "  hangups             : %d  (HANGUP/HANGUP)\n", cnt_hangups);
+	ast_cli(a->fd, "  connection_error    : %d  (HUMAN/CONNECTION_ERROR)\n", cnt_connection_error);
+	ast_cli(a->fd, "  processing_error    : %d  (HUMAN/PROCESSING_ERROR)\n", cnt_processing_error);
+	ast_cli(a->fd, "  fatal_error         : %d  (HUMAN/FATAL_ERROR)\n", cnt_fatal_error);
+	ast_cli(a->fd, "  server_timeout      : %d  (NOTSURE/SERVER_TIMEOUT)\n", cnt_server_timeout);
+	ast_cli(a->fd, "  noaudiodata         : %d  (NOTSURE/NOAUDIODATA-<ms>)\n", cnt_noaudiodata);
+	ast_cli(a->fd, "  eof_inconclusive    : %d  (NOTSURE/EOF_INCONCLUSIVE)\n", cnt_eof_inconclusive);
+	ast_cli(a->fd, "  eof_error           : %d  (NOTSURE/EOF_ERROR)\n", cnt_eof_error);
 	ast_cli(a->fd, "  connects in flight  : %d (helper threads currently connecting)\n", inflight_helpers);
 	ast_mutex_lock(&pending_lock);
 	ast_cli(a->fd, "  parked connects     : %d (max %d per host: the call gave up, the thread waits for the peer to close)\n",
@@ -2569,7 +2683,7 @@ static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	for (i = 0; i < MAX_PENDING_HOSTS; i++) {
 		if (pending_hosts[i].count > 0) {
 			ast_cli(a->fd, "    %-18s: %d%s\n", pending_hosts[i].host, pending_hosts[i].count,
-				pending_hosts[i].count >= c.max_pending_connects ? "  (cap reached: calls to this host fail fast with NETERR)" : "");
+				pending_hosts[i].count >= c.max_pending_connects ? "  (cap reached: calls to this host fail fast with CONNECTION_ERROR)" : "");
 		}
 	}
 	ast_mutex_unlock(&pending_lock);
