@@ -204,7 +204,7 @@ install_deps() {
     else
         mysql_dev_candidates
         local p ok=0
-        for p in "${MYSQL_DEV_PKGS[@]}"; do
+        for p in ${MYSQL_DEV_PKGS[@]+"${MYSQL_DEV_PKGS[@]}"}; do   # (empty-array safe on bash 4.2)
             if pkg_install "$p" && have_mysql_dev; then ok=1; break; fi
         done
         if [ $ok = 0 ]; then
