@@ -97,6 +97,7 @@
 #include "asterisk.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <unistd.h>
 
 /*
@@ -166,11 +167,11 @@
 					</option>
 					<option name="p">
 						<argument name="phone" required="true" />
-						<para>Supply the phone number explicitly (skips the DB for phone; sent as <literal>phone</literal>).</para>
+						<para>Supply the phone number explicitly (sent as <literal>phone</literal>; p() or k() skips the DB lookup).</para>
 					</option>
 					<option name="k">
 						<argument name="code" required="true" />
-						<para>Supply the country/phone code explicitly (sent as <literal>country_code</literal>).</para>
+						<para>Supply the country/phone code explicitly (sent as <literal>country_code</literal>; p() or k() skips the DB lookup).</para>
 					</option>
 					<option name="a">
 						<para>Answer the channel if it is not up (default).</para>
@@ -246,7 +247,7 @@ static const char description[] =
 "              s         TLS (wss://); verification per conf tls_verify\n"
 "              d(ms)     playdelay_ms override\n"
 "              c(ms)     connect timeout override (conf connect_timeout_ms, 2000)\n"
-"              p(phone)  phone number sent as \"phone\" (skips DB for phone)\n"
+"              p(phone)  phone number sent as \"phone\" (p or k skips the DB lookup)\n"
 "              k(code)   country/phone code sent as \"country_code\"\n"
 "              a         answer the channel if not up (default)\n"
 "              A         do NOT answer; fail with INTERR if the channel is not up\n"
@@ -291,6 +292,7 @@ static const char description[] =
 #define RX_CAP                 16384       /* server text buffer */
 #define MAX_RESPONSE           255         /* AMDRESPONSE length */
 #define CONNECT_WARN_S         10          /* connect failure warning per host */
+#define MAX_PENDING_CONNECTS   64          /* helper threads allowed in flight */
 #define DB_WARN_S              60          /* DB warning rate limit */
 #define DB_BACKOFF_S           5           /* skip the DB this long after a failure */
 #define MAX_VID_LEN            255
@@ -325,6 +327,14 @@ AST_MUTEX_DEFINE_STATIC(conf_lock);
 
 /* Statistics (ast_atomic_fetchadd_int) */
 static int cnt_calls, cnt_human, cnt_machine, cnt_other, cnt_neterr, cnt_interr, cnt_timeouts, cnt_hangups;
+
+/*
+ * Connect helper threads in flight.  A server that accepts TCP but never
+ * answers the HTTP upgrade (and never closes) keeps its helper blocked in the
+ * core's handshake read, so the count is capped: beyond MAX_PENDING_CONNECTS
+ * new calls fail fast with NETERR instead of piling up threads.
+ */
+static int pending_connects;
 
 /* Rate limiting of repeated warnings */
 struct warn_slot {
@@ -1242,6 +1252,7 @@ static void *connect_thread(void *data)
 
 	job_connect(job);
 	job_unref(job);
+	ast_atomic_fetchadd_int(&pending_connects, -1);
 	ast_module_unref(AST_MODULE_SELF);
 	return NULL;
 }
@@ -1748,16 +1759,32 @@ static void ws_release(struct amd_call *c)
 }
 
 /*!
- * \brief Start the connect job on a helper thread.  Falls back to a synchronous
- *        connect if no thread can be created.  Returns 0 or -1 (INTERR).
+ * \brief Start the connect job on a helper thread.
+ *
+ * The connect is never run on the PBX thread: besides blocking it, the core's
+ * tcptls client marks the calling thread with ast_thread_inhibit_escalations(),
+ * which would break a later System() in the same dialplan.
+ *
+ * \retval 0 started, 1 refused because too many connects are in flight (NETERR),
+ *         -1 internal failure (INTERR)
  */
 static int start_connect(struct amd_call *c)
 {
 	struct connect_job *job;
 	pthread_t tid;
 
+	if (ast_atomic_fetchadd_int(&pending_connects, 1) >= MAX_PENDING_CONNECTS) {
+		ast_atomic_fetchadd_int(&pending_connects, -1);
+		if (connect_warn_allowed(c->host)) {
+			ast_log(LOG_WARNING, "AMD_WS: %d connects to %s still pending, failing fast (suppressed for %d s)\n",
+				MAX_PENDING_CONNECTS, c->host, CONNECT_WARN_S);
+		}
+		return 1;
+	}
+
 	job = ast_calloc(1, sizeof(*job));
 	if (!job) {
+		ast_atomic_fetchadd_int(&pending_connects, -1);
 		return -1;
 	}
 	ast_mutex_init(&job->lock);
@@ -1771,6 +1798,7 @@ static int start_connect(struct amd_call *c)
 		if (!job->tls_cfg) {
 			ast_mutex_destroy(&job->lock);
 			ast_free(job);
+			ast_atomic_fetchadd_int(&pending_connects, -1);
 			return -1;
 		}
 	}
@@ -1778,10 +1806,13 @@ static int start_connect(struct amd_call *c)
 	/* The helper holds a module reference so an unload cannot race its tail. */
 	ast_module_ref(AST_MODULE_SELF);
 	if (ast_pthread_create_detached_background(&tid, NULL, connect_thread, job)) {
+		ast_log(LOG_ERROR, "AMD_WS: %s cannot create connect thread: %s\n", ast_channel_name(c->chan), strerror(errno));
 		ast_module_unref(AST_MODULE_SELF);
-		ast_log(LOG_WARNING, "AMD_WS: %s cannot create connect thread, connecting inline\n", ast_channel_name(c->chan));
-		job->refs = 1;
-		job_connect(job);
+		ast_atomic_fetchadd_int(&pending_connects, -1);
+		tls_cfg_free(job->tls_cfg);
+		ast_mutex_destroy(&job->lock);
+		ast_free(job);
+		return -1;
 	}
 	c->job = job;
 	return 0;
@@ -1864,12 +1895,15 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 		ast_channel_unlock(chan);
 	}
 	c.timeout_ms = c.conf.timeout_ms;
-	if (!ast_strlen_zero(args.timeout) && !parse_int(args.timeout, 1, 600000, &c.timeout_ms)) {
-		if (!parse_int(args.timeout, -2147483647, 0, &v)) {
+	if (!ast_strlen_zero(args.timeout)) {
+		if (parse_int(args.timeout, INT_MIN + 1, INT_MAX, &v)) {
+			if (v > 0) {
+				c.timeout_ms = v;   /* <= 0 means "use the default" */
+			}
+		} else {
 			ast_log(LOG_WARNING, "AMD_WS: %s invalid timeout '%s', using %d\n",
 				ast_channel_name(chan), args.timeout, c.conf.timeout_ms);
 		}
-		c.timeout_ms = c.conf.timeout_ms;
 	}
 	c.connect_timeout_ms = c.conf.connect_timeout_ms;
 	if (ast_test_flag(&opts, OPT_CONNTO) && !parse_int(opt_args[OPT_ARG_CONNTO], 1, 600000, &c.connect_timeout_ms)) {
@@ -1943,19 +1977,22 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 	}
 
 	/* ---- connect (helper thread) + DB enrichment -------------------- */
-	if (start_connect(&c)) {
+	v = start_connect(&c);
+	if (v) {
+		if (v > 0) {
+			set_outcome(&c, "NOTSURE", "NETERR");
+		}
 		goto finish;
 	}
 
 #ifdef HAVE_MYSQL
-	if (c.conf.db && !ast_test_flag(&opts, OPT_NODB) && ast_strlen_zero(c.phone)) {
+	/* conf db=no, option n, or explicit p()/k() values skip the query (spec 5) */
+	if (c.conf.db && !ast_test_flag(&opts, OPT_NODB | OPT_PHONE | OPT_CODE)) {
 		char db_phone[sizeof(c.phone)], db_code[sizeof(c.country)];
 
 		if (!db_lookup(c.vid, c.conf.db_timeout_ms, db_phone, sizeof(db_phone), db_code, sizeof(db_code))) {
 			ast_copy_string(c.phone, db_phone, sizeof(c.phone));
-			if (ast_strlen_zero(c.country)) {
-				ast_copy_string(c.country, db_code, sizeof(c.country));
-			}
+			ast_copy_string(c.country, db_code, sizeof(c.country));
 			ast_debug(2, "AMD_WS: %s DB phone=%s country=%s\n", ast_channel_name(chan), c.phone, c.country);
 		} else {
 			ast_debug(2, "AMD_WS: %s no DB row for vid=%s\n", ast_channel_name(chan), c.vid);
@@ -2254,7 +2291,8 @@ static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	ast_cli(a->fd, "  neterr              : %d\n", cnt_neterr);
 	ast_cli(a->fd, "  interr              : %d\n", cnt_interr);
 	ast_cli(a->fd, "  timeouts            : %d\n", cnt_timeouts);
-	ast_cli(a->fd, "  hangups             : %d\n\n", cnt_hangups);
+	ast_cli(a->fd, "  hangups             : %d\n", cnt_hangups);
+	ast_cli(a->fd, "  connects in flight  : %d (max %d)\n\n", pending_connects, MAX_PENDING_CONNECTS);
 	return CLI_SUCCESS;
 }
 
