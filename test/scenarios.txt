@@ -81,7 +81,10 @@ nothuman           | amd   | 1     | speech8            | /nothuman?after=2     
 server_down        | amd   | 1     | speech8            | -                        | wsdead:8000,,                             | -         | HUMAN    | CONNECTION_ERROR | 0      | 2500   | noconn
 slow_handshake     | amd   | 1     | speech8            | /slow?handshake=3500     | ws:8000,,                                 | -         | HUMAN    | CONNECTION_ERROR | 1700   | 3200   | noconn
 opt_c_connto       | amd   | 1     | speech8            | /slow?handshake=1500     | wsraw:127.0.0.1,${MOCK_PORT},${VID},8000,,c(300) | - | HUMAN | CONNECTION_ERROR | 200    | 1200   | noconn,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 status=HUMAN cause=CONNECTION_ERROR
-hangup_in_connect  | amd   | 1     | speech1500-hangup  | /slow?handshake=3000     | ws:8000,,                                 | -         | HANGUP   | HANGUP           | 1600   | 2600   | noconn,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 status=HANGUP cause=HANGUP elapsed=[0-9]+ sent=0 chunks=0
+# the callee hangs up at ~2000 ms (Answer +500 ms, 1.5 s of speech) while the handshake is still pending: c(4000) keeps the
+# connect deadline 2 s away from that hangup (with the conf's 2000 ms it was a coin flip decided by 1-2 ms) and the 3500 ms
+# handshake completes only after the call is gone (late socket discarded by the helper)
+hangup_in_connect  | amd   | 1     | speech1500-hangup  | /slow?handshake=3500     | wsraw:127.0.0.1,${MOCK_PORT},${VID},8000,,c(4000) | - | HANGUP | HANGUP         | 1600   | 2600   | noconn,elapsed>=1300,elapsed<=1900,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 status=HANGUP cause=HANGUP elapsed=[0-9]+ sent=0 chunks=0
 expire_in_connect  | amd   | 1     | speech8            | /slow?handshake=2500     | wsraw:127.0.0.1,${MOCK_PORT},${VID},1500,,c(5000) | - | HUMAN | CONNECTION_ERROR | 1500   | 2700   | noconn,elapsed>=1400,elapsed<=1700
 reject_upgrade     | amd   | 1     | speech8            | /reject                  | ws:8000,,                                 | -         | HUMAN    | CONNECTION_ERROR | 0      | 2500   | noconn
 # timeout_ms elapsed with audio sent -> NOTSURE/SERVER_TIMEOUT exactly at timeout_ms (result_grace_ms=0 like amd.py); the 3000 ms
