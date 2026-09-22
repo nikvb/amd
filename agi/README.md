@@ -47,9 +47,16 @@ WebSocket; covers no-audio, hangup, HUMAN and MACHINE results, and the
 
 ## Rebuilding `amdy.tar.gz`
 
-The tarball on gw contains exactly one file, `amd.py` (mode 755, owner root).
-To produce an equivalent one from this directory:
+The ViciDial installers (`installamd*.sh`) download
+`http://download.amdy.io/amdy.tar.gz` and run
+`tar zxvf amdy.tar.gz --directory /var/lib/asterisk/agi-bin`. The tarball
+contains exactly one member, `amd.py` (root:root, mode 0755). Rebuild it
+reproducibly from this directory with:
 
 ```bash
-tar --owner=root --group=root --mode=755 -czf amdy.tar.gz -C agi amd.py && sha256sum amdy.tar.gz
+tools/make-amdy-tarball.sh            # writes ./amdy.tar.gz and prints its sha256
 ```
+
+Then upload the file to the download host and update the installers' published
+checksum, if any. (`amdy8.tar.gz` and `amdy360.tar.gz` carry older, different
+scripts; this patch does not apply to them.)
