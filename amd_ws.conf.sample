@@ -185,7 +185,8 @@ db_timeout_ms=1000
 ; Where to read VARDB_server / VARDB_database / VARDB_user / VARDB_pass /
 ; VARDB_port from.  Parsing tolerates tabs, trailing spaces, inline '#' or
 ; ';' comments and '=>' inside values, like ViciDial itself.  When the file
-; cannot be read the lookup is skipped entirely (one NOTICE at load/reload,
-; 'amd_ws show settings' says "NOT READ"); no connection is attempted with
-; built-in defaults.
+; cannot be read, or has no VARDB_ line at all, the lookup is skipped
+; entirely (one NOTICE at load/reload, 'amd_ws show settings' says "NOT READ"
+; or "NO VARDB_ LINES"); no connection is attempted with built-in defaults,
+; exactly as amd.py's "DB ERROR: no config".
 astguiclient_conf=/etc/astguiclient.conf

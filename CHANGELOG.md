@@ -63,6 +63,14 @@ vocabulary of their own; see the "was" table in
 - **Removed**: the configurable extra-status key and the token parser of
   earlier 2.0 branch builds, together with their four error/timeout causes
   (mapped in the migration doc).
+- **Parity audit against the July 2026 `amd.py`** (every behaviour of the
+  script traced to the module, table in the pull request): `caller_id` is
+  skipped on exactly `Unknown` (case-sensitive, as `amd.py`); an
+  `astguiclient.conf` without `VARDB_` lines skips the lookup like `amd.py`'s
+  "DB ERROR: no config" instead of trying the built-in defaults;
+  `docs/protocol.md` now also states the two remaining wire-level details
+  (JSON whitespace/escaping, sends over 16000 bytes split into frames) and
+  what a server that never replies produces under each client.
 - Docs: README (status matrix with sources, `VD_amd.agi` routing table,
   caller id, configuration reference), `docs/protocol.md` rewritten to the
   July 2026 protocol with the EOF finalisation exchange,

@@ -737,6 +737,7 @@ struct db_creds {
 	char pass[256];
 	int port;
 	int loaded;     /* 1 if the file was read */
+	int keys;       /* VARDB_* lines found; 0 = no config, no lookup (amd.py:95-97) */
 };
 
 static struct db_creds g_db_creds;   /* protected by conf_lock */
@@ -746,9 +747,11 @@ static struct db_creds g_db_creds;   /* protected by conf_lock */
  *
  * Tolerates tabs, trailing whitespace, inline '#'/';' comments (when preceded by
  * whitespace or at line start) and '=>' inside values (split on the first one).
- * Credentials are never logged.  When the file cannot be read, loaded stays 0
- * and db_lookup() skips the DB entirely (no connection attempts with the
- * built-in defaults); with the lookup enabled this is said once at load/reload.
+ * Credentials are never logged.  When the file cannot be read, loaded stays 0;
+ * when it has no VARDB_ line at all, keys stays 0.  Either way db_lookup()
+ * skips the DB entirely (no connection attempts with the built-in defaults),
+ * exactly as amd.py's "DB ERROR: no config" (amd.py:95-97); with the lookup
+ * enabled this is said once at load/reload.
  */
 static void load_db_creds(const char *path, int db_enabled)
 {
@@ -787,6 +790,7 @@ static void load_db_creds(const char *path, int db_enabled)
 			*arrow = '\0';
 			val = ast_strip(arrow + 2);
 			key = ast_strip(key);
+			c.keys++;
 
 			if (!strcmp(key, "VARDB_server")) {
 				ast_copy_string(c.server, val, sizeof(c.server));
@@ -803,6 +807,9 @@ static void load_db_creds(const char *path, int db_enabled)
 			}
 		}
 		fclose(f);
+		if (!c.keys && db_enabled) {
+			ast_log(LOG_NOTICE, "AMD_WS: %s has no VARDB_ lines - the phone/country DB lookup is skipped until they exist and the module is reloaded\n", path);
+		}
 	} else if (db_enabled) {
 		ast_log(LOG_NOTICE, "AMD_WS: cannot read %s: %s - the phone/country DB lookup is skipped until the file is readable and the module reloaded\n",
 			path, strerror(errno));
@@ -902,10 +909,10 @@ static int db_lookup(const char *vid, int timeout_ms, char *phone, size_t phone_
 	code[0] = '\0';
 
 	ast_mutex_lock(&conf_lock);
-	loaded = g_db_creds.loaded;
+	loaded = g_db_creds.loaded && g_db_creds.keys;
 	ast_mutex_unlock(&conf_lock);
 	if (!loaded) {
-		return -1;   /* astguiclient.conf unreadable: said once at load/reload */
+		return -1;   /* astguiclient.conf unreadable or without VARDB_ lines: said once at load/reload */
 	}
 
 	/* Acquire the lock with a deadline: never wait longer than db_timeout_ms */
@@ -2241,8 +2248,9 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 	}
 	/*
 	 * caller_id (amd.py:197-200): i(cid), else CALLERID(num) unless the conf says
-	 * send_caller_id=no.  amd.py skips "Unknown"; the AGI environment spells a
-	 * missing number "unknown", so both spellings are skipped here.
+	 * send_caller_id=no; sent only when non-empty and != "Unknown", exactly
+	 * amd.py's test (a number the channel does not have is empty here, never
+	 * the AGI environment's "unknown").
 	 */
 	if (ast_test_flag(&opts, OPT_CALLERID)) {
 		ast_copy_string(c.caller_id, S_OR(opt_args[OPT_ARG_CALLERID], ""), sizeof(c.caller_id));
@@ -2254,7 +2262,7 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 		ast_copy_string(c.caller_id, S_OR(cid_num, ""), sizeof(c.caller_id));
 		ast_channel_unlock(chan);
 	}
-	if (!strcasecmp(c.caller_id, "unknown")) {
+	if (!strcmp(c.caller_id, "Unknown")) {
 		c.caller_id[0] = '\0';
 	}
 	if (!ast_strlen_zero(args.playfile)) {
@@ -2661,7 +2669,8 @@ static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	ast_cli(a->fd, "  db                  : %s (%s)\n", AST_CLI_YESNO(c.db), db_availability());
 	ast_cli(a->fd, "  db_timeout_ms       : %d\n", c.db_timeout_ms);
 	ast_cli(a->fd, "  astguiclient_conf   : %s (%s)\n", c.astguiclient_conf,
-		creds.loaded ? "read" : "NOT READ - DB lookup skipped");
+		!creds.loaded ? "NOT READ - DB lookup skipped"
+		: !creds.keys ? "read, NO VARDB_ LINES - DB lookup skipped" : "read");
 	ast_cli(a->fd, "  db server           : %s:%d/%s user=%s\n", creds.server, creds.port, creds.database, creds.user);
 	ast_cli(a->fd, "  max_pending_connects: %d (per host)\n", c.max_pending_connects);
 	ast_cli(a->fd, "\nCounters (AMDSTATUS/AMDCAUSE)\n");

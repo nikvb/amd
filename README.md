@@ -273,8 +273,10 @@ When built with the MySQL client and `db=yes` (the default), the module looks up
 ORDER BY auto_call_id DESC LIMIT 1`) using the `VARDB_*` credentials in
 `/etc/astguiclient.conf`, and sends them as `phone` and `country_code` in the
 config frame. The file is parsed once at module load and on
-`module reload app_amd_ws.so`; if it cannot be read the lookup is skipped
-(one NOTICE in the log, `amd_ws show settings` says `NOT READ`). The query
+`module reload app_amd_ws.so`; if it cannot be read, or contains no `VARDB_`
+line, the lookup is skipped (one NOTICE in the log, `amd_ws show settings`
+says `NOT READ` or `NO VARDB_ LINES`), exactly as `amd.py` skips it on
+"DB ERROR: no config". The query
 runs on the per-call connect helper thread, right before the WebSocket
 connect, never on the channel thread; it uses one persistent connection and
 fails soft: on any DB problem the call proceeds without `phone`, and a warning
@@ -345,7 +347,7 @@ interval, the 2-mark / 3 s EOF finalisation).
 | `playdelay_ms` | `0` | Delay from the application start before `playfile` starts. |
 | `db` | `yes` | Enable the ViciDial phone/country lookup (only when compiled with MySQL support). |
 | `db_timeout_ms` | `1000` | Time budget for the lookup: bound for waiting on the shared connection; connect/read/write socket timeouts are this value rounded up to whole seconds (minimum 1). |
-| `astguiclient_conf` | `/etc/astguiclient.conf` | Where to read `VARDB_*` credentials. Unreadable file = lookup skipped (NOTICE once). |
+| `astguiclient_conf` | `/etc/astguiclient.conf` | Where to read `VARDB_*` credentials. Unreadable file, or no `VARDB_` line in it = lookup skipped (NOTICE once), as `amd.py` does. |
 | `max_pending_connects` | `64` | Per-host cap on connect helper threads left parked by a server that accepts TCP but never answers the handshake (counted only after their call gave up; healthy bursts are never capped); beyond it calls to that host fail fast with `CONNECTION_ERROR` (range 8..1024). See [docs/troubleshooting.md](docs/troubleshooting.md#4-known-limitations). |
 
 There is no list of "extra" server statuses any more: like `amd.py`, the module
