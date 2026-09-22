@@ -166,7 +166,14 @@ ASCII and cut at 255 characters, in `${AMDRESPONSE}`.
 - Fragmented TEXT frames are reassembled until the final fragment before being
   classified.
 - Result sizes are not limited to 255 bytes; only the stored `AMDRESPONSE`
-  copy is cut.
+  copy is cut. **Keep replies small anyway** (well under one TCP segment,
+  ~1400 bytes): once a frame has started to arrive, `res_http_websocket`
+  waits for the rest of it on the channel thread, up to 10 s if the remainder
+  never comes (see [troubleshooting.md, Known limitations](troubleshooting.md#4-known-limitations)).
+  The token results are a few bytes; a JSON result with a long transcript
+  should stay under that size.
+- Two frames that arrive together (one TCP segment, or one TLS record over
+  `wss://`) are both read in the same iteration.
 - PING frames are answered by `res_http_websocket` itself.
 - A CLOSE frame before any result ends the call with `NOTSURE` / `NETERR`.
 
@@ -185,15 +192,18 @@ calls alike, and an abnormal close (`1006`) only if Asterisk itself died.
 
 | Phase | Bound |
 |---|---|
-| Connect | `connect_timeout_ms` (2000 ms) → `NETERR` |
-| Detection | `timeout_ms` (10000 ms) from the first audio frame |
-| Result grace | after `timeout_ms` without a result: the remaining accumulated audio is sent and the client waits up to `result_grace_ms` (1000 ms) for a reply, still detecting hangup |
-| Hangup | detected at any point; playback stopped, `{"eof":1}` + CLOSE, no grace wait; `HANGUP` / `HANGUP` |
+| Connect | `connect_timeout_ms` (2000 ms) from the moment the connect job starts (after answer / format setup) → `NETERR`; the optional DB lookup runs inside this window; cut earlier if the detection window ends first |
+| Detection | `timeout_ms` (10000 ms) from the first captured audio frame (from application start while no frame has arrived) |
+| Result grace | after `timeout_ms` without a result: the remaining accumulated audio is sent and the client waits up to `result_grace_ms` (1000 ms) for a reply, still detecting hangup; audio arriving during the grace period is no longer accumulated |
+| Hangup | detected at any point, including during the connect; playback stopped, `{"eof":1}` + CLOSE, no grace wait; `HANGUP` / `HANGUP` |
 
 If the grace period ends without a result: `AUDIO_TIMEOUT` when at least one
-audio frame was captured, `NO_AUDIO_TIMEOUT` when none was. Worst-case time
-spent in `AMD_WS()` is therefore `connect_timeout_ms + timeout_ms +
-result_grace_ms`.
+audio frame was captured, `NO_AUDIO_TIMEOUT` when none was. Time spent in
+`AMD_WS()` is therefore about *(time until the first audio frame) +
+`timeout_ms` + `result_grace_ms`*; the connect runs **inside** that window
+and is cut at `connect_timeout_ms` (`NETERR`), it does not add to it. The
+module does not bound the wait for the first frame beyond `timeout_ms`
+(`NO_AUDIO_TIMEOUT` at `timeout_ms` from application start).
 
 ## Differences from `amd.py`
 

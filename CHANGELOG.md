@@ -4,10 +4,97 @@ All notable changes to `app_amd_ws` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [2.0.0] - unreleased
+## [Unreleased]
 
-Complete rewrite of the module, build system and installer. Operators
-upgrading from 1.x: read [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md).
+The 2.0.0 rewrite, until it is merged to `main` and tagged (`v2.0.0`; the
+heading then gets its date). Complete rewrite of the module, build system and
+installer. Operators upgrading from 1.x: read
+[docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md).
+
+### Review round 2 (fixes to the unreleased 2.0.0 code)
+
+- **Connect cap is per host and configurable** (`max_pending_connects=`,
+  default 64, range 8..1024): a server that accepts TCP but never answers the
+  handshake parks one helper thread per call in the core's handshake read
+  (`res_http_websocket` gives it no timeout); the cap now applies per host
+  and only to helpers whose call has already given up (a burst of healthy
+  simultaneous connects was tripping the old global cap), so one dead host
+  cannot fail production calls to another, and the "cap reached" WARNING has
+  its own once-per-minute limit. `amd_ws show settings` prints `connects in
+  flight` (all helpers) and `parked connects` per host. The sticky state and its
+  recovery (peer closes, or Asterisk restart) are documented in
+  [docs/troubleshooting.md, Known limitations](docs/troubleshooting.md#4-known-limitations);
+  the harness reproduces it (`blackhole`, `blackhole_cap`, `blackhole_release`).
+- **DB lookup moved to the connect helper thread**, right before the
+  WebSocket connect: a stalled DB can cost that call its connect window
+  (`NETERR`) but never blocks the channel thread. The socket timeouts are
+  whole seconds (`ceil(db_timeout_ms/1000)`), which the documentation now says
+  instead of "bounded by `db_timeout_ms`". A connection the server dropped
+  while idle (2006/2013) is reconnected once within the same budget instead
+  of starting the 5 s backoff. An unreadable `astguiclient.conf` disables the
+  lookup with one NOTICE at load/reload instead of connecting to
+  `localhost` as `cron` every 5 s.
+- Per-write socket bound raised from 100 ms to 500 ms (a multi-frame flush on
+  a fresh connection over a >100 ms RTT could turn into a spurious `NETERR`).
+- After a readable socket the module drains frames already buffered
+  (`ast_websocket_wait_for_input(ws, 0)`), so a TLS record carrying an ack
+  and the result in one piece no longer leaves the result unread over
+  `wss://`; a close initiated by the core itself (PONG write failure, bad
+  opcode) is noticed through `ast_websocket_fd() < 0` instead of polling a
+  stale descriptor.
+- Out-of-file-descriptors probe before starting a connect: the core's client
+  path would dereference NULL when `socket()` fails; the call now exits
+  `INTERR` with a rate-limited WARNING.
+- IPv6 literal hosts are bracketed in the URI (`ws://[2001:db8::10]:2700/`).
+- The connect deadline runs from the moment the connect starts (after the
+  answer), not from application entry.
+- Audio arriving during the result grace period is counted but no longer
+  accumulated (nothing is sent in that phase; long `result_grace_ms` values
+  logged a misleading "dropping audio" warning).
+- The invalid-options warning masks digits (a `p(<phone>)` inside the option
+  string never reaches the log through the module) and "ignored" now means
+  all options are ignored, not the half parsed before the error.
+- A connect that failed exactly at the deadline logs its real reason (DNS,
+  4xx, TLS) instead of "timed out".
+- Makefile: `make load`/`make reload` reported "not Running" after a
+  successful load (nested `sh -c` quoting); `reload` is sequential under
+  `-j`; the post-link gate strips the trailing comma of versioned undefined
+  symbols and falls back to the name pattern when the core export list is
+  empty.
+- Installer: shellcheck-clean with 0.8.0 and 0.10.0 (CI was red);
+  `AST_BUILDOPT_SUM`/version are re-read after installing binutils (bundle
+  and tarball routes failed on a box without `strings`); `set -E` so the ERR
+  trap reports the failing line and command; `rpm -V`/`dpkg --verify` no
+  longer sit in a pipeline under `pipefail`; apt lists are refreshed when no
+  `*_Packages` index exists; certified versions are named
+  `asterisk-certified-<ver>` for bundles and cache dirs; `curl --retry 3
+  --proto '=https,file' --proto-redir '=https'`; sha256 of the ViciDial
+  tarballs (`16.30.1-vici`, `18.21.0-vici`) and upstream `16.30.1` pinned in
+  the installer, `--allow-configure` refused for an unverifiable download;
+  non-root runs use `mktemp` cache/log paths; the module version from
+  `amd_ws show settings` is logged after load; `--uninstall` exit code 3
+  documented.
+- `tools/make-header-bundle.sh --configure` keeps the extracted tree only on
+  failure (it leaked it on success and removed it on failure);
+  `tools/gen-installer.sh` refuses a source without a final newline.
+- Harness: `MYSQL_ROOT` has no baked-in path (use `test/local.env`);
+  `db`-tagged rows SKIP without the MySQL build and `cli_show_settings`
+  asserts the DB availability line; soak bursts use unique VIDs (they were
+  reused, so per-burst results were stale); `log~` assertions anchored to the
+  call's channel; `log_lines` counts one start + one end line per AMD_WS
+  channel; `module_reload` verifies changed keys and runs a call on the new
+  config; bursts check one mock connection per VID; `TEST_SLOW_FACTOR`;
+  upper bounds with <=300 ms headroom widened by ~500 ms; new scenarios
+  `opt_c_connto`, `hangup_in_connect`, `expire_in_connect`, `bad_options`,
+  `vid_escape`, `blackhole`, `blackhole_fill`, `blackhole_cap`, `blackhole_release`,
+  `reload_effect`; the mock imports the `websockets` legacy server API
+  explicitly.
+- Docs: install one-liners point at the branch until `v2.0.0` is tagged
+  (`main` still serves the 1.x installer); header bundles are marked as not
+  published yet; migration table corrections (1.x `host` default, detection
+  window origin, `NOTSURE`→token for non-HUMAN/MACHINE results, new conf
+  sample file, full flag list); loader message wording; synthesised
+  `buildopts.h` shape; worst-case time formula.
 
 ### Added
 
@@ -33,17 +120,21 @@ upgrading from 1.x: read [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md
 - Configuration file `/etc/asterisk/amd_ws.conf` with `host`, `port`, `tls`,
   `tls_verify`, `tls_cafile`, `tls_check_hostname`, `timeout_ms`, `connect_timeout_ms`,
   `result_grace_ms`, `send_schedule`, `chunk_bytes`, `extra_statuses`,
-  `playdelay_ms`, `db`, `db_timeout_ms`, `astguiclient_conf`; all optional;
-  shipped as `amd_ws.conf.sample`.
+  `playdelay_ms`, `db`, `db_timeout_ms`, `astguiclient_conf`,
+  `max_pending_connects`; all optional; shipped as `amd_ws.conf.sample`
+  (installed to `/etc/asterisk/amd_ws.conf.sample` by `make install` and the
+  installer).
 - `module reload app_amd_ws.so` re-reads `amd_ws.conf` and
   `/etc/astguiclient.conf`.
 - CLI command `amd_ws show settings`: effective configuration, DB
   availability, counters (calls, human, machine, other, neterr, interr,
-  timeouts, hangups) and the number of connects in flight.
-- The blocking WebSocket connect runs on a helper thread per call so the
-  channel is serviced during the whole `connect_timeout_ms`, including a
-  server that accepts TCP but never answers the handshake; at most 64 such
-  connects are in flight, further calls fail fast with `NETERR`.
+  timeouts, hangups), the number of connects in flight and of parked
+  connects per host.
+- The blocking WebSocket connect (and the optional DB lookup) runs on a
+  helper thread per call so the channel is serviced during the whole
+  `connect_timeout_ms`, including a server that accepts TCP but never answers
+  the handshake; at most `max_pending_connects` (64) such connects per host
+  are in flight, further calls to that host fail fast with `NETERR`.
 - `core show application AMD_WS` shows a full synopsis and description.
 - Two verbose-3 log lines per call (`AMD_WS: <chan> vid=... host=... play=...`
   and `AMD_WS: <chan> status=... cause=... elapsed=... sent=... chunks=...`).
@@ -172,5 +263,5 @@ MySQL lookup of `phone_number`/`phone_code` from `vicidial_auto_calls` using
 (security and robustness fixes merged 2026-04-01; `/usr/src/asterisk/asterisk-*`
 header search and `./configure` fallback added 2026-04-02).
 
-[2.0.0]: https://github.com/nikvb/amd/compare/main...feat/v2-res-http-websocket
+[Unreleased]: https://github.com/nikvb/amd/compare/main...feat/v2-res-http-websocket
 [1.0.0]: https://github.com/nikvb/amd/tree/main

@@ -53,7 +53,10 @@ Every pull request must:
    file in the same PR whenever `app_amd_ws.c`, `Makefile`, `ast-detect.sh` or
    `amd_ws.conf.sample` change. CI runs `tools/check-embedded.sh` and fails
    otherwise.
-5. Pass `shellcheck install.sh` and `python3 -m py_compile test/*.py`.
+5. Pass the CI shellcheck step with both Ubuntu 22.04's 0.8.0 and a current
+   release (`shellcheck -S warning -s sh ast-detect.sh tools/*.sh` and
+   `shellcheck -S warning -s bash install.sh`; static binaries from the
+   shellcheck GitHub releases work) and `python3 -m py_compile test/*.py`.
 6. Update the documentation: `README.md` for anything user-visible,
    `amd_ws.conf.sample` for configuration keys, `docs/protocol.md` for wire
    changes, `docs/migration-v1-to-v2.md` if a 1.x behaviour changes again,
@@ -128,12 +131,22 @@ compatibility table in `README.md` and, if it needs anything special, to
 
 ## Releasing
 
-1. Update `CHANGELOG.md`: move `Unreleased` to a version and date, add the
-   compare link.
-2. `make installer`; confirm `tools/check-embedded.sh` passes.
-3. Tag `vX.Y.Z` on `main` after the merge. The one-liner in the README points
-   at `main`; if you publish the installer elsewhere, publish its sha256 next
-   to it.
+1. Update `CHANGELOG.md`: rename `## [Unreleased]` to `## [X.Y.Z] - <date>`,
+   add the compare link, start a new empty `[Unreleased]` section.
+2. Publish header bundles for the field versions that have no devel package
+   (`16.30.1-vici`, `18.21.0-vici`, `18.26.4-vici`) with
+   `tools/make-header-bundle.sh` to `https://download.amdy.io/asterisk-headers/`
+   (none are published yet; the docs say so until this is done).
+3. `make installer`; confirm `tools/check-embedded.sh` passes; run the full
+   `test/run.sh`.
+4. Merge to `main` and tag `vX.Y.Z` there (`git describe` then yields the
+   version the installer header and `--help` print).
+5. Replace the branch name in every install URL (`README.md`,
+   `docs/installer.md`, `docs/migration-v1-to-v2.md`) with the tag
+   (`https://raw.githubusercontent.com/nikvb/amd/vX.Y.Z/install.sh`), publish
+   `sha256sum install.sh` in the release notes, and remove the "until merged"
+   notes. `main` must never again serve an installer that is not the released
+   one.
 
 ## License
 

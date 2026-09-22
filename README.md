@@ -44,10 +44,16 @@ upgrading from 1.x.
 
 ## Install (one command)
 
+> **Which URL.** Until 2.0.0 is merged to `main` and tagged, `raw.githubusercontent.com/nikvb/amd/main/install.sh`
+> still serves the **1.x installer** (libwebsockets build, repository changes, hangs up calls to unload).
+> Use the branch URL below, or `sudo ./install.sh -y` from a checkout of the branch. After the release the
+> URL becomes `https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh` (an immutable tag; its sha256 is
+> published in the release notes).
+
 As root on the ViciDial telephony server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/main/install.sh | sudo bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- -y
 ```
 
 The installer detects the running Asterisk, obtains matching headers, installs
@@ -60,13 +66,13 @@ Common variants:
 
 ```bash
 # see what would happen, change nothing
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/main/install.sh | sudo bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- --dry-run
 
 # no MySQL dependency, no DB lookup
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/main/install.sh | sudo bash -s -- -y --no-db
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- -y --no-db
 
 # remove the module again
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/main/install.sh | sudo bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- --uninstall
 ```
 
 All flags, exit codes and the header-resolution order are in
@@ -75,12 +81,13 @@ All flags, exit codes and the header-resolution order are in
 ## Manual build
 
 ```bash
-git clone https://github.com/nikvb/amd.git && cd amd
+git clone -b feat/v2-res-http-websocket https://github.com/nikvb/amd.git && cd amd   # -b v2.0.0 once tagged
 make show-config     # what Asterisk, version, headers and MySQL client were detected
 make                 # builds app_amd_ws.so against the detected headers; the gates run here:
                      #   no unresolved symbols Asterisk cannot provide, correct build-option sum
 make check           # the build plus a compile-only matrix against header bundles under ./bundles
-sudo make install    # backs up the old .so, installs into the module directory
+sudo make install    # backs up the old .so, installs into the module directory, and puts
+                     #   amd_ws.conf.sample into /etc/asterisk (an existing amd_ws.conf is never touched)
 sudo make load       # or: make reload (unload + load, refused by Asterisk while a call is inside AMD_WS)
 ```
 
@@ -95,9 +102,13 @@ Useful overrides (all optional):
 | `MYSQL=auto\|1\|0` | Detect / require / disable the MySQL client (default `auto`). |
 | `MYSQL_CFLAGS=... MYSQL_LIBS=...` | Explicit MySQL client flags. |
 
-Targets: `all`, `check`, `install`, `uninstall`, `clean`, `show-config`,
+More overrides (`WERROR=1`, `BUNDLES=`, `DESTDIR=`, `ASTETCDIR=`, `EXTRA_CPPFLAGS=`, `EXTRA_LIBS=`,
+`AST_TIMEOUT=`, `ASTERISK=`, `ASTVERSION=`, `ASTBUILDSUM=`, `AST_SRC_ROOTS=`, `AST_INC_ROOTS=`) are listed
+by `make help` and in [docs/build-and-headers.md](docs/build-and-headers.md).
+
+Targets: `all`, `check`, `install`, `uninstall`, `clean`, `distclean`, `show-config`,
 `installer` (regenerates `install.sh`), `test` (runs `test/run.sh`), `load`,
-`unload`, `reload`. Details: [docs/build-and-headers.md](docs/build-and-headers.md).
+`unload`, `reload`, `help`. Details: [docs/build-and-headers.md](docs/build-and-headers.md).
 
 ## Dialplan usage
 
@@ -107,7 +118,7 @@ AMD_WS([host[,port[,vid[,timeout_ms[,playfile[,options]]]]]])
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `host` | `host=` from `amd_ws.conf` (built-in default `127.0.0.1`; the shipped sample sets `api.amdy.io`) | AMD server hostname or IP. |
+| `host` | `host=` from `amd_ws.conf` (built-in default `127.0.0.1`; the shipped sample sets `api.amdy.io`) | AMD server hostname or IP (an IPv6 literal such as `2001:db8::10` is accepted). |
 | `port` | `port=` from `amd_ws.conf` (default `2700`) | TCP port. An invalid value logs a warning and uses the default. |
 | `vid` | `${CALLERID(name)}` if valid and non-empty, else `Unknown` | Call tracking id sent to the server as `VID`. ViciDial puts its call id in the caller id name. |
 | `timeout_ms` | `timeout_ms=` from `amd_ws.conf` (default `10000`) | Overall detection window. Values `<= 0` use the default. |
@@ -212,10 +223,18 @@ When built with the MySQL client and `db=yes` (the default), the module looks up
 ORDER BY auto_call_id DESC LIMIT 1`) using the `VARDB_*` credentials in
 `/etc/astguiclient.conf`, and sends them as `phone` and `country_code` in the
 config frame. The file is parsed once at module load and on
-`module reload app_amd_ws.so`. The query uses one persistent connection, is
-bounded by `db_timeout_ms` (default 1000 ms), and fails soft: on any DB problem
-the call proceeds without `phone`, and a warning is logged at most once per
-minute. Credentials are never logged.
+`module reload app_amd_ws.so`; if it cannot be read the lookup is skipped
+(one NOTICE in the log, `amd_ws show settings` says `NOT READ`). The query
+runs on the per-call connect helper thread, right before the WebSocket
+connect, never on the channel thread; it uses one persistent connection and
+fails soft: on any DB problem the call proceeds without `phone`, and a warning
+is logged at most once per minute. Time budget: waiting for the shared
+connection is bounded by `db_timeout_ms` (default 1000 ms); the connect, read
+and write socket timeouts are each `db_timeout_ms` rounded **up** to whole
+seconds (minimum 1 s), so a DB that accepts TCP but stalls can hold one lookup
+for a few seconds, once per 5 s backoff. Because the lookup sits inside the
+connect window, such a stall costs that call its connect (`NETERR`, `AMD()`
+fallback) rather than audio. Credentials are never logged.
 
 Ways to skip the lookup: `db=no` in `amd_ws.conf`, option `n` per call, or
 supply the values yourself with `p(<phone>)` / `k(<code>)`.
@@ -244,6 +263,7 @@ playdelay_ms=0
 db=yes
 db_timeout_ms=1000
 astguiclient_conf=/etc/astguiclient.conf
+max_pending_connects=64
 ```
 
 | Key | Built-in default | Meaning |
@@ -255,15 +275,16 @@ astguiclient_conf=/etc/astguiclient.conf
 | `tls_cafile` | empty | CA bundle used to verify the server certificate when TLS is on. Empty = the first existing system bundle (`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem`), else the directory `/etc/ssl/certs`. |
 | `tls_check_hostname` | `no` | Also require the certificate's CN/subjectAltName to match `host`. Keep `no` on Asterisk 16 (its WebSocket client does not hand the hostname to the check, so every `wss://` connect would fail with `did not match ()`); works on 18+. |
 | `timeout_ms` | `10000` | Default detection window. |
-| `connect_timeout_ms` | `2000` | WebSocket connect (DNS + TCP + handshake) timeout. |
+| `connect_timeout_ms` | `2000` | WebSocket connect (DNS + TCP + handshake) timeout; the optional DB lookup runs inside this window. |
 | `result_grace_ms` | `1000` | After `timeout_ms` with no result, the remaining audio is sent and the module waits this long for a reply (still detecting hangup). |
 | `send_schedule` | `500,1000,1500,2000,3000,4000` | Milliseconds from the first captured frame at which everything accumulated so far is sent. A single value such as `500` means plain fixed-interval chunks. |
 | `chunk_bytes` | `8000` | After the last schedule mark, send whenever this many bytes have accumulated (8000 B = 500 ms of 8 kHz 16-bit audio). |
 | `extra_statuses` | `HONEYPOT,FAS,FASAMD,AUDIO,NOTSURE` | Server statuses other than `HUMAN`/`MACHINE`/`AMD` that end detection and are passed through verbatim. |
 | `playdelay_ms` | `0` | Delay from the application start before `playfile` starts. |
 | `db` | `yes` | Enable the ViciDial phone/country lookup (only when compiled with MySQL support). |
-| `db_timeout_ms` | `1000` | Connect/read/write timeout for the lookup (rounded up to whole seconds, minimum 1). |
-| `astguiclient_conf` | `/etc/astguiclient.conf` | Where to read `VARDB_*` credentials. |
+| `db_timeout_ms` | `1000` | Time budget for the lookup: bound for waiting on the shared connection; connect/read/write socket timeouts are this value rounded up to whole seconds (minimum 1). |
+| `astguiclient_conf` | `/etc/astguiclient.conf` | Where to read `VARDB_*` credentials. Unreadable file = lookup skipped (NOTICE once). |
+| `max_pending_connects` | `64` | Per-host cap on connect helper threads left parked by a server that accepts TCP but never answers the handshake (counted only after their call gave up; healthy bursts are never capped); beyond it calls to that host fail fast with `NETERR` (range 8..1024). See [docs/troubleshooting.md](docs/troubleshooting.md#4-known-limitations). |
 
 ## Parallel playback
 
@@ -299,7 +320,7 @@ with a log line saying why, and the dialplan fallback applies.
 |---|---|
 | `asterisk -rx 'module show like app_amd_ws'` | Module loaded, use count (calls currently inside `AMD_WS`). |
 | `asterisk -rx 'core show application AMD_WS'` | Syntax, parameters, options, variables. |
-| `asterisk -rx 'amd_ws show settings'` | Effective configuration, DB availability, counters (calls, human, machine, other, neterr, interr, timeouts, hangups). |
+| `asterisk -rx 'amd_ws show settings'` | Effective configuration, DB availability, whether `astguiclient.conf` was read, counters (calls, human, machine, other, neterr, interr, timeouts, hangups), `connects in flight` (helper threads currently connecting) and `parked connects` per host (helpers left behind by a server that never finishes the handshake; capped by `max_pending_connects`). |
 | `asterisk -rx 'module reload app_amd_ws.so'` | Re-read `amd_ws.conf` and `astguiclient.conf`. |
 | `asterisk -rx 'module unload app_amd_ws.so'` | Refused by the core while a call is inside `AMD_WS` (this is intended). |
 
@@ -343,10 +364,10 @@ Where the headers come from, per install type:
 | Install type | Typical Asterisk | Headers used by the build | Notes |
 |---|---|---|---|
 | ViciDial scratch install (tarball from `download.vicidial.com/required-apps`, `./configure && make install`) | `16.30.1-vici`, `18.21.0-vici` | `/usr/include` (installed by `make install`) and the configured source tree, usually `/usr/src/asterisk/asterisk-<ver>-vici` or `/usr/src/asterisk-<ver>-vici` | Both contain `autoconfig.h` and `buildopts.h`; detected automatically. |
-| ViciBox (openSUSE RPM from OBS `home:vicidial`) | `18.26.4-vici` | `asterisk-devel` RPM pinned to the exact installed version | The OBS `asterisk-18` project publishes `asterisk-devel`; the `asterisk-13`/`asterisk-16` projects publish nothing any more, so those boxes use a header bundle or the vendor tarball. Never install an unpinned `asterisk-devel`: it pulls a different Asterisk. |
+| ViciBox (openSUSE RPM from OBS `home:vicidial`) | `18.26.4-vici` | `asterisk-devel` RPM pinned to the exact installed version | The OBS `asterisk-18` project publishes `asterisk-devel`; the `asterisk-13`/`asterisk-16` projects publish nothing any more, so those boxes need a header bundle or the vendor tarball. **No header bundles are published at `download.amdy.io` yet**; until they are, such a box needs `--asterisk-src DIR`, `--headers DIR`, or `--allow-configure` (the `-vici` tarball has no `autoconfig.h`; `./configure` needs the extra `-devel` packages the installer names). Never install an unpinned `asterisk-devel`: it pulls a different Asterisk. |
 | Debian / Ubuntu distro package | `16.28` (bullseye), `18.10` (jammy), `20.6` (noble) | `asterisk-dev=<exact installed version>` | Only correct when the running Asterisk **is** the distro package. A scratch-installed `-vici` binary with a distro `asterisk-dev` present is a mismatch; detection rejects it by build-option sum / version. |
 | RHEL family scratch install (CentOS 7, Alma/Rocky 8-9) | `18.21.0-vici` | Same as ViciDial scratch install | |
-| Anything else (upstream source, custom prefix, GIT builds) | 16-22 | `ASTTOPDIR=`/`ASTINCDIR=` override, `<prefix>/include`, or a header bundle | For unknown versions pass `--version` / `--headers` to the installer. |
+| Anything else (upstream source, custom prefix, GIT builds) | 16-22 | `ASTTOPDIR=`/`ASTINCDIR=` override, `<prefix>/include`, or a header bundle (none published yet) | For unknown versions pass `--version` / `--headers` to the installer. |
 
 Details and the detection algorithm: [docs/build-and-headers.md](docs/build-and-headers.md).
 

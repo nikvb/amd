@@ -21,14 +21,18 @@ dialplan: AMD_WS(host,port,vid,timeout_ms,playfile,options)
 [3] set channel read format to slin (8 kHz 16-bit mono); remember the old format
    |  allocate the heap accumulator (sized for connect_timeout + largest schedule gap + 2 frames)
    v
-[4] start the WebSocket connect on a helper thread
-   |  ast_websocket_client_create_with_options(.timeout = connect_timeout_ms) blocks for
-   |  DNS + TCP + HTTP upgrade, so it never runs on the PBX thread (see "Threading model")
-   |  more than 64 connects already pending -> fail fast, NETERR
+[4] start the connect job on a helper thread (after a throw-away socket() probe: out of
+   |  file descriptors -> INTERR, because the core's client path would crash on that)
+   |  max_pending_connects (64) helpers already PARKED for THIS host (their calls gave up on a server
+   |  that never answers the handshake) -> fail fast, NETERR; healthy bursts are never capped
    v
-[5] phone/country lookup (optional), on the PBX thread while the connect is in flight
-   |  skipped with db=no, option n, or p()/k(); one persistent MySQL connection under a
-   |  module mutex, bounded by db_timeout_ms, fails soft -> continue without phone
+[5] helper thread: phone/country lookup (optional) right before the connect
+   |  skipped with db=no, option n, p()/k(), or an unreadable astguiclient.conf; one persistent
+   |  MySQL connection under a module mutex, socket timeouts ceil(db_timeout_ms/1000) s,
+   |  fails soft -> continue without phone; never on the PBX thread
+   |  then ast_websocket_client_create_with_options(.timeout = connect_timeout_ms), which blocks
+   |  for DNS + TCP + HTTP upgrade (see "Threading model"); the PBX thread builds and sends the
+   |  config TEXT frame when the helper hands the socket over
    v
 [6] main loop  (until result | timeout_ms | hangup | ws closed)
    |   ast_waitfor_nandfds(channel, ws fd, <= 20 ms)
@@ -42,13 +46,16 @@ dialplan: AMD_WS(host,port,vid,timeout_ms,playfile,options)
    |                        socket), NETERR
    |   STREAM phase       -> schedule mark hit: send everything accumulated as one BINARY frame
    |                        after the last mark: send when >= chunk_bytes accumulated
-   |   ws fd readable     -> ast_websocket_read(); reassemble fragments; TEXT -> classify tokens
+   |   ws fd readable     -> ast_websocket_read(); reassemble fragments; TEXT -> classify tokens;
+   |                        then drain what is already buffered (<= 8 frames: a TLS record may hold
+   |                        two frames poll() cannot see); core-initiated close -> ast_websocket_fd() < 0
    |                        CLOSE / error -> NETERR (if no result yet)
    |   playback           -> after playdelay_ms (from application start) start the playfile list;
    |                        end of a file starts the next one; end of the list changes nothing
    v
 [7] result grace (only after timeout_ms without result): send remaining audio,
-   |  wait <= result_grace_ms for a TEXT reply, still servicing the channel
+   |  wait <= result_grace_ms for a TEXT reply, still servicing the channel (frames read,
+   |  counted, no longer accumulated: nothing is sent in this phase)
    |  (no audio ever captured -> NO_AUDIO_TIMEOUT immediately, no grace)
    v
 [8] exit path (always the same, whatever the reason)
@@ -88,9 +95,16 @@ start.
   runs on a detached helper thread (`ast_pthread_create_detached_background`)
   that holds a module reference; the PBX thread polls a reference-counted job
   while it services the channel, and abandons the job at its deadline. A late
-  socket is closed by the helper. At most 64 helpers may be in flight
-  (`amd_ws show settings` prints `connects in flight`); beyond that a call
-  fails fast with `NETERR`. Running the connect on the PBX thread is not an
+  socket is closed by the helper. The optional DB lookup runs on the same
+  helper right before the connect, so it can never stall the channel thread
+  (a stalled DB costs that call its connect window instead). At most
+  `max_pending_connects` (64) helpers per host may be parked in the core's
+  handshake read after their call gave up (`amd_ws show settings` prints
+  `connects in flight` and `parked connects` per host); beyond that a call to
+  that host fails fast with `NETERR`. A burst of healthy connects is never
+  capped. Parked helpers end when the peer closes or Asterisk restarts
+  ([troubleshooting.md, Known limitations](troubleshooting.md#4-known-limitations)).
+  Running the connect on the PBX thread is not an
   option even as a fallback: the core's TCP/TLS client marks the calling
   thread with `ast_thread_inhibit_escalations()`, which would break a later
   `System()` in the same dialplan.

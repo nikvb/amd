@@ -10,12 +10,18 @@ fails if the embedded copies are stale).
 ## Running it
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/main/install.sh | sudo bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- -y
 ```
 
 Or from a checkout: `sudo ./install.sh -y`. Run it as root on the telephony
 server that runs Asterisk. It logs everything it prints to
 `/var/log/app_amd_ws-install.log`.
+
+**Which URL:** until 2.0.0 is merged to `main` and tagged, the `main` URL
+still serves the 1.x installer. After the release use the tag,
+`https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh`, whose sha256
+is published in the release notes; compare with `sha256sum install.sh` after
+downloading if you do not pipe into `bash`.
 
 ## Flags
 
@@ -31,7 +37,7 @@ server that runs Asterisk. It logs everything it prints to
 | `--headers DIR` | Use this header directory (`asterisk.h` inside), skipping detection. |
 | `--asterisk-src DIR` | Use `DIR/include` of this configured and built source tree. |
 | `--version VER` | Override the detected Asterisk version (e.g. `18.21.0-vici`) for header lookup and downloads. |
-| `--allow-configure` | Permit running `./configure` inside a downloaded source tarball when no `autoconfig.h` is available otherwise (slow; the installer names the extra packages `./configure` needs). Off by default. |
+| `--allow-configure` | Permit running `./configure` inside a downloaded source tarball when no `autoconfig.h` is available otherwise (slow; the installer names the extra packages `./configure` needs). Off by default, and refused for a tarball whose sha256 could not be verified (no published checksum and none pinned in the installer): download it yourself, verify it, and pass `--tarball-file`. |
 | `--bundle-url URL` | Base URL for header bundles (default `https://download.amdy.io/asterisk-headers`; env `AMD_WS_BUNDLE_URL`). |
 | `--tarball-file F` | Use this local Asterisk source tarball instead of downloading one (resolution step 4). |
 | `--wait N` | Seconds to keep retrying a soft `module unload` that is refused because calls are inside `AMD_WS()` (default 30). |
@@ -46,7 +52,9 @@ Environment overrides (all optional): the `ast-detect.sh` set (`ASTERISK`,
 `AMD_WS_CACHE_DIR` (default `/var/cache/app_amd_ws`), `AMD_WS_LOG_FILE`
 (default `/var/log/app_amd_ws-install.log`), `AMD_WS_ETCDIR` (default
 `/etc/asterisk`), `MYSQL_CFLAGS`/`MYSQL_LIBS`. Non-root runs (`--dry-run`,
-`--build-only`) use a per-user cache and log under `$TMPDIR`.
+`--build-only`) use a private `mktemp` cache directory and log file under
+`$TMPDIR` (printed at the start; the cache is removed on exit unless
+`--keep-build`), never a predictable path another user could pre-create.
 
 ## What it does, in order
 
@@ -59,8 +67,10 @@ Environment overrides (all optional): the `ast-detect.sh` set (`ASTERISK`,
    `--no-db`).
 3. **Detect the running Asterisk** with `ast-detect.sh` (binary via
    `/proc/<pid>/exe`, version via `core show version` / `asterisk -V` /
-   `strings`, build-option sum via `strings`). See
-   [build-and-headers.md](build-and-headers.md).
+   `strings`, build-option sum via `strings`). Detection runs first so the
+   plan can be printed; whatever needed `strings` (binutils) on a box that did
+   not have it yet is read again right after the dependencies are installed.
+   See [build-and-headers.md](build-and-headers.md).
 4. **Resolve headers**, first match wins:
    1. local trees and installed headers validated by `ast-detect.sh`
       (`/usr/src/asterisk*/…/include`, `<prefix>/include`, `/usr/include`);
@@ -70,10 +80,17 @@ Environment overrides (all optional): the `ast-detect.sh` set (`ASTERISK`,
       `dnf`/`yum install asterisk-devel-<ver>`, `apt-get install asterisk-dev=<ver>`;
    3. header bundle download:
       `<bundle-url>/asterisk-<ver>-headers.tar.gz`, sha256-verified from the
-      sidecar when published;
+      sidecar when published (`certified/18.9-cert1` is looked up as
+      `asterisk-certified-18.9-cert1-headers.tar.gz`). **No bundles are
+      published at `download.amdy.io` yet**; this step currently 404s and
+      falls through.
    4. source tarball, headers only: `download.vicidial.com/required-apps/asterisk-<ver>.tar.gz`
-      for `-vici` versions, else `downloads.asterisk.org/pub/telephony/asterisk/{releases,old-releases}/asterisk-<base>.tar.gz`
-      (verified with the published `.sha256`); only `*/include/*` and
+      for `-vici` versions, else `downloads.asterisk.org/pub/telephony/asterisk/{releases,old-releases}/asterisk-<base>.tar.gz`.
+      Verification: a sha256 **pinned in the installer** for the tarballs whose
+      origin publishes none (`asterisk-16.30.1-vici`, `asterisk-18.21.0-vici`,
+      upstream `asterisk-16.30.1`), else the origin's `.sha256` sidecar
+      (asterisk.org); an unverifiable download is used for the headers but
+      `--allow-configure` is refused for it. Only `*/include/*` and
       `.version` are extracted; `autoconfig.h` comes from the bundle if one
       exists, otherwise `./configure` runs only with `--allow-configure`;
       `buildopts.h` is synthesised from the running core's sum. Downloaded
@@ -98,23 +115,26 @@ Environment overrides (all optional): the `ast-detect.sh` set (`ASTERISK`,
    status 3.
 8. **Load and verify**: `module load app_amd_ws.so`, then parse the reply of
    `module show like app_amd_ws` and check that
-   `core show application AMD_WS` answers. Prints the effective version.
-9. **Print the dialplan snippet** (with the hostname from the configuration,
-   no hard-coded public IPs) and where the log went.
+   `core show application AMD_WS` answers. Logs the module version as reported
+   by `amd_ws show settings` (`module version (amd_ws show settings): 2.0.0`).
+9. **Print a fixed example dialplan snippet** (`api.amdy.io,2700`, no
+   hard-coded IPs) and where the log went.
 
-All downloads use `curl -fsSL`; checksums are verified wherever the source
-publishes one. The script runs with `set -euo pipefail` and correct traps, so
-a truncated download executes nothing and every successful path (including
-`--help`) exits 0.
+All downloads use `curl -fsSL --retry 3` restricted to `https` (and `file://`
+mirrors), never following a redirect to plain `http`; checksums are verified
+wherever the origin publishes one or the installer pins one. The script runs
+with `set -Eeuo pipefail` and correct traps: a truncated download executes
+nothing, an unexpected failure prints the failing line and command, and every
+successful path (including `--help`) exits 0.
 
 ## Exit codes
 
 | Code | Meaning | What to do |
 |---|---|---|
-| `0` | Success (also for `--help`, `--dry-run`, `--deps-only`, `--build-only`, `--uninstall`). | Nothing. Check `module show like app_amd_ws`. |
+| `0` | Success (also for `--help`, `--dry-run`, `--deps-only`, `--build-only`, and `--uninstall` when the module could be unloaded or was not loaded). | Nothing. Check `module show like app_amd_ws`. |
 | `1` | A step failed (download, checksum, unsupported distro, ...). | Read the last lines of the output or `/var/log/app_amd_ws-install.log`; the message names the failing step and the override or fix. |
 | `2` | Usage error, or not running as root without `--dry-run`/`--build-only`. | Fix the command line; run with `sudo`. |
-| `3` | Built and installed, but the previous module is still loaded because calls were inside `AMD_WS()` for the whole `--wait` period. | Run the printed command when the dialer is idle (a `module unload app_amd_ws.so` followed by `module load app_amd_ws.so`, or an Asterisk restart at the next maintenance window). The new code is active after that. |
+| `3` | Built and installed, but the previous module is still loaded because calls were inside `AMD_WS()` for the whole `--wait` period. Also returned by `--uninstall` when the module could not be unloaded: the file is removed, the code stays resident until Asterisk restarts. | Run the printed command when the dialer is idle (a `module unload app_amd_ws.so` followed by `module load app_amd_ws.so`, or an Asterisk restart at the next maintenance window). The new code is active after that. |
 | `4` | No Asterisk headers matching the running Asterisk could be found or obtained. | The message lists every rejected candidate; pass `--headers DIR`, `--asterisk-src DIR`, `--version VER`, `--tarball-file F` or `--allow-configure`. |
 | `5` | Build or gate failure, or the new module failed to load (the backup is restored and reloaded). | Read the compiler/gate output in the log. |
 | `6` | Build dependencies could not be installed. | Install `gcc make pkg-config binutils tar curl` (and the MariaDB/MySQL client dev package unless `--no-db`) by hand, or fix the package manager. |
@@ -174,10 +194,11 @@ recommended (see [migration-v1-to-v2.md](migration-v1-to-v2.md)).
 ## Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/main/install.sh | sudo bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- --uninstall
 ```
 
-Unloads the module (softly; refused while in use), removes `app_amd_ws.so`
+Unloads the module (softly; refused while in use, exit code 3 in that case,
+the file is removed anyway), removes `app_amd_ws.so`
 from the module directory and the header cache `/var/cache/app_amd_ws`.
 Backups `app_amd_ws.so.bak.*` stay unless `--remove-backups` is added. It
 restores nothing else: packages, dialplan, `amd_ws.conf`,

@@ -62,8 +62,9 @@ the binary runs with `LD_LIBRARY_PATH=/usr/lib64 /usr/sbin/asterisk`; modules
 are in `/usr/lib64/asterisk/modules`; the core's build-option sum is
 `da6642af068ee5e6490c5b1d2cc1d238` (= `md5("OPTIONAL_API\n")`). MariaDB
 client dev files may be staged outside `/usr`; pass `MYSQL_CFLAGS`/`MYSQL_LIBS`
-explicitly in that case. There is no MySQL server; the DB-unreachable path
-must complete within `db_timeout_ms`.
+explicitly in that case (for `test/run.sh`: `MYSQL_ROOT=/dir` in the gitignored
+`test/local.env`). There is no MySQL server; the DB-unreachable path must
+complete quickly (connect refused) and never touch the channel thread.
 
 Installer checks without touching the system: `./install.sh --dry-run`,
 `./install.sh --build-only`, `shellcheck install.sh`.
@@ -75,16 +76,23 @@ Installer checks without touching the system: `./install.sh --dry-run`,
    parser). `reload_module` re-reads both.
 2. DB lookup (`#ifdef HAVE_MYSQL`): `mysql_library_init()` once in
    `load_module`; one persistent `MYSQL*` under an `AST_MUTEX_DEFINE_STATIC`
-   mutex; connect/read/write timeouts from `db_timeout_ms`; escape with
-   `mysql_real_escape_string`; fail soft; warnings rate-limited to 1/min.
+   mutex; connect/read/write timeouts `ceil(db_timeout_ms/1000)` s; one
+   reconnect on 2006/2013; escape with `mysql_real_escape_string`; fail soft;
+   warnings rate-limited to 1/min; skipped entirely when `astguiclient.conf`
+   is unreadable. Runs on the connect helper thread, never on the PBX thread.
 3. `amd_ws_exec`: parse args (`AST_APP_OPTIONS`), answer unless `A`, set read
-   format `slin`, connect with `ast_websocket_client_create_with_options`
-   (`.timeout = connect_timeout_ms`), send config TEXT, main loop on
-   `ast_waitfor_nandfds(chan, ws fd, <= 20 ms)`, heap accumulator, schedule
-   sends, `ast_websocket_read` with fragment reassembly, token classifier,
-   playback start/stop, result grace, uniform exit path (`{"eof":1}`, close
-   1000, unref, restore format, set 4 variables, verbose-3 summary, counters).
-4. CLI `amd_ws show settings`; counters via `ast_atomic_fetchadd_int`.
+   format `slin`, start the connect job (helper thread: DB lookup, then
+   `ast_websocket_client_create_with_options` with `.timeout =
+   connect_timeout_ms`; per-host cap `max_pending_connects`), main loop on
+   `ast_waitfor_nandfds(chan, ws fd, <= 20 ms)` from the first iteration,
+   config TEXT once the helper hands the socket over, heap accumulator,
+   schedule sends, `ast_websocket_read` with fragment reassembly and a
+   bounded drain of already-buffered frames, token classifier, playback
+   start/stop, result grace, uniform exit path (`{"eof":1}`, close 1000,
+   unref, restore format, set 4 variables, verbose-3 summary, counters).
+4. CLI `amd_ws show settings`; counters via `ast_atomic_fetchadd_int`;
+   `connects in flight` (atomic) and `parked connects` per host under
+   `pending_lock`.
 5. Module glue: `ast_register_application` with full synopsis/description
    (out-of-tree XML docs are not shown by `core show application`),
    `AST_MODULE_INFO(... .support_level = AST_MODULE_SUPPORT_EXTENDED,

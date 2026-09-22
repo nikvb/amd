@@ -135,19 +135,45 @@ ${AMD_WS_BUNDLE_URL:-https://download.amdy.io/asterisk-headers}/asterisk-<ver>-h
 ```
 
 and verifies it against the `.sha256` sidecar file published next to it when
-present. `buildopts.h` is then **synthesised on the target** from the sum
-read out of the running binary:
+present. Certified versions are named without the slash
+(`certified/18.9-cert1` → `asterisk-certified-18.9-cert1-headers.tar.gz`);
+the `.version` inside the bundle keeps the real string.
+
+**Status: no bundles are published at `download.amdy.io/asterisk-headers/`
+yet** (every URL 404s). Until they are, a box without local headers and
+without a distro devel package needs `--asterisk-src DIR`, `--headers DIR`,
+or the tarball route with `--allow-configure`. Publishing bundles for
+`16.30.1-vici`, `18.21.0-vici` and `18.26.4-vici` is a release step
+([CONTRIBUTING.md](../CONTRIBUTING.md#releasing)).
+
+`buildopts.h` is then **synthesised on the target** by `ast_synth_buildopts`
+in `ast-detect.sh`: the sum read out of the running binary is matched against
+every combination of the ABI-relevant menuselect options (`DEBUG_THREADLOCALS
+DO_CRASH TEST_FRAMEWORK DEBUG_THREADS DEBUG_FD_LEAKS LOADABLE_MODULES
+OPTIONAL_API G711_NEW_ALGORITHM INTEGER_CALLERID`, 512 md5 computations) and
+the file is written with one `#define` per option found, e.g. for the stock
+sum:
 
 ```c
-#define AST_BUILDOPT_SUM "<sum>"
-#define AST_BUILDOPTS "<unknown>"
-/* plus the OPTIONAL_API define when <sum> == md5("OPTIONAL_API\n") */
+/*
+ * buildopts.h
+ * Synthesised by ast-detect.sh for AST_BUILDOPT_SUM da6642af068ee5e6490c5b1d2cc1d238
+ * (the running Asterisk was built with: OPTIONAL_API)
+ */
+
+#define OPTIONAL_API 1
+#define AST_BUILDOPT_SUM "da6642af068ee5e6490c5b1d2cc1d238"
+#define AST_BUILDOPTS "OPTIONAL_API"
+#define AST_BUILDOPTS_ALL "OPTIONAL_API"
 ```
 
+A sum that no combination of stock options produces (a custom build with
+e.g. `BUSYDETECT_*`, sanitizers, or Asterisk 13's `MALLOC_DEBUG`) is refused
+with `AST_BUILDOPT_SUM <sum> is not one produced by stock menuselect options
+(custom build) - use the real configured+built source tree: ASTTOPDIR=...`.
 This is why a bundle for a *version* works for every default build of that
-version, and why a box with a non-default sum (for example `DEBUG_THREADS`)
-gets a clear error asking for `ASTTOPDIR` instead of a module the loader would
-refuse.
+version, and why a box with a non-default sum gets a clear error asking for
+`ASTTOPDIR` instead of a module the loader would refuse.
 
 ### Building a bundle
 
@@ -157,8 +183,11 @@ has the `./configure` dependencies listed below (it extracts, configures and
 packs). Run it without arguments for its usage text. Output:
 `asterisk-<ver>-headers.tar.gz` plus its `.sha256` sidecar; upload both to the
 bundle URL. Bundles are built per exact version string (`18.21.0-vici`,
-`18.26.4-vici`, `16.30.1-vici`, ...). Do this on a build box, never on the
-dialer.
+`18.26.4-vici`, `16.30.1-vici`, ...; a certified tree's `certified/18.9-cert1`
+becomes `asterisk-certified-18.9-cert1-headers.tar.gz` automatically). Do this
+on a build box, never on the dialer. With `--tarball ... --configure` the
+extracted tree is removed afterwards; when `./configure` fails it is kept so
+`configure.log` can be read.
 
 ### Why `./configure` on the dialer is the last resort
 
