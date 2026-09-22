@@ -298,9 +298,10 @@ build_module() {
 	fi
 	local flav; flav=$(mysql_flavour)
 	local blog=$LOGDIR/build.log
-	export LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH
+	# the Makefile may ask the asterisk binary for its version: it needs the lib path
+	local mk=(env "LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" make)
 	log "build 1/2: make MYSQL=0 (flavour=$flav)"
-	if (cd "$REPO" && make clean >/dev/null 2>&1; make MYSQL=0 $MAKE_ARGS) >"$blog.nomysql" 2>&1 && [ -f "$REPO/app_amd_ws.so" ]; then
+	if (cd "$REPO" && "${mk[@]}" clean >/dev/null 2>&1; "${mk[@]}" MYSQL=0 $MAKE_ARGS) >"$blog.nomysql" 2>&1 && [ -f "$REPO/app_amd_ws.so" ]; then
 		row PASS build_nomysql - - - "make MYSQL=0 ok ($(stat -c %s "$REPO/app_amd_ws.so") bytes)"
 	else
 		row FAIL build_nomysql - - - "make MYSQL=0 failed, see $blog.nomysql"; tail -20 "$blog.nomysql"; return
@@ -313,7 +314,7 @@ build_module() {
 	none) row SKIP build_mysql - - - "no MySQL/MariaDB client dev files (system or $MYSQL_ROOT)"; MODULE_AVAILABLE=1; return ;;
 	esac
 	log "build 2/2: make ${margs[*]}"
-	if (cd "$REPO" && make clean >/dev/null 2>&1; make "${margs[@]}" $MAKE_ARGS) >"$blog" 2>&1 && [ -f "$REPO/app_amd_ws.so" ]; then
+	if (cd "$REPO" && "${mk[@]}" clean >/dev/null 2>&1; "${mk[@]}" "${margs[@]}" $MAKE_ARGS) >"$blog" 2>&1 && [ -f "$REPO/app_amd_ws.so" ]; then
 		local und
 		und=$(ldd -r "$REPO/app_amd_ws.so" 2>&1 | grep 'undefined symbol' | grep -vE 'symbol: (_?_?ast_|__ao2_|ao2_|pbx_)' || true)
 		if [ -n "$und" ]; then
@@ -327,9 +328,8 @@ build_module() {
 	else
 		row FAIL build_mysql - - - "make MYSQL=1 failed, see $blog"; tail -20 "$blog"
 		# fall back to the MYSQL=0 object so the rest of the suite can still run
-		(cd "$REPO" && make clean >/dev/null 2>&1; make MYSQL=0 $MAKE_ARGS) >/dev/null 2>&1 && MODULE_AVAILABLE=1
+		(cd "$REPO" && "${mk[@]}" clean >/dev/null 2>&1; "${mk[@]}" MYSQL=0 $MAKE_ARGS) >/dev/null 2>&1 && MODULE_AVAILABLE=1
 	fi
-	unset LD_LIBRARY_PATH
 }
 
 # ---------------------------------------------------------------------------
