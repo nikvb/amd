@@ -250,7 +250,7 @@ astguiclient_conf=/etc/astguiclient.conf
 | `port` | `2700` | Default TCP port. |
 | `tls` | `no` | `yes` connects with `wss://` for every call (same as option `s`). |
 | `tls_verify` | `yes` | Verify the server certificate when TLS is used. |
-| `tls_cafile` | empty | CA bundle to verify against; empty = Asterisk's default trust store. |
+| `tls_cafile` | empty | CA file used to verify the server certificate when TLS is on; see `amd_ws.conf.sample`. |
 | `timeout_ms` | `10000` | Default detection window. |
 | `connect_timeout_ms` | `2000` | WebSocket connect (DNS + TCP + handshake) timeout. |
 | `result_grace_ms` | `1000` | After `timeout_ms` with no result, the remaining audio is sent and the module waits this long for a reply (still detecting hangup). |
@@ -285,7 +285,8 @@ Option `s` or `tls=yes` connects with `wss://` using Asterisk's own TLS support;
 `tls_verify` and `tls_cafile` control certificate verification. Use TLS only
 against an endpoint that offers it; the production endpoint documented for the
 amdy.io service is plain `ws://api.amdy.io:2700`. If Asterisk was built
-without TLS, a `wss://` request fails with `NOTSURE` / `INTERR` and a log line.
+without TLS, a `wss://` connection cannot be made; the call ends `NOTSURE`
+with a log line saying why, and the dialplan fallback applies.
 
 ## CLI and logging
 

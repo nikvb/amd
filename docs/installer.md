@@ -113,10 +113,11 @@ a truncated download executes nothing and every successful path (including
 | `app_amd_ws.so.bak.<timestamp>` | Asterisk module directory | Backups are not touched by an install; see `--help` for the current uninstall behaviour regarding backups. |
 | Loaded module | running Asterisk | Unloaded on `--uninstall` (soft; refused while in use). |
 | Log | `/var/log/app_amd_ws-install.log` | Kept. |
+| Sample configuration | The installer embeds `amd_ws.conf.sample`; its output states where, if anywhere, it placed a copy. An existing `/etc/asterisk/amd_ws.conf` is never overwritten. | n/a |
 
-It does **not** touch `/etc/asterisk/extensions.conf`, `/etc/asterisk/amd_ws.conf`,
-`/etc/asterisk/modules.conf`, `/etc/astguiclient.conf`, ViciDial's database, or
-any repository configuration. Configuration is yours to add; see the
+It does **not** modify `/etc/asterisk/extensions.conf`, an existing
+`/etc/asterisk/amd_ws.conf`, `/etc/asterisk/modules.conf`,
+`/etc/astguiclient.conf`, ViciDial's database, or any repository configuration. Configuration is yours to add; see the
 configuration reference in the [README](../README.md#configuration-reference)
 and `amd_ws.conf.sample`.
 

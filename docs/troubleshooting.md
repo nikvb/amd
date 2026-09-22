@@ -156,7 +156,7 @@ Normal: the callee hung up before a result. Frequent `HANGUP` at very low
 |---|---|
 | `amd_ws show settings` says `db: unavailable` | Built without the MySQL client (`MYSQL=0`, `--no-db`, or dev package missing at build time). Rebuild with the client dev package installed, or accept: detection works without enrichment. |
 | `db=no` in `amd_ws.conf`, or option `n` / `p()` / `k()` in the dialplan | Intentional skip. |
-| Warning in the log about the DB (at most once per minute) | Credentials or host in `/etc/astguiclient.conf` (`VARDB_server`, `VARDB_database`, `VARDB_user`, `VARDB_pass`, `VARDB_port`) wrong for this box, or the DB is unreachable. Test: `mysql -h "$(sed -n 's/^VARDB_server *=> *//p' /etc/astguiclient.conf)" -u "$(sed -n 's/^VARDB_user *=> *//p' /etc/astguiclient.conf)" -p asterisk -e 'SELECT 1'`. After fixing the file: `module reload app_amd_ws.so` (it is parsed at load/reload, not per call). |
+| Warning in the log about the DB (at most once per minute) | Credentials or host in `/etc/astguiclient.conf` (`VARDB_server`, `VARDB_database`, `VARDB_user`, `VARDB_pass`, `VARDB_port`) wrong for this box, or the DB is unreachable. Test (prompts for `VARDB_pass`): `mysql -h "$(sed -n 's/^VARDB_server *=> *//p' /etc/astguiclient.conf)" -u "$(sed -n 's/^VARDB_user *=> *//p' /etc/astguiclient.conf)" -p asterisk -e 'SELECT 1'`. After fixing the file: `module reload app_amd_ws.so` (it is parsed at load/reload, not per call). |
 | Lookups slow down calls | They are bounded by `db_timeout_ms` (default 1000 ms) and fail soft, but a slow DB still adds up to that per call. Lower `db_timeout_ms`, or set `db=no` and let the server work without `phone`. |
 
 ### Concurrency / performance
