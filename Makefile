@@ -144,12 +144,14 @@ $(MODULE).so: $(MODULE).o
 	@echo "  [LD] $< -> $@"
 	$(CC) $(LDFLAGS) -o $@ $< $(LIBS)
 	@# post-link gate 3: every symbol still undefined must be one the core (or res_http_websocket) provides
-	@und=$$(ldd -r $@ 2>&1 | awk '/undefined symbol/{sub(/[[:space:]]*\(.*/,"",$$3); print $$3}' | sort -u); \
-	 if [ -n '$(ASTERISK)' ] && [ -r '$(ASTERISK)' ] && nm -D --defined-only '$(ASTERISK)' >/dev/null 2>&1; then \
-	   core=$$(nm -D --defined-only '$(ASTERISK)' | awk '{print $$NF}' | sed 's/@.*//' | sort -u); \
+	@# ('ldd -r' prints "undefined symbol: name, version libfoo_3 (file)" for versioned symbols: strip the comma)
+	@und=$$(ldd -r $@ 2>&1 | awk '/undefined symbol/{s=$$3; sub(/,$$/,"",s); sub(/\(.*/,"",s); print s}' | sort -u); \
+	 core=''; \
+	 if [ -n '$(ASTERISK)' ] && [ -r '$(ASTERISK)' ]; then core=$$(nm -D --defined-only '$(ASTERISK)' 2>/dev/null | awk '{print $$NF}' | sed 's/@.*//' | sort -u); fi; \
+	 if [ -n "$$core" ]; then \
 	   missing=$$(printf '%s\n' "$$und" | grep -v '^ast_websocket_' | grep -vxF "$$core"); \
 	 else \
-	   echo "  [..] no readable core binary - symbol check limited to the name pattern"; \
+	   echo "  [..] no readable core binary (or no export list) - symbol check limited to the name pattern"; \
 	   missing=$$(printf '%s\n' "$$und" | grep -v -E '$(CORE_SYM_RE)'); \
 	 fi; \
 	 missing=$$(printf '%s\n' "$$missing" | grep -v '^$$' || true); \
@@ -199,23 +201,28 @@ uninstall:
 	@echo "  [REMOVED] $(DESTDIR)$(ASTMODDIR)/$(MODULE).so (backups $(MODULE).so.bak.* kept, amd_ws.conf kept)"
 
 # ---- load / unload / reload: 'asterisk -rx' exits 0 whatever happened, so parse the reply ------
-define ast_rx
-$(SHELL) -c 'timeout $(or $(AST_TIMEOUT),5) "$(ASTERISK)" $(ASTERISK_OPTS) -rx "$(1)" 2>&1'
-endef
-ast_status = $(SHELL) -c '$(call ast_rx,module show like $(MODULE)) | awk -v m="$(MODULE).so" '"'"'$$1==m'"'"
+# Recipes already run in $(SHELL): plain commands, no nested 'sh -c' (the quotes would not nest).
+ast_rx = timeout $(or $(AST_TIMEOUT),5) "$(ASTERISK)" $(ASTERISK_OPTS) -rx "$(1)" 2>&1
+ast_status = $(call ast_rx,module show like $(MODULE)) | awk -v m="$(MODULE).so" '$$1==m'
 
 load:
 	@[ -n "$(ASTERISK)" ] || { echo "ERROR: no asterisk binary"; exit 1; }
 	@out=$$($(call ast_rx,module load $(MODULE).so)); echo "  $$out"; \
 	 case "$$out" in "Loaded "*) ;; *) echo "ERROR: module load failed (check /var/log/asterisk/messages)"; exit 1;; esac
-	@$(ast_status) | grep -q ' Running ' && echo "  [OK] $(MODULE).so is Running" || { echo "ERROR: $(MODULE).so not Running"; exit 1; }
+	@st=$$($(ast_status)); case "$$st" in \
+	 *"Not Running"*) echo "ERROR: $(MODULE).so is loaded but Not Running: $$st"; exit 1;; \
+	 *" Running"*) echo "  [OK] $(MODULE).so is Running";; \
+	 *) echo "ERROR: $(MODULE).so not Running: $${st:-<no such module in 'module show'>}"; exit 1;; esac
 
 unload:
 	@[ -n "$(ASTERISK)" ] || { echo "ERROR: no asterisk binary"; exit 1; }
 	@out=$$($(call ast_rx,module unload $(MODULE).so)); echo "  $$out"; \
 	 case "$$out" in "Unloaded "*) ;; *) echo "ERROR: module unload refused (module in use by a call? try again when idle)"; exit 1;; esac
 
-reload: unload load
+# unload THEN load, also under 'make -j' (a plain prerequisite list would run them in parallel)
+reload:
+	@$(MAKE) --no-print-directory unload
+	@$(MAKE) --no-print-directory load
 
 # ---- misc ---------------------------------------------------------------------------------
 show-config:
