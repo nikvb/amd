@@ -102,7 +102,11 @@ override CFLAGS += -pthread -fPIC -std=gnu99 -Wall -Wextra -Wno-unused-parameter
 ifeq ($(WERROR),1)
   override CFLAGS += -Werror
 endif
-CPPFLAGS += -I$(ASTINCDIR) -DAST_MODULE=\"$(MODULE)\" -DAST_MODULE_SELF_SYM=__internal_$(MODULE)_self
+# Asterisk headers as system headers (-isystem) so -Wextra does not report Asterisk's own header
+# style (e.g. 'inline not at beginning of declaration' in strings.h); /usr/include and
+# /usr/local/include stay -I because -isystem would reorder the compiler's own include chain
+AST_INC_FLAG = $(if $(filter /usr/include /usr/local/include,$(1)),-I$(1),-isystem $(1))
+CPPFLAGS += $(call AST_INC_FLAG,$(ASTINCDIR)) -DAST_MODULE=\"$(MODULE)\" -DAST_MODULE_SELF_SYM=__internal_$(MODULE)_self
 ifeq ($(HAVE_MYSQL),1)
   CPPFLAGS += -DHAVE_MYSQL $(MYSQL_CFLAGS)
 endif
@@ -158,6 +162,7 @@ $(MODULE).so: $(MODULE).o
 # found there are extracted first).  Bundles ship no buildopts.h: one is synthesised for the core's
 # sum (or the stock OPTIONAL_API sum when unknown), exactly as install.sh does on a customer box.
 CHECK_SUM := $(or $(ASTBUILDSUM),da6642af068ee5e6490c5b1d2cc1d238)
+CHECK_CPPFLAGS := $(filter-out -I$(ASTINCDIR) -isystem $(ASTINCDIR),$(CPPFLAGS))
 check: all
 	@set -e; found=0; \
 	 for tb in $(BUNDLES)/asterisk-*-headers.tar.gz; do \
@@ -168,7 +173,7 @@ check: all
 	   [ -f "$$inc/asterisk.h" ] || continue; found=$$((found+1)); tree=$${inc%/include}; name=$${tree##*/}; \
 	   [ -f "$$inc/asterisk/buildopts.h" ] || { . $(DETECT_SH); ast_synth_buildopts "$$inc" '$(CHECK_SUM)'; }; \
 	   printf '  [check] %-28s ' "$$name"; \
-	   $(CC) $(filter-out -I$(ASTINCDIR),$(CPPFLAGS)) -I"$$inc" $(CFLAGS) -c -o "$$tree/$(MODULE).o" $(MODULE).c || { echo "FAILED (compile)"; exit 1; }; \
+	   $(CC) $(CHECK_CPPFLAGS) -isystem "$$inc" $(CFLAGS) -c -o "$$tree/$(MODULE).o" $(MODULE).c || { echo "FAILED (compile)"; exit 1; }; \
 	   bad=$$(tr ' \\' '\n\n' < "$$tree/$(MODULE).d" | grep -E '/asterisk(\.h|/[^/]*\.h)$$' | grep -v "^$$inc/" | sort -u); \
 	   [ -z "$$bad" ] || { echo "FAILED (headers from outside the bundle: $$bad)"; exit 1; }; \
 	   echo "OK ($$(sed -n 1p "$$tree/.version" 2>/dev/null || echo 'no .version'))"; \
