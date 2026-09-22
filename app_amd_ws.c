@@ -1801,7 +1801,7 @@ static void set_outcome(struct amd_call *c, const char *status, const char *caus
 /*! \brief Append ,"key":"<escaped value>" when value is non-empty; returns the new length or -1 */
 static int json_append_kv(char *out, size_t out_sz, int n, const char *key, const char *value)
 {
-	char esc[MAX_VID_LEN * 6 + 1];   /* the longest value we ever pass is the vid */
+	char esc[MAX_VID_LEN * 6 + 1];   /* phone/country/caller_id are all shorter than a vid */
 	int m;
 
 	if (ast_strlen_zero(value) || json_escape(esc, sizeof(esc), value) < 0) {
