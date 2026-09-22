@@ -19,6 +19,7 @@
 ; AMD service host name or IP address, and TCP port.  The module connects to
 ; ws://host:port/ (or wss:// when tls=yes / option 's').  Hostnames are
 ; resolved by the core's resolver for every call, off the channel thread.
+; An IPv6 literal (2001:db8::10) is accepted and bracketed automatically.
 host=api.amdy.io
 port=2700
 
@@ -55,8 +56,21 @@ timeout_ms=10000
 ; connect runs on a helper thread while audio is already being captured;
 ; when this expires AMDCAUSE=NETERR is returned immediately.  Option c(ms)
 ; overrides it per call.  The connect deadline is never later than the
-; detection deadline.
+; detection deadline.  The optional DB lookup (below) runs on the same helper
+; right before the connect, inside this window.
 connect_timeout_ms=2000
+
+; PARKED connect helpers allowed PER HOST.  A server that accepts the TCP
+; connection but never answers the HTTP upgrade (hung process, black-holing
+; middlebox) keeps its helper thread parked in the core's handshake read
+; until the peer closes or Asterisk restarts: the call itself still returns
+; NETERR at connect_timeout_ms, but the thread stays.  Only helpers whose
+; call has already given up count (a burst of healthy connects never does).
+; Beyond this many parked helpers new calls to THAT host fail fast with
+; NETERR (one WARNING per minute); other hosts are unaffected.
+; 'amd_ws show settings' prints "connects in flight" (all helpers) and
+; "parked connects" per host.  Range 8..1024.
+max_pending_connects=64
 
 ; After timeout_ms the remaining audio is flushed and the server gets this
 ; long to answer before AUDIO_TIMEOUT is returned.  The channel is still
@@ -111,15 +125,22 @@ playdelay_ms=0
 ; without MySQL reports db "unavailable" and ignores db=yes.
 db=yes
 
-; Hard bound for the whole lookup (connect + query, and waiting for the
-; shared connection).  Connect/read/write timeouts are set from this value
-; rounded up to whole seconds (minimum 1).  After a failure the DB is
-; skipped for 5 s so a dead DB costs one timeout, not one per call; failures
-; are logged at WARNING at most once per minute and the call continues
-; without phone.
+; Time budget for the lookup.  Waiting for the shared connection is bounded
+; by this value; the connect, read and write socket timeouts are each set to
+; this value rounded UP to whole seconds (minimum 1 s), so a DB that accepts
+; TCP but stalls can hold the lookup for a few seconds.  The lookup runs on
+; the connect helper thread (never on the channel thread): a stalled DB
+; costs that call its connect window (NETERR -> AMD() fallback), not audio.
+; After a failure the DB is skipped for 5 s so a dead DB costs one timeout,
+; not one per call; failures are logged at WARNING at most once per minute
+; and the call continues without phone.  A connection the server dropped
+; while idle (wait_timeout) is reconnected once within the same budget.
 db_timeout_ms=1000
 
 ; Where to read VARDB_server / VARDB_database / VARDB_user / VARDB_pass /
 ; VARDB_port from.  Parsing tolerates tabs, trailing spaces, inline '#' or
-; ';' comments and '=>' inside values, like ViciDial itself.
+; ';' comments and '=>' inside values, like ViciDial itself.  When the file
+; cannot be read the lookup is skipped entirely (one NOTICE at load/reload,
+; 'amd_ws show settings' says "NOT READ"); no connection is attempted with
+; built-in defaults.
 astguiclient_conf=/etc/astguiclient.conf

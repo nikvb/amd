@@ -46,8 +46,7 @@
  * Phases of a call (all waits are bounded by ast_tvdiff_ms() deadlines):
  *
  *   1. SETUP      parse args + config snapshot, answer (unless 'A'),
- *                 set read format slin, optional DB enrichment (bounded by
- *                 db_timeout_ms), build the config JSON.
+ *                 set read format slin.
  *   2. CONNECT    ast_websocket_client_create_with_options() is *blocking*
  *                 (DNS, TCP, HTTP upgrade), so it runs on a short-lived helper
  *                 thread while the PBX thread keeps reading the channel:
@@ -55,6 +54,11 @@
  *                 seen immediately and a stalled handshake cannot park the
  *                 call -- the PBX thread abandons the job at the connect
  *                 deadline and the helper disposes of whatever it produces.
+ *                 The optional DB enrichment (bounded by db_timeout_ms) runs
+ *                 on the same helper right before the connect, so a stalled
+ *                 DB can cost that call its connect window (NETERR) but never
+ *                 stops the PBX thread from reading the channel.  The config
+ *                 JSON is built when the helper hands the socket over.
  *   3. STREAM     ast_waitfor_nandfds(chan + ws fd, <= 20 ms budget).
  *                 Voice frames are appended to the accumulator (never
  *                 truncated).  Sends follow the time schedule measured from
@@ -77,10 +81,11 @@
  *
  * Timing model:
  *   t_app     application entry
+ *   t_connect the moment the connect job is started (after answer/format)
  *   t_first   first captured voice frame (0 if none)
  *   marks     conf send_schedule, measured from t_first
  *   detection deadline  = (t_first ? t_first : t_app) + timeout_ms
- *   connect deadline    = min(t_app + connect_timeout_ms, detection deadline)
+ *   connect deadline    = min(t_connect + connect_timeout_ms, detection deadline)
  *   grace deadline      = detection deadline + result_grace_ms
  *   playback start      = t_app + playdelay_ms
  *   AMDELAPSED          = exit - (t_first ? t_first : t_app)
@@ -99,6 +104,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <unistd.h>
+#include <sys/socket.h>
 
 /*
  * Asterisk 18/20 strings.h declares "static int force_inline ..." which trips
@@ -126,6 +132,7 @@
 
 #ifdef HAVE_MYSQL
 #include <mysql.h>
+#include <errmsg.h>
 #endif
 
 /*** DOCUMENTATION
@@ -286,13 +293,23 @@ static const char description[] =
 #define MAX_EXTRA_STATUSES     16
 #define STATUS_TOKEN_LEN       32
 #define LOOP_BUDGET_MS         20          /* max ast_waitfor_nandfds budget */
-#define WS_WRITE_TIMEOUT_MS    100         /* per-write bound on the socket */
-#define WS_MAX_FRAME_BYTES     16000       /* split larger sends (1 s of audio) */
+/*
+ * Per-write bound on the socket.  res_http_websocket turns a write that does
+ * not complete within this time into a CLOSE 1011 (= NETERR for us), so it
+ * must cover one RTT of ACK clocking for a multi-frame flush on a fresh
+ * connection over a WAN, while staying far below the ~1.9 s after which the
+ * Local channel's read queue overflows.
+ */
+#define WS_WRITE_TIMEOUT_MS    500
+#define WS_MAX_FRAME_BYTES     16000       /* split larger sends (1 s of audio); the core alloca()s a frame copy */
+#define WS_READ_DRAIN_MAX      8           /* frames read per readiness before the channel is serviced again */
 #define ACC_HARD_CAP           (1024 * 1024)
 #define RX_CAP                 16384       /* server text buffer */
 #define MAX_RESPONSE           255         /* AMDRESPONSE length */
 #define CONNECT_WARN_S         10          /* connect failure warning per host */
-#define MAX_PENDING_CONNECTS   64          /* helper threads allowed in flight */
+#define PENDING_WARN_S         60          /* "cap reached" warning per host */
+#define DEF_MAX_PENDING        64          /* default max_pending_connects (per host) */
+#define MAX_PENDING_HOSTS      16          /* distinct hosts tracked at once */
 #define DB_WARN_S              60          /* DB warning rate limit */
 #define DB_BACKOFF_S           5           /* skip the DB this long after a failure */
 #define MAX_VID_LEN            255
@@ -320,6 +337,7 @@ struct amd_ws_conf {
 	int db;
 	int db_timeout_ms;
 	char astguiclient_conf[256];
+	int max_pending_connects;
 };
 
 static struct amd_ws_conf g_conf;
@@ -329,12 +347,25 @@ AST_MUTEX_DEFINE_STATIC(conf_lock);
 static int cnt_calls, cnt_human, cnt_machine, cnt_other, cnt_neterr, cnt_interr, cnt_timeouts, cnt_hangups;
 
 /*
- * Connect helper threads in flight.  A server that accepts TCP but never
- * answers the HTTP upgrade (and never closes) keeps its helper blocked in the
- * core's handshake read, so the count is capped: beyond MAX_PENDING_CONNECTS
- * new calls fail fast with NETERR instead of piling up threads.
+ * Connect helper threads.  inflight_helpers counts every live helper (a
+ * legitimate burst of answers creates as many for a few milliseconds; that is
+ * never capped).  A server that accepts TCP but never answers the HTTP
+ * upgrade (and never closes) keeps its helper blocked in the core's handshake
+ * read (res_http_websocket gives that read no timeout) after the call gave up
+ * at connect_timeout_ms: such PARKED helpers are counted per host, and beyond
+ * max_pending_connects new calls to THAT host fail fast with NETERR instead of
+ * piling up threads; one dead test host cannot disable production.  A parked
+ * helper ends only when the peer closes the socket or Asterisk restarts.
  */
-static int pending_connects;
+static int inflight_helpers;
+struct pending_slot {
+	char host[256];
+	int count;             /* parked helpers for this host */
+	time_t last_warn;      /* "cap reached" warning, once per PENDING_WARN_S */
+};
+static struct pending_slot pending_hosts[MAX_PENDING_HOSTS];
+static int pending_total;  /* sum over the slots, for the CLI */
+AST_MUTEX_DEFINE_STATIC(pending_lock);
 
 /* Rate limiting of repeated warnings */
 struct warn_slot {
@@ -376,6 +407,7 @@ static void conf_set_defaults(struct amd_ws_conf *c)
 #endif
 	c->db_timeout_ms = 1000;
 	ast_copy_string(c->astguiclient_conf, "/etc/astguiclient.conf", sizeof(c->astguiclient_conf));
+	c->max_pending_connects = DEF_MAX_PENDING;
 }
 
 /*! \brief Parse a positive int; returns 0 and leaves *out untouched on error */
@@ -520,6 +552,8 @@ static int load_config(int reload)
 			if (!ast_strlen_zero(val)) {
 				ast_copy_string(c.astguiclient_conf, val, sizeof(c.astguiclient_conf));
 			}
+		} else if (!strcasecmp(name, "max_pending_connects")) {
+			ok = parse_int(val, 8, 1024, &c.max_pending_connects);
 		} else {
 			ast_log(LOG_WARNING, "AMD_WS: amd_ws.conf: unknown option '%s' at line %d\n", name, v->lineno);
 		}
@@ -571,6 +605,79 @@ static int connect_warn_allowed(const char *host)
 	return 1;
 }
 
+/*! \brief Slot of host (pending_lock held); create one when create is set. -1 when none. */
+static int pending_slot_of(const char *host, int create)
+{
+	int i, free_slot = -1;
+
+	for (i = 0; i < MAX_PENDING_HOSTS; i++) {
+		if (pending_hosts[i].count > 0 && !strcmp(pending_hosts[i].host, host)) {
+			return i;
+		}
+		if (free_slot < 0 && pending_hosts[i].count == 0) {
+			free_slot = i;
+		}
+	}
+	if (!create || free_slot < 0) {
+		return -1;   /* > MAX_PENDING_HOSTS hosts parked at once: never counted, never refused */
+	}
+	ast_copy_string(pending_hosts[free_slot].host, host, sizeof(pending_hosts[free_slot].host));
+	pending_hosts[free_slot].last_warn = 0;
+	return free_slot;
+}
+
+/*!
+ * \brief Is the per-host cap of parked helpers reached?  *warn is set when the
+ *        rate-limited (PENDING_WARN_S) warning may be logged.
+ */
+static int pending_cap_reached(const char *host, int max, int *warn)
+{
+	int slot, reached = 0;
+
+	*warn = 0;
+	ast_mutex_lock(&pending_lock);
+	slot = pending_slot_of(host, 0);
+	if (slot >= 0 && pending_hosts[slot].count >= max) {
+		time_t now = time(NULL);
+
+		reached = 1;
+		if (now - pending_hosts[slot].last_warn >= PENDING_WARN_S) {
+			pending_hosts[slot].last_warn = now;
+			*warn = 1;
+		}
+	}
+	ast_mutex_unlock(&pending_lock);
+	return reached;
+}
+
+/*! \brief The call gave up on a still-pending connect: its helper is now parked. */
+static void pending_park(const char *host)
+{
+	int slot;
+
+	ast_mutex_lock(&pending_lock);
+	slot = pending_slot_of(host, 1);
+	if (slot >= 0) {
+		pending_hosts[slot].count++;
+		pending_total++;
+	}
+	ast_mutex_unlock(&pending_lock);
+}
+
+/*! \brief A parked helper ended (the peer closed, or the connect finally completed). */
+static void pending_unpark(const char *host)
+{
+	int slot;
+
+	ast_mutex_lock(&pending_lock);
+	slot = pending_slot_of(host, 0);
+	if (slot >= 0) {
+		pending_hosts[slot].count--;
+		pending_total--;
+	}
+	ast_mutex_unlock(&pending_lock);
+}
+
 /* ------------------------------------------------------------------------
  * DB lookup (ViciDial phone / country enrichment) -- optional
  * ---------------------------------------------------------------------- */
@@ -591,9 +698,11 @@ static struct db_creds g_db_creds;   /* protected by conf_lock */
  *
  * Tolerates tabs, trailing whitespace, inline '#'/';' comments (when preceded by
  * whitespace or at line start) and '=>' inside values (split on the first one).
- * Credentials are never logged.
+ * Credentials are never logged.  When the file cannot be read, loaded stays 0
+ * and db_lookup() skips the DB entirely (no connection attempts with the
+ * built-in defaults); with the lookup enabled this is said once at load/reload.
  */
-static void load_db_creds(const char *path)
+static void load_db_creds(const char *path, int db_enabled)
 {
 	struct db_creds c;
 	FILE *f;
@@ -646,8 +755,11 @@ static void load_db_creds(const char *path)
 			}
 		}
 		fclose(f);
+	} else if (db_enabled) {
+		ast_log(LOG_NOTICE, "AMD_WS: cannot read %s: %s - the phone/country DB lookup is skipped until the file is readable and the module reloaded\n",
+			path, strerror(errno));
 	} else {
-		ast_debug(1, "AMD_WS: cannot read %s: %s (DB lookup will use defaults)\n", path, strerror(errno));
+		ast_debug(1, "AMD_WS: cannot read %s: %s (DB lookup disabled anyway)\n", path, strerror(errno));
 	}
 
 	ast_mutex_lock(&conf_lock);
@@ -718,11 +830,15 @@ static int db_connect_locked(int timeout_ms)
 /*!
  * \brief Look up phone_code/phone_number for a ViciDial callerid (VID).
  *
- * Bounded by timeout_ms: the mutex is acquired with a deadline, the connection
- * uses connect/read/write timeouts, and after a failure the DB is skipped for
- * DB_BACKOFF_S so a dead DB costs at most one timeout, not one per call.
- * Any problem is logged at WARNING once per minute and the call continues
- * without phone.  Returns 0 when a row was found.
+ * Runs on the connect helper thread, never on the PBX thread.  Bounded: the
+ * mutex is acquired with a deadline of timeout_ms, the connection uses
+ * connect/read/write timeouts of ceil(timeout_ms / 1000) s each, and after a
+ * failure the DB is skipped for DB_BACKOFF_S so a dead DB costs at most one
+ * timeout, not one per call.  A connection the server dropped meanwhile
+ * (wait_timeout: CR_SERVER_GONE_ERROR / CR_SERVER_LOST) is reconnected once
+ * within the same deadline instead of starting the backoff.  Any problem is
+ * logged at WARNING once per minute and the call continues without phone.
+ * Returns 0 when a row was found.
  */
 static int db_lookup(const char *vid, int timeout_ms, char *phone, size_t phone_sz, char *code, size_t code_sz)
 {
@@ -732,10 +848,17 @@ static int db_lookup(const char *vid, int timeout_ms, char *phone, size_t phone_
 	MYSQL_RES *res;
 	MYSQL_ROW row;
 	unsigned long elen;
-	int found = -1;
+	int found = -1, loaded;
 
 	phone[0] = '\0';
 	code[0] = '\0';
+
+	ast_mutex_lock(&conf_lock);
+	loaded = g_db_creds.loaded;
+	ast_mutex_unlock(&conf_lock);
+	if (!loaded) {
+		return -1;   /* astguiclient.conf unreadable: said once at load/reload */
+	}
 
 	/* Acquire the lock with a deadline: never wait longer than db_timeout_ms */
 	while (ast_mutex_trylock(&db_lock)) {
@@ -768,12 +891,28 @@ static int db_lookup(const char *vid, int timeout_ms, char *phone, size_t phone_
 		escaped);
 
 	if (mysql_query(db_conn, query)) {
+		unsigned int e = mysql_errno(db_conn);
+
+		if ((e == CR_SERVER_GONE_ERROR || e == CR_SERVER_LOST)
+			&& ast_tvdiff_ms(ast_tvnow(), start) < timeout_ms) {
+			/* idle connection dropped by the server (wait_timeout): one reconnect, same deadline */
+			ast_debug(1, "AMD_WS: DB connection gone (%u), reconnecting\n", e);
+			mysql_close(db_conn);
+			db_conn = NULL;
+			if (db_connect_locked(timeout_ms)) {
+				goto done;   /* backoff set by db_connect_locked */
+			}
+			if (!mysql_query(db_conn, query)) {
+				goto fetch;
+			}
+		}
 		db_warn("DB query failed: %s", mysql_error(db_conn));
 		mysql_close(db_conn);      /* manual reconnect on the next call */
 		db_conn = NULL;
 		db_fail_until = time(NULL) + DB_BACKOFF_S;
 		goto done;
 	}
+fetch:
 	res = mysql_store_result(db_conn);
 	if (res) {
 		row = mysql_fetch_row(res);
@@ -1172,6 +1311,10 @@ static struct ast_tls_config *tls_cfg_create(const struct amd_ws_conf *conf)
  * the channel, and abandons it when the deadline passes.  Whoever drops the
  * last reference frees the job; an abandoned job's websocket is closed by
  * the helper.
+ *
+ * The optional DB enrichment runs on the helper right before the connect
+ * (results in phone/country, valid once state == JOB_DONE), so a stalled DB
+ * never blocks the channel thread.
  */
 enum job_state {
 	JOB_PENDING = 0,
@@ -1187,8 +1330,15 @@ struct connect_job {
 	enum ast_websocket_result wr;
 	struct ast_tls_config *tls_cfg;   /* owned by the ws client once args are created */
 	int timeout_ms;
+	char host[256];                   /* for the parked-helper accounting */
 	char uri[600];
 	char chan_name[AST_CHANNEL_NAME];
+	/* DB enrichment (helper thread) */
+	int do_db;
+	int db_timeout_ms;
+	char vid[MAX_VID_LEN + 1];
+	char phone[64];
+	char country[32];
 };
 
 static void job_unref(struct connect_job *job)
@@ -1204,8 +1354,12 @@ static void job_unref(struct connect_job *job)
 	}
 }
 
-/*! \brief Run the blocking connect; result into job->ws / job->wr. */
-static void job_connect(struct connect_job *job)
+/*!
+ * \brief Run the optional DB lookup and the blocking connect; result into job->ws / job->wr.
+ * \retval JOB_DONE the outcome was handed to the call
+ * \retval JOB_ABANDONED the call had given up meanwhile (a late socket was closed here)
+ */
+static enum job_state job_connect(struct connect_job *job)
 {
 	struct ast_websocket_client_options opts = {
 		.uri = job->uri,
@@ -1215,6 +1369,16 @@ static void job_connect(struct connect_job *job)
 	};
 	enum ast_websocket_result wr = (enum ast_websocket_result) -1; /* stays -1 if the OPTIONAL_API stub ran */
 	struct ast_websocket *ws;
+
+#ifdef HAVE_MYSQL
+	if (job->do_db) {
+		if (!db_lookup(job->vid, job->db_timeout_ms, job->phone, sizeof(job->phone), job->country, sizeof(job->country))) {
+			ast_debug(2, "AMD_WS: %s DB phone=%s country=%s\n", job->chan_name, job->phone, job->country);
+		} else {
+			ast_debug(2, "AMD_WS: %s no DB row for vid=%s\n", job->chan_name, job->vid);
+		}
+	}
+#endif
 
 	ws = ast_websocket_client_create_with_options(&opts, &wr);
 
@@ -1239,25 +1403,31 @@ static void job_connect(struct connect_job *job)
 			ast_websocket_close(ws, 1000);
 			ast_websocket_unref(ws);
 		}
-		return;
+		return JOB_ABANDONED;
 	}
 	job->ws = ws;
 	job->state = JOB_DONE;
 	ast_mutex_unlock(&job->lock);
+	return JOB_DONE;
 }
 
 static void *connect_thread(void *data)
 {
 	struct connect_job *job = data;
 
-	job_connect(job);
+	if (job_connect(job) == JOB_ABANDONED) {
+		pending_unpark(job->host);   /* always after job_abandon()'s pending_park(): see there */
+	}
 	job_unref(job);
-	ast_atomic_fetchadd_int(&pending_connects, -1);
+	ast_atomic_fetchadd_int(&inflight_helpers, -1);
 	ast_module_unref(AST_MODULE_SELF);
 	return NULL;
 }
 
-/*! \brief Poll the job: returns JOB_DONE (ws taken into *ws, may be NULL) or JOB_PENDING. */
+/*!
+ * \brief Poll the job: returns JOB_DONE (ws taken into *ws, may be NULL; *wr and
+ *        job->phone/country valid) or JOB_PENDING.
+ */
 static enum job_state job_poll(struct connect_job *job, struct ast_websocket **ws, enum ast_websocket_result *wr)
 {
 	enum job_state st;
@@ -1273,20 +1443,33 @@ static enum job_state job_poll(struct connect_job *job, struct ast_websocket **w
 	return st;
 }
 
-/*! \brief Give up on the job.  If it completed meanwhile, the ws is returned to the caller. */
-static struct ast_websocket *job_abandon(struct connect_job *job)
+/*!
+ * \brief Give up on the job.  If it completed meanwhile the outcome is handed
+ *        over exactly like job_poll() (JOB_DONE, ws may be NULL with the real
+ *        failure in *wr); otherwise it is marked JOB_ABANDONED and the helper
+ *        disposes of whatever it still produces.
+ */
+static enum job_state job_abandon(struct connect_job *job, struct ast_websocket **ws, enum ast_websocket_result *wr)
 {
-	struct ast_websocket *ws = NULL;
+	enum job_state st;
 
 	ast_mutex_lock(&job->lock);
 	if (job->state == JOB_DONE) {
-		ws = job->ws;
+		*ws = job->ws;
+		*wr = job->wr;
 		job->ws = NULL;
 	} else {
 		job->state = JOB_ABANDONED;
+		/*
+		 * Counted while job->lock is held: the helper only sees ABANDONED
+		 * after this unlock, so its pending_unpark() always follows this
+		 * pending_park() (lock order job->lock -> pending_lock, nowhere else).
+		 */
+		pending_park(job->host);
 	}
+	st = job->state;
 	ast_mutex_unlock(&job->lock);
-	return ws;
+	return st;
 }
 
 /* ------------------------------------------------------------------------
@@ -1361,6 +1544,7 @@ struct amd_call {
 
 	/* clocks */
 	struct timeval t_app;
+	struct timeval t_connect;         /* connect job started (connect deadline runs from here) */
 	struct timeval t_first;           /* first voice frame; zero if none yet */
 	int have_audio;
 
@@ -1679,6 +1863,10 @@ static int ws_attach(struct amd_call *c, struct ast_websocket *ws, const char *c
  * pieces into rx.  PING is answered by res_http_websocket itself.  CLOSE or
  * any read error marks the connection lost.
  *
+ * Bound: when only part of a frame has arrived the core's ws_safe_read()
+ * waits for the rest in 1 s steps, up to 10 s (see docs/troubleshooting.md,
+ * "Known limitations"); server replies are expected to be small.
+ *
  * \retval 1 terminal result received, 0 nothing decisive, -1 connection lost
  */
 static int ws_service_read(struct amd_call *c)
@@ -1743,6 +1931,41 @@ static int ws_service_read(struct amd_call *c)
 	return 0;
 }
 
+/*!
+ * \brief Service the websocket after poll reported it readable.
+ *
+ * Reads one frame, then drains what is already buffered: over wss:// a TLS
+ * record may carry two frames of which the second sits decrypted inside
+ * OpenSSL where poll() on the fd cannot see it (ast_websocket_wait_for_input()
+ * checks SSL_pending()); over ws:// two coalesced frames are read in one
+ * iteration instead of two.  Bounded by WS_READ_DRAIN_MAX so the channel is
+ * serviced again quickly.  A close the core initiated itself (PONG write
+ * failure, unknown opcode) is detected through ast_websocket_fd() < 0.
+ *
+ * \retval 1 terminal result received, 0 nothing decisive, -1 connection lost
+ */
+static int ws_service(struct amd_call *c)
+{
+	int n;
+
+	for (n = 0; n < WS_READ_DRAIN_MAX; n++) {
+		int r = ws_service_read(c);
+
+		if (r) {
+			return r;
+		}
+		if (ast_websocket_fd(c->ws) < 0) {
+			ast_debug(1, "AMD_WS: %s websocket closed by the core\n", ast_channel_name(c->chan));
+			c->ws_lost = 1;
+			return -1;
+		}
+		if (ast_websocket_wait_for_input(c->ws, 0) <= 0) {
+			break;
+		}
+	}
+	return 0;
+}
+
 /*! \brief Best-effort protocol goodbye + close + unref.  Never leaves the fd open. */
 static void ws_release(struct amd_call *c)
 {
@@ -1765,50 +1988,77 @@ static void ws_release(struct amd_call *c)
  * tcptls client marks the calling thread with ast_thread_inhibit_escalations(),
  * which would break a later System() in the same dialplan.
  *
- * \retval 0 started, 1 refused because too many connects are in flight (NETERR),
- *         -1 internal failure (INTERR)
+ * \retval 0 started, 1 refused because too many connects to this host are in
+ *         flight (NETERR), -1 internal failure (INTERR)
  */
-static int start_connect(struct amd_call *c)
+static int start_connect(struct amd_call *c, int do_db)
 {
 	struct connect_job *job;
 	pthread_t tid;
+	int warn, probe;
+	const char *scheme = c->use_tls ? "wss" : "ws";
 
-	if (ast_atomic_fetchadd_int(&pending_connects, 1) >= MAX_PENDING_CONNECTS) {
-		ast_atomic_fetchadd_int(&pending_connects, -1);
+	/*
+	 * File-descriptor probe.  The core's client path calls
+	 * ast_tcptls_client_start_timeout(ast_tcptls_client_create(...)) and
+	 * dereferences the NULL that ast_tcptls_client_create() returns when
+	 * socket() fails (EMFILE/ENFILE) -- that would take the whole Asterisk
+	 * down.  A socket we can open now is no guarantee for the helper a few
+	 * microseconds later, but it catches sustained exhaustion.
+	 */
+	probe = socket(AF_INET, SOCK_STREAM, 0);
+	if (probe < 0) {
 		if (connect_warn_allowed(c->host)) {
-			ast_log(LOG_WARNING, "AMD_WS: %d connects to %s still pending, failing fast (suppressed for %d s)\n",
-				MAX_PENDING_CONNECTS, c->host, CONNECT_WARN_S);
+			ast_log(LOG_WARNING, "AMD_WS: cannot open a socket: %s - out of file descriptors? (raise maxfiles in asterisk.conf; suppressed for %d s)\n",
+				strerror(errno), CONNECT_WARN_S);
+		}
+		return -1;
+	}
+	close(probe);
+
+	if (pending_cap_reached(c->host, c->conf.max_pending_connects, &warn)) {
+		if (warn) {
+			ast_log(LOG_WARNING, "AMD_WS: %d connects to %s still pending (max_pending_connects), failing fast with NETERR until the server closes them (suppressed for %d s)\n",
+				c->conf.max_pending_connects, c->host, PENDING_WARN_S);
 		}
 		return 1;
 	}
 
 	job = ast_calloc(1, sizeof(*job));
 	if (!job) {
-		ast_atomic_fetchadd_int(&pending_connects, -1);
 		return -1;
 	}
 	ast_mutex_init(&job->lock);
 	job->refs = 2;   /* caller + thread */
 	job->state = JOB_PENDING;
 	job->timeout_ms = c->connect_timeout_ms;
+	ast_copy_string(job->host, c->host, sizeof(job->host));
 	ast_copy_string(job->chan_name, ast_channel_name(c->chan), sizeof(job->chan_name));
-	snprintf(job->uri, sizeof(job->uri), "%s://%s:%d/", c->use_tls ? "wss" : "ws", c->host, c->port);
+	if (strchr(c->host, ':') && c->host[0] != '[') {
+		/* IPv6 literal: the URI parser needs brackets */
+		snprintf(job->uri, sizeof(job->uri), "%s://[%s]:%d/", scheme, c->host, c->port);
+	} else {
+		snprintf(job->uri, sizeof(job->uri), "%s://%s:%d/", scheme, c->host, c->port);
+	}
+	job->do_db = do_db;
+	job->db_timeout_ms = c->conf.db_timeout_ms;
+	ast_copy_string(job->vid, c->vid, sizeof(job->vid));
 	if (c->use_tls) {
 		job->tls_cfg = tls_cfg_create(&c->conf);
 		if (!job->tls_cfg) {
 			ast_mutex_destroy(&job->lock);
 			ast_free(job);
-			ast_atomic_fetchadd_int(&pending_connects, -1);
 			return -1;
 		}
 	}
 
 	/* The helper holds a module reference so an unload cannot race its tail. */
 	ast_module_ref(AST_MODULE_SELF);
+	ast_atomic_fetchadd_int(&inflight_helpers, 1);
 	if (ast_pthread_create_detached_background(&tid, NULL, connect_thread, job)) {
 		ast_log(LOG_ERROR, "AMD_WS: %s cannot create connect thread: %s\n", ast_channel_name(c->chan), strerror(errno));
 		ast_module_unref(AST_MODULE_SELF);
-		ast_atomic_fetchadd_int(&pending_connects, -1);
+		ast_atomic_fetchadd_int(&inflight_helpers, -1);
 		tls_cfg_free(job->tls_cfg);
 		ast_mutex_destroy(&job->lock);
 		ast_free(job);
@@ -1816,6 +2066,20 @@ static int start_connect(struct amd_call *c)
 	}
 	c->job = job;
 	return 0;
+}
+
+/*! \brief Take the helper's DB enrichment (valid once the job is JOB_DONE) unless p()/k() gave values */
+static void job_take_db(struct amd_call *c)
+{
+	if (!c->job || !c->job->do_db) {
+		return;
+	}
+	if (ast_strlen_zero(c->phone)) {
+		ast_copy_string(c->phone, c->job->phone, sizeof(c->phone));
+	}
+	if (ast_strlen_zero(c->country)) {
+		ast_copy_string(c->country, c->job->country, sizeof(c->country));
+	}
 }
 
 static void count_outcome(const struct amd_call *c)
@@ -1875,7 +2139,20 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 
 	if (!ast_strlen_zero(args.options)
 		&& ast_app_parse_options(amd_ws_options, &opts, opt_args, args.options)) {
-		ast_log(LOG_WARNING, "AMD_WS: %s invalid options '%s' (ignored)\n", ast_channel_name(chan), args.options);
+		/* p(<phone>) may be inside: never write digits to the log at normal verbosity */
+		char masked[128];
+		size_t i;
+
+		ast_copy_string(masked, args.options, sizeof(masked));
+		for (i = 0; masked[i]; i++) {
+			if (isdigit((unsigned char) masked[i])) {
+				masked[i] = 'X';
+			}
+		}
+		ast_log(LOG_WARNING, "AMD_WS: %s invalid options '%s' (digits masked; all options ignored)\n", ast_channel_name(chan), masked);
+		/* "ignored" means ignored: not the half of them parsed before the error */
+		memset(&opts, 0, sizeof(opts));
+		memset(opt_args, 0, sizeof(opt_args));
 	}
 
 	ast_copy_string(c.host, !ast_strlen_zero(args.host) ? args.host : c.conf.host, sizeof(c.host));
@@ -1976,32 +2253,15 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 		goto finish;
 	}
 
-	/* ---- connect (helper thread) + DB enrichment -------------------- */
-	v = start_connect(&c);
+	/* ---- connect (helper thread; the DB enrichment runs there too) --- */
+	/* conf db=no, option n, or explicit p()/k() values skip the query (spec 5) */
+	v = c.conf.db && !ast_test_flag(&opts, OPT_NODB | OPT_PHONE | OPT_CODE);
+	c.t_connect = ast_tvnow();
+	v = start_connect(&c, v);
 	if (v) {
 		if (v > 0) {
 			set_outcome(&c, "NOTSURE", "NETERR");
 		}
-		goto finish;
-	}
-
-#ifdef HAVE_MYSQL
-	/* conf db=no, option n, or explicit p()/k() values skip the query (spec 5) */
-	if (c.conf.db && !ast_test_flag(&opts, OPT_NODB | OPT_PHONE | OPT_CODE)) {
-		char db_phone[sizeof(c.phone)], db_code[sizeof(c.country)];
-
-		if (!db_lookup(c.vid, c.conf.db_timeout_ms, db_phone, sizeof(db_phone), db_code, sizeof(db_code))) {
-			ast_copy_string(c.phone, db_phone, sizeof(c.phone));
-			ast_copy_string(c.country, db_code, sizeof(c.country));
-			ast_debug(2, "AMD_WS: %s DB phone=%s country=%s\n", ast_channel_name(chan), c.phone, c.country);
-		} else {
-			ast_debug(2, "AMD_WS: %s no DB row for vid=%s\n", ast_channel_name(chan), c.vid);
-		}
-	}
-#endif
-
-	if (build_config_json(&c, config_json, sizeof(config_json))) {
-		ast_log(LOG_WARNING, "AMD_WS: %s config JSON too large\n", ast_channel_name(chan));
 		goto finish;
 	}
 
@@ -2028,45 +2288,48 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 		if (c.phase == PHASE_CONNECT) {
 			struct ast_websocket *ws = NULL;
 			enum ast_websocket_result wr = WS_OK;
-			int64_t conn_left = c.connect_timeout_ms - ast_tvdiff_ms(now, c.t_app);
+			int64_t conn_left = c.connect_timeout_ms - ast_tvdiff_ms(now, c.t_connect);
+			enum job_state st = job_poll(c.job, &ws, &wr);
 
-			if (job_poll(c.job, &ws, &wr) == JOB_DONE) {
-				job_unref(c.job);
-				c.job = NULL;
-				if (!ws) {
-					if ((int) wr == -1) {
-						ast_log(LOG_ERROR, "AMD_WS: %s res_http_websocket is not loaded\n", ast_channel_name(chan));
-						set_outcome(&c, "NOTSURE", "INTERR");
-					} else {
-						if (connect_warn_allowed(c.host)) {
-							ast_log(LOG_WARNING, "AMD_WS: connect to %s://%s:%d failed: %s (suppressed for %d s)\n",
-								c.use_tls ? "wss" : "ws", c.host, c.port, ws_result_str(wr), CONNECT_WARN_S);
-						}
-					}
-					break;
-				}
-				if (ws_attach(&c, ws, config_json)) {
-					break;
-				}
-				c.phase = PHASE_STREAM;
-				ast_debug(1, "AMD_WS: %s connected after %" PRId64 " ms\n", ast_channel_name(chan), ast_tvdiff_ms(now, c.t_app));
-			} else if (conn_left <= 0 || detect_left <= 0) {
-				ws = job_abandon(c.job);
-				job_unref(c.job);
-				c.job = NULL;
-				if (ws) {
-					/* raced: it finished exactly now -- use it */
-					if (ws_attach(&c, ws, config_json)) {
-						break;
-					}
-					c.phase = PHASE_STREAM;
-				} else {
+			if (st != JOB_DONE && (conn_left <= 0 || detect_left <= 0)) {
+				/* deadline: give up, unless it finished exactly now (then use the outcome) */
+				st = job_abandon(c.job, &ws, &wr);
+				if (st != JOB_DONE) {
+					job_unref(c.job);
+					c.job = NULL;
 					if (connect_warn_allowed(c.host)) {
 						ast_log(LOG_WARNING, "AMD_WS: connect to %s://%s:%d timed out after %d ms (suppressed for %d s)\n",
 							c.use_tls ? "wss" : "ws", c.host, c.port, c.connect_timeout_ms, CONNECT_WARN_S);
 					}
 					break;
 				}
+			}
+			if (st == JOB_DONE) {
+				job_take_db(&c);
+				job_unref(c.job);
+				c.job = NULL;
+				if (!ws) {
+					if ((int) wr == -1) {
+						ast_log(LOG_ERROR, "AMD_WS: %s res_http_websocket is not loaded\n", ast_channel_name(chan));
+						set_outcome(&c, "NOTSURE", "INTERR");
+					} else if (connect_warn_allowed(c.host)) {
+						ast_log(LOG_WARNING, "AMD_WS: connect to %s://%s:%d failed: %s (suppressed for %d s)\n",
+							c.use_tls ? "wss" : "ws", c.host, c.port, ws_result_str(wr), CONNECT_WARN_S);
+					}
+					break;
+				}
+				if (build_config_json(&c, config_json, sizeof(config_json))) {
+					ast_log(LOG_WARNING, "AMD_WS: %s config JSON too large\n", ast_channel_name(chan));
+					c.ws = ws;
+					c.ws_lost = 1;   /* nothing was sent; ws_release() still closes it */
+					set_outcome(&c, "NOTSURE", "INTERR");
+					break;
+				}
+				if (ws_attach(&c, ws, config_json)) {
+					break;
+				}
+				c.phase = PHASE_STREAM;
+				ast_debug(1, "AMD_WS: %s connected after %" PRId64 " ms\n", ast_channel_name(chan), ast_tvdiff_ms(now, c.t_connect));
 			}
 		}
 
@@ -2109,7 +2372,7 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 			ms = m;
 		}
 		if (c.phase == PHASE_CONNECT) {
-			m = c.connect_timeout_ms - (int) ast_tvdiff_ms(now, c.t_app);
+			m = c.connect_timeout_ms - (int) ast_tvdiff_ms(now, c.t_connect);
 			if (m >= 0 && m < ms) {
 				ms = m;
 			}
@@ -2137,7 +2400,7 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 
 		/* -- websocket readable -- */
 		if (nfds && outfd == c.wsfd) {
-			int r = ws_service_read(&c);
+			int r = ws_service(&c);
 
 			if (r > 0) {
 				break;   /* result */
@@ -2168,7 +2431,10 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 					c.t_first = ast_tvnow();
 				}
 				c.bytes_captured += f->datalen;
-				acc_append(&c, f->data.ptr, f->datalen);
+				/* in GRACE nothing is sent any more: count, do not accumulate */
+				if (c.phase != PHASE_GRACE) {
+					acc_append(&c, f->data.ptr, f->datalen);
+				}
 			}
 			ast_frfree(f);
 		} else if (!winner && ms < 0) {
@@ -2190,8 +2456,10 @@ finish:
 	play_stop(&c);
 
 	if (c.job) {
-		struct ast_websocket *late = job_abandon(c.job);
+		struct ast_websocket *late = NULL;
+		enum ast_websocket_result wr = WS_OK;
 
+		job_abandon(c.job, &late, &wr);
 		job_unref(c.job);
 		c.job = NULL;
 		if (late) {
@@ -2281,8 +2549,10 @@ static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	ast_cli(a->fd, "  playdelay_ms        : %d\n", c.playdelay_ms);
 	ast_cli(a->fd, "  db                  : %s (%s)\n", AST_CLI_YESNO(c.db), db_availability());
 	ast_cli(a->fd, "  db_timeout_ms       : %d\n", c.db_timeout_ms);
-	ast_cli(a->fd, "  astguiclient_conf   : %s (%s)\n", c.astguiclient_conf, creds.loaded ? "read" : "not read");
+	ast_cli(a->fd, "  astguiclient_conf   : %s (%s)\n", c.astguiclient_conf,
+		creds.loaded ? "read" : "NOT READ - DB lookup skipped");
 	ast_cli(a->fd, "  db server           : %s:%d/%s user=%s\n", creds.server, creds.port, creds.database, creds.user);
+	ast_cli(a->fd, "  max_pending_connects: %d (per host)\n", c.max_pending_connects);
 	ast_cli(a->fd, "\nCounters\n");
 	ast_cli(a->fd, "  calls               : %d\n", cnt_calls);
 	ast_cli(a->fd, "  human               : %d\n", cnt_human);
@@ -2292,7 +2562,18 @@ static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	ast_cli(a->fd, "  interr              : %d\n", cnt_interr);
 	ast_cli(a->fd, "  timeouts            : %d\n", cnt_timeouts);
 	ast_cli(a->fd, "  hangups             : %d\n", cnt_hangups);
-	ast_cli(a->fd, "  connects in flight  : %d (max %d)\n\n", pending_connects, MAX_PENDING_CONNECTS);
+	ast_cli(a->fd, "  connects in flight  : %d (helper threads currently connecting)\n", inflight_helpers);
+	ast_mutex_lock(&pending_lock);
+	ast_cli(a->fd, "  parked connects     : %d (max %d per host: the call gave up, the thread waits for the peer to close)\n",
+		pending_total, c.max_pending_connects);
+	for (i = 0; i < MAX_PENDING_HOSTS; i++) {
+		if (pending_hosts[i].count > 0) {
+			ast_cli(a->fd, "    %-18s: %d%s\n", pending_hosts[i].host, pending_hosts[i].count,
+				pending_hosts[i].count >= c.max_pending_connects ? "  (cap reached: calls to this host fail fast with NETERR)" : "");
+		}
+	}
+	ast_mutex_unlock(&pending_lock);
+	ast_cli(a->fd, "\n");
 	return CLI_SUCCESS;
 }
 
@@ -2307,12 +2588,14 @@ static struct ast_cli_entry cli_amd_ws[] = {
 static void load_all_config(int reload)
 {
 	char path[sizeof(g_conf.astguiclient_conf)];
+	int db;
 
 	load_config(reload);
 	ast_mutex_lock(&conf_lock);
 	ast_copy_string(path, g_conf.astguiclient_conf, sizeof(path));
+	db = g_conf.db;
 	ast_mutex_unlock(&conf_lock);
-	load_db_creds(path);
+	load_db_creds(path, db);
 }
 
 static int load_module(void)
