@@ -1,0 +1,29 @@
+; asterisk.conf for the app_amd_ws test harness (rendered by test/run.sh).
+; Every directory lives under the scratch run dir @RUN@ (test/run/ast, gitignored)
+; so the real 16.30.1-vici binary runs as an unprivileged user with no
+; network listeners and without touching /etc/asterisk or /var/lib/asterisk.
+[directories]
+astetcdir => @RUN@/etc
+astmoddir => @RUN@/modules
+astvarlibdir => @RUN@/var/lib
+astdbdir => @RUN@/var/lib
+astkeydir => @RUN@/var/lib
+astdatadir => @RUN@/var/lib
+astagidir => @RUN@/var/lib/agi-bin
+astspooldir => @RUN@/var/spool
+astrundir => @RUN@/var/run
+astlogdir => @LOGDIR@
+astsbindir => /usr/sbin
+
+[options]
+verbose = 3
+debug = 1
+; do not fabricate audio: the "no audio" scenario relies on it
+transmit_silence = no
+hideconnect = yes
+lockconfdir = no
+systemname = amdtest
+defaultlanguage = en
+documentation_language = en_US
+; a hung test must never leave a core file behind
+dumpcore = no

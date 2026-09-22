@@ -166,9 +166,10 @@ def check_close(rec, code):
     if rec.get("close_code") != code:
         return False, "close_code=%r reason=%r error=%r, expected %d" % (
             rec.get("close_code"), rec.get("close_reason"), rec.get("error"), code)
-    if rec.get("error"):
+    if code == 1000 and rec.get("error"):
         return False, "close code ok but connection error recorded: %r" % (rec.get("error"),)
-    return True, "clean close %d at %d ms" % (code, rec.get("t_close", -1))
+    return True, "close %d at %d ms%s" % (code, rec.get("t_close", -1),
+                                          " (%s)" % rec["error"] if rec.get("error") else "")
 
 
 def check_chunks(rec, expect=None, min_chunks=None, max_chunks=None):

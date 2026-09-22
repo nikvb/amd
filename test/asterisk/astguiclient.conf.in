@@ -1,0 +1,11 @@
+# astguiclient.conf for the app_amd_ws test harness (rendered by test/run.sh).
+# Points the module's VARDB_* lookup at a port on 127.0.0.1 where nothing
+# listens, so the DB path fails fast (connect refused) and the call must still
+# complete without "phone"/"country_code".  Deliberately messy formatting
+# (tabs, trailing spaces, inline comments, '=>' in a value) - SPEC section 5
+# requires a tolerant parser.  Never the real credentials.
+VARDB_server =>	127.0.0.1
+VARDB_database => asterisk	# db name
+VARDB_user => cron ; the user
+VARDB_pass => test=>pass
+VARDB_port => @DBPORT@
