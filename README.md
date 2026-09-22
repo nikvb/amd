@@ -188,6 +188,12 @@ This is the canonical ViciDial AI-AMD block with the `EAGI(amd.py)` line
 replaced by `AMD_WS()`. Everything else (call logging, the fallback to stock
 `AMD()` on the three error causes, `VD_amd.agi`) stays as it is.
 
+If you keep the EAGI script instead of the module, use
+[`agi/amd.py`](agi/README.md): the production `amd.py` (2.2) with the same
+stock-`app_amd` vocabulary for no-audio (`NOAUDIODATA-<ms>`) and hangup
+(`HANGUP`) and a numeric `AMDSTATS`, so both integrations behave the same in
+`VD_amd.agi`.
+
 ```text
 exten => 8370,1,AGI(agi://127.0.0.1:4577/call_log)
 exten => 8370,n,Playback(sip-silence)
@@ -453,6 +459,7 @@ Details and the detection algorithm: [docs/build-and-headers.md](docs/build-and-
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Symptom → cause → check → fix playbook, log lines, CLI. |
 | [docs/testing.md](docs/testing.md) | Test harness overview. |
 | [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md) | Behaviour changes from 1.x; status/cause mapping 1.x → `amd.py` → 2.0. |
+| [agi/README.md](agi/README.md) | The EAGI client `agi/amd.py` (production 2.2 + stock-Asterisk no-audio/hangup vocabulary), its unit tests, how to rebuild `amdy.tar.gz`. |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Branching, pull requests, regenerating the installer, running tests. |
 

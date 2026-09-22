@@ -20,6 +20,16 @@ keys on are taken from stock `AMD()`. Earlier builds of this branch used a
 vocabulary of their own; see the "was" table in
 [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md#channel-variables).
 
+- **`agi/amd.py`** — the production EAGI client (2.2, `gw.724care.com/amdy.tar.gz`,
+  2026-07-14) is now in the repository as 2.2.1 with the same alignment for the
+  two situations that differ from stock `app_amd`: FD3 EOF → `HANGUP`/`HANGUP`
+  (was `NOAUDIO`/`NOAUDIO`, which `VD_amd.agi` routed down the machine path),
+  no audio → `NOTSURE`/`NOAUDIODATA-<ms>` (was `NO_AUDIO_TIMEOUT`; enables the
+  `NOAUDIODATA-Hangup-ENABLED` → ADAIR handling), `AMDSTATS` always
+  `<elapsed_ms>-<bytes>` (was the word `HUMAN`), raw server text in
+  `AMDRESPONSE`. Unit tests: `python3 agi/test_amd_py.py`. See
+  [agi/README.md](agi/README.md).
+
 - **Causes.** `HUMAN` / `CONNECTION_ERROR` (cannot connect, incl.
   `res_http_websocket` missing), `HUMAN` / `PROCESSING_ERROR` (WebSocket
   error after the connect), `HUMAN` / `FATAL_ERROR` (internal failure, option
