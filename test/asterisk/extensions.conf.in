@@ -26,6 +26,7 @@ REC = @REC@
 MOCK_PORT = @MOCK_PORT@
 DEAD_PORT = @DEAD_PORT@
 TLS_PORT = @TLS_PORT@
+BLACKHOLE_PORT = @BLACKHOLE_PORT@
 
 ; ---------------------------------------------------------------------------
 ; farside behaviours: Gosub(fs-<name>,s,1(<VID>,<scenario>,<NNNN>))

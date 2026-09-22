@@ -34,11 +34,20 @@ MODULE_SO=${MODULE_SO:-}
 SCENARIOS=${SCENARIOS:-$TESTDIR/scenarios.txt}
 PYTHON=${PYTHON:-python3}
 MAKE_ARGS=${MAKE_ARGS:-}
-# MariaDB client staged without root (SPEC section 1); used when the system has no MySQL dev files
-MYSQL_ROOT=${MYSQL_ROOT:-/tmp/claude-1000/-home-na/ba3f2cc5-ea24-44ec-aebc-c050b41abe5d/scratchpad/mariadb/usr}
+# Per-box settings that do not belong in the repository (gitignored), e.g. MYSQL_ROOT=/path
+# shellcheck disable=SC1091
+[ -f "$TESTDIR/local.env" ] && . "$TESTDIR/local.env"
+# MariaDB/MySQL client dev files staged outside /usr (no root): a directory holding
+# include/mariadb and lib/x86_64-linux-gnu.  Empty = use the system dev files only; when there
+# are none either, the DB-enabled build and the DB scenarios are SKIPped (a hint is printed).
+MYSQL_ROOT=${MYSQL_ROOT:-}
 TEST_MALLOC_ARENA_MAX=${TEST_MALLOC_ARENA_MAX:-1}   # for the test daemon only, see start_asterisk
 SOAK_RSS_LIMIT_KB=${SOAK_RSS_LIMIT_KB:-1024}         # allowed RSS growth over the 200 measured soak calls
-SUITE_BUDGET_S=${SUITE_BUDGET_S:-240}
+# On a slower/loaded box multiply every UPPER timing bound (max_ms, elapsed<=, burst launch, suite
+# budget) by this integer; lower bounds stay (they catch early exits).
+TEST_SLOW_FACTOR=${TEST_SLOW_FACTOR:-1}
+case "$TEST_SLOW_FACTOR" in ''|*[!0-9]*|0) echo "TEST_SLOW_FACTOR must be a positive integer" >&2; exit 2 ;; esac
+SUITE_BUDGET_S=${SUITE_BUDGET_S:-$((240 * TEST_SLOW_FACTOR))}
 
 MODE=full           # full | selftest
 ONLY=""
@@ -125,9 +134,13 @@ MOCK_PID=""
 MOCK_PORT=""
 MOCK_TLS_PID=""
 TLS_PORT=""        # wss:// mock (empty when openssl is missing -> TLS scenarios SKIP)
+BLACKHOLE_PID=""
+BLACKHOLE_PORT=""  # accept-and-never-reply listener (test/blackhole_server.py)
 DEAD_PORT=""
 DB_PORT=""
 FULL_LOG=""
+AMD_CALLS=0        # calls that ran AMD_WS() (for log_lines: two verbose lines each)
+DB_BUILD=0         # 1 when the module under test was built with MySQL support
 RESULTS=$RUN/results.txt
 CONTROL=$RUN/mock.control
 
@@ -137,7 +150,10 @@ ast_cli() { # run one CLI command on our instance; strip ANSI colour codes
 }
 # NOTE: never pipe a live command into 'grep -q' here: with pipefail the SIGPIPE
 # on early exit makes a matching pipeline report failure.  Capture, then test.
-has() { grep -q -- "$2" <<<"$1"; }       # has "$haystack" 'regex'
+has() { grep -q -- "$2" <<<"$1"; }       # has "$haystack" 'regex' (BRE)
+# the Asterisk log may contain non-UTF-8 bytes (vid_escape sends 0xFF on purpose): grep must not
+# treat it as binary or stop '.' from matching -> byte semantics, always
+lgrep() { LC_ALL=C grep -a "$@"; }
 hasi() { grep -qi -- "$2" <<<"$1"; }
 ast_alive() { local o; o=$(ast_cli 'core show version' 2>/dev/null); has "$o" '^Asterisk'; }
 
@@ -235,6 +251,7 @@ gen_dialplan() { # appends per-scenario [farside-<name>] / [amdside-<name>] cont
 			ws:*)     echo " same => n,AMD_WS(127.0.0.1,\${MOCK_PORT},\${VID},${amd#ws:})" ;;
 			wsdead:*) echo " same => n,AMD_WS(127.0.0.1,\${DEAD_PORT},\${VID},${amd#wsdead:})" ;;
 			wstls:*)  echo " same => n,AMD_WS(127.0.0.1,\${TLS_PORT},\${VID},${amd#wstls:})" ;;
+			wshole:*) echo " same => n,AMD_WS(127.0.0.1,\${BLACKHOLE_PORT},\${VID},${amd#wshole:})" ;;
 			wsraw:*)  echo " same => n,AMD_WS(${amd#wsraw:})" ;;
 			app:*)    emit_apps "${amd#app:}" ;;
 			*) die "scenario $name: bad amdside spec '$amd'" ;;
@@ -283,7 +300,7 @@ mysql_flavour() {
 	if pkg-config --exists libmariadb 2>/dev/null || pkg-config --exists mariadb 2>/dev/null || pkg-config --exists mysqlclient 2>/dev/null \
 	   || command -v mariadb_config >/dev/null 2>&1 || command -v mysql_config >/dev/null 2>&1; then
 		echo system
-	elif [ -d "$MYSQL_ROOT/include/mariadb" ] && [ -d "$MYSQL_ROOT/lib/x86_64-linux-gnu" ]; then
+	elif [ -n "$MYSQL_ROOT" ] && [ -d "$MYSQL_ROOT/include/mariadb" ] && [ -d "$MYSQL_ROOT/lib/x86_64-linux-gnu" ]; then
 		echo staged
 	else
 		echo none
@@ -321,7 +338,8 @@ build_module() {
 	system) margs=(MYSQL=1) ;;
 	staged) margs=(MYSQL=1 "MYSQL_CFLAGS=-I$MYSQL_ROOT/include/mariadb -I$MYSQL_ROOT/include" "MYSQL_LIBS=-L$MYSQL_ROOT/lib/x86_64-linux-gnu -lmariadb")
 	        EXTRA_LD=$MYSQL_ROOT/lib/x86_64-linux-gnu ;;
-	none) row SKIP build_mysql - - - "no MySQL/MariaDB client dev files (system or $MYSQL_ROOT)"; MODULE_AVAILABLE=1; return ;;
+	none) row SKIP build_mysql - - - "no MySQL/MariaDB client dev files (system${MYSQL_ROOT:+ or $MYSQL_ROOT}); DB scenarios SKIP - hint: export MYSQL_ROOT=/dir/with/include/mariadb+lib/x86_64-linux-gnu (or put it in test/local.env)"
+	      MODULE_AVAILABLE=1; return ;;
 	esac
 	log "build 2/2: make ${margs[*]}"
 	# the Makefile's post-link gate runs 'ldd -r': the staged libmariadb must be resolvable
@@ -338,7 +356,7 @@ build_module() {
 		else
 			row PASS build_mysql - - - "make ${margs[0]} ok (could not confirm 'MySQL: yes' in build log)"
 		fi
-		MODULE_AVAILABLE=1
+		MODULE_AVAILABLE=1; DB_BUILD=1
 	else
 		row FAIL build_mysql - - - "make MYSQL=1 failed, see $blog"; tail -20 "$blog"
 		# fall back to the MYSQL=0 object so the rest of the suite can still run
@@ -400,11 +418,49 @@ prepare_rundir() {
 	FULL_LOG=$LOGDIR/full
 }
 
+render_amd_conf() { # [sed-expression ...]: render amd_ws.conf.in, optionally with edits (reload check)
+	sed -e "s|@RUN@|$AST_RUN|g" -e "s|@MOCK_PORT@|$MOCK_PORT|g" -e "s|@DBPORT@|$DB_PORT|g" "$@" "$TESTDIR/asterisk/amd_ws.conf.in" >"$AST_RUN/etc/amd_ws.conf"
+}
+
 render_dialplan() { # needs MOCK_PORT
 	sed -e "s|@RESULTS@|$RESULTS|g" -e "s|@REC@|$REC|g" -e "s|@MOCK_PORT@|$MOCK_PORT|g" -e "s|@DEAD_PORT@|$DEAD_PORT|g" \
-		-e "s|@TLS_PORT@|${TLS_PORT:-$DEAD_PORT}|g" "$TESTDIR/asterisk/extensions.conf.in" >"$AST_RUN/etc/extensions.conf"
+		-e "s|@TLS_PORT@|${TLS_PORT:-$DEAD_PORT}|g" -e "s|@BLACKHOLE_PORT@|${BLACKHOLE_PORT:-$DEAD_PORT}|g" \
+		"$TESTDIR/asterisk/extensions.conf.in" >"$AST_RUN/etc/extensions.conf"
 	gen_dialplan "$AST_RUN/etc/extensions.conf"
-	sed -e "s|@RUN@|$AST_RUN|g" -e "s|@MOCK_PORT@|$MOCK_PORT|g" -e "s|@DBPORT@|$DB_PORT|g" "$TESTDIR/asterisk/amd_ws.conf.in" >"$AST_RUN/etc/amd_ws.conf"
+	render_amd_conf
+}
+
+start_blackhole() { # accept-and-never-reply listener for the blackhole* scenarios (R1-1)
+	rm -f "$RUN/blackhole.port"
+	"$PYTHON" "$TESTDIR/blackhole_server.py" --port 0 --port-file "$RUN/blackhole.port" >"$LOGDIR/blackhole.out" 2>"$LOGDIR/blackhole.log" &
+	BLACKHOLE_PID=$!
+	local i
+	for i in $(seq 1 50); do [ -s "$RUN/blackhole.port" ] && break; sleep 0.1; done
+	if [ -s "$RUN/blackhole.port" ]; then BLACKHOLE_PORT=$(cat "$RUN/blackhole.port"); log "blackhole listener pid=$BLACKHOLE_PID port=$BLACKHOLE_PORT"
+	else log "blackhole listener did not start (see $LOGDIR/blackhole.log); blackhole scenarios will be skipped"; kill "$BLACKHOLE_PID" 2>/dev/null || true; BLACKHOLE_PID=""; fi
+}
+
+stop_blackhole() {
+	[ -n "$BLACKHOLE_PID" ] || return 0
+	kill "$BLACKHOLE_PID" 2>/dev/null || true
+	wait "$BLACKHOLE_PID" 2>/dev/null || true
+	BLACKHOLE_PID=""
+}
+
+cli_parked() { ast_cli 'amd_ws show settings' | sed -n 's/^ *parked connects *: *\([0-9]*\).*/\1/p' | head -1; }
+
+# Killing the black-hole peer must release every parked connect helper (kernel FIN -> the core's
+# handshake read fails -> the helper ends); otherwise 'module unload' stays refused for ever.
+check_blackhole_release() {
+	[ -n "$BLACKHOLE_PID" ] || { row SKIP blackhole_release - - - "no blackhole listener"; return; }
+	local before after i t0; before=$(cli_parked); t0=$(now_ms)
+	stop_blackhole
+	for i in $(seq 1 100); do after=$(cli_parked); [ "${after:-x}" = 0 ] && break; sleep 0.1; done
+	if [ "${before:-0}" -ge 1 ] && [ "${after:-x}" = 0 ]; then
+		row PASS blackhole_release - "$(( $(now_ms) - t0 ))" - "parked connects $before -> 0 within $(( $(now_ms) - t0 )) ms of killing the peer (parked helpers released by FIN)"
+	else
+		row FAIL blackhole_release - "$(( $(now_ms) - t0 ))" - "parked connects before=${before:-?} after=${after:-?} (want >=1 -> 0)"
+	fi
 }
 
 start_mock() {
@@ -507,11 +563,12 @@ cleanup() {
 	local rc=$?
 	trap - EXIT
 	if [ "$KEEP" = 1 ] && [ -n "$AST_PID" ]; then
-		log "--keep: asterisk pid $AST_PID and mock pid(s) $MOCK_PID $MOCK_TLS_PID left running"
+		log "--keep: asterisk pid $AST_PID and mock pid(s) $MOCK_PID $MOCK_TLS_PID $BLACKHOLE_PID left running"
 		log "  console: LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH $ASTERISK_BIN -C $AST_CONF -r"
-		log "  stop:    LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH $ASTERISK_BIN -C $AST_CONF -rx 'core stop now'; kill $MOCK_PID $MOCK_TLS_PID"
+		log "  stop:    LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH $ASTERISK_BIN -C $AST_CONF -rx 'core stop now'; kill $MOCK_PID $MOCK_TLS_PID $BLACKHOLE_PID"
 		log "  mock control file: $CONTROL (write e.g. /human?after=2), results: $RESULTS"
 	else
+		stop_blackhole
 		stop_asterisk
 		stop_mock
 	fi
@@ -598,6 +655,51 @@ print(n)
 EOF
 }
 
+mock_conn_counts() { # vid... -> "<vid> <connections>" per line (bursts: exactly one connection each)
+	"$PYTHON" - "$LOGDIR/mock-record.jsonl" "$@" <<'EOF'
+import json, sys
+want = sys.argv[2:]
+n = {v: 0 for v in want}
+try:
+    for line in open(sys.argv[1]):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("event") == "connection" and r.get("vid") in n:
+            n[r["vid"]] += 1
+except OSError:
+    pass
+for v in want:
+    print(v, n[v])
+EOF
+}
+
+mock_vid_present() { # exact VID text -> "yes" when a connection record carries exactly this VID, else the near misses
+	"$PYTHON" - "$LOGDIR/mock-record.jsonl" "$1" "$2" <<'EOF'
+import json, sys
+want, prefix = sys.argv[2], sys.argv[3]
+near = []
+try:
+    for line in open(sys.argv[1]):
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if r.get("event") != "connection":
+            continue
+        v = r.get("vid")
+        if v == want:
+            print("yes")
+            sys.exit(0)
+        if isinstance(v, str) and v.startswith(prefix):
+            near.append(repr(v))
+except OSError:
+    pass
+print("no (near: %s)" % (", ".join(near) or "-"))
+EOF
+}
+
 check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 	local vid=$1 list=$2 tok checks extra v thr seg st ln pat rc rest toks parts
 	A_FAIL=""; A_NOTE=""
@@ -647,7 +749,7 @@ check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 		resp~*) [[ $R_RESP == *"${tok#resp~}"* ]] || A_FAIL+="resp='$R_RESP'(want ~'${tok#resp~}') " ;;
 		resp=*) [ "$R_RESP" = "${tok#resp=}" ] || A_FAIL+="resp='$R_RESP'(want '${tok#resp=}') " ;;
 		elapsed\>=*) [[ $R_ELAPSED =~ ^[0-9]+$ ]] && [ "$R_ELAPSED" -ge "${tok#elapsed>=}" ] || A_FAIL+="AMDELAPSED=$R_ELAPSED(want>=${tok#elapsed>=}) " ;;
-		elapsed\<=*) [[ $R_ELAPSED =~ ^[0-9]+$ ]] && [ "$R_ELAPSED" -le "${tok#elapsed<=}" ] || A_FAIL+="AMDELAPSED=$R_ELAPSED(want<=${tok#elapsed<=}) " ;;
+		elapsed\<=*) [[ $R_ELAPSED =~ ^[0-9]+$ ]] && [ "$R_ELAPSED" -le $(( ${tok#elapsed<=} * TEST_SLOW_FACTOR )) ] || A_FAIL+="AMDELAPSED=$R_ELAPSED(want<=$(( ${tok#elapsed<=} * TEST_SLOW_FACTOR ))) " ;;
 		heard_dur\<*|heard_dur\>*)
 			wait_file_stable "$REC/$vid-heard.wav" || true
 			v=$(dur_of "$REC/$vid-heard.wav")
@@ -679,11 +781,19 @@ check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 			;;
 		log~*)
 			pat=${tok#log~}; pat=${pat//%VID%/$vid}; pat=${pat//%NUM%/${vid%%_*}}; pat=${pat//%NAME%/${vid#*_}}
-			grep -qE -- "$pat" "$FULL_LOG" 2>/dev/null || A_FAIL+="log lacks /$pat/ "
+			lgrep -qE -- "$pat" "$FULL_LOG" 2>/dev/null || A_FAIL+="log lacks /$pat/ "
 			;;
 		nolog~*)
 			pat=${tok#nolog~}; pat=${pat//%VID%/$vid}; pat=${pat//%NUM%/${vid%%_*}}; pat=${pat//%NAME%/${vid#*_}}
-			! grep -qE -- "$pat" "$FULL_LOG" 2>/dev/null || A_FAIL+="log has /$pat/ "
+			! lgrep -qE -- "$pat" "$FULL_LOG" 2>/dev/null || A_FAIL+="log has /$pat/ "
+			;;
+		cli~*)   # 'amd_ws show settings' output (grep -E), evaluated after the call ended
+			pat=${tok#cli~}; v=$(ast_cli 'amd_ws show settings')
+			grep -qE -- "$pat" <<<"$v" || A_FAIL+="cli lacks /$pat/ (parked=$(sed -n 's/^ *parked connects *: *\([0-9]*\).*/\1/p' <<<"$v" | head -1)) "
+			;;
+		mockvid=*)   # the mock parsed exactly this VID from the config JSON (JSON escaping round trip)
+			v=${tok#mockvid=}; v=${v//%VID%/$vid}; st=$(mock_vid_present "$v" "$vid")
+			[ "$st" = yes ] || A_FAIL+="mock vid '$v' $st "
 			;;
 		alive) ast_alive || A_FAIL+="asterisk not answering CLI " ;;
 		*) A_FAIL+="unknown assert '$tok' " ;;
@@ -694,8 +804,10 @@ check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 
 run_call_scenario() { # index [mock-override]
 	local i=$1 name=${S_NAME[$1]} count=${S_COUNT[$1]} mock=${2:-${S_MOCK[$1]}}
-	local exp_s=${S_STATUS[$i]} exp_c=${S_CAUSE[$i]} min=${S_MIN[$i]} max=${S_MAX[$i]}
+	local exp_s=${S_STATUS[$i]} exp_c=${S_CAUSE[$i]} min=${S_MIN[$i]} max=$(( S_MAX[$1] * TEST_SLOW_FACTOR ))
 	local vids=() vid line fail="" note="" t_launch0 t_launch1 deadline=$(( max / 1000 + 12 ))
+	# every row whose amdside runs AMD_WS() (ws*: specs, or an app: chain naming it) is an AMD call
+	case "${S_AMD[$i]}" in ws*|*AMD_WS*) AMD_CALLS=$((AMD_CALLS + count)) ;; esac
 	set_control "$mock"
 	local scen_log
 	if [ "$count" -le 1 ]; then
@@ -716,7 +828,8 @@ run_call_scenario() { # index [mock-override]
 		wait "${pids[@]}"
 		t_launch1=$(now_ms)
 		note+="launched $count in $((t_launch1 - t_launch0))ms "
-		[ $((t_launch1 - t_launch0)) -le 1000 ] || fail+="originates took $((t_launch1 - t_launch0))ms (>1000) "
+		# 25 parallel 'asterisk -rx' consoles: 70-85 ms on the reference box; the bound only catches a wedged CLI
+		[ $((t_launch1 - t_launch0)) -le $((2500 * TEST_SLOW_FACTOR)) ] || fail+="originates took $((t_launch1 - t_launch0))ms (>$((2500 * TEST_SLOW_FACTOR))) "
 	fi
 	local got=0 wall_max="" el_show="" sc_show="" first_line="" bad_s=0 bad_c=0 bad_t=0 missing=0 example=""
 	for vid in "${vids[@]}"; do
@@ -756,15 +869,30 @@ run_call_scenario() { # index [mock-override]
 		[ -n "$R_RESP" ] && note+="resp='${R_RESP:0:40}' "
 	fi
 	[ "$count" -gt 1 ] && note+="results=$got/$count "
-	# only single calls get the per-VID assertions; bursts get alive + count
+	for vid in "${vids[@]}"; do wait_quiet "$vid" || note+="(channels of $vid lingered) "; done
 	if [ "$count" -le 1 ] && [ "$got" = 1 ]; then
 		check_asserts "${vids[0]}" "${S_ASSERTS[$i]}"
 		fail+=$A_FAIL; note+=$A_NOTE
 	elif [ "$count" -gt 1 ]; then
 		ast_alive || fail+="asterisk not alive after burst "
 		[ "$got" = "$count" ] || fail+="only $got/$count results "
+		# a burst that reached the mock must have produced exactly one connection per VID (no
+		# missing, no duplicate connects); the record is written when the mock sees the close
+		if [ "$mock" != "-" ]; then
+			local k cc dup=0 miss=0
+			for k in $(seq 1 20); do
+				cc=$(mock_conn_counts "${vids[@]}"); dup=$(awk '$2>1' <<<"$cc" | wc -l); miss=$(awk '$2==0' <<<"$cc" | wc -l)
+				[ "$dup" = 0 ] && [ "$miss" = 0 ] && break
+				sleep 0.1
+			done
+			[ "$miss" = 0 ] || fail+="$miss/$count VIDs without a mock connection "
+			[ "$dup" = 0 ] || fail+="$dup VIDs with more than one mock connection "
+			note+="mock_conns=$((count - miss)) "
+		fi
+		# burst rows may carry log~/nolog~/cli~/alive asserts (evaluated once, %VID% = first call)
+		check_asserts "${vids[0]}" "${S_ASSERTS[$i]}"
+		fail+=$A_FAIL; note+=$A_NOTE
 	fi
-	for vid in "${vids[@]}"; do wait_quiet "$vid" || note+="(channels of $vid lingered) "; done
 	ast_alive || fail+="asterisk died "
 	[ ${#vids[@]} -gt 0 ] && cp "$RESULTS" "$LOGDIR/results.txt" 2>/dev/null
 	if [ -z "$fail" ]; then
@@ -873,14 +1001,21 @@ check_cli_application() {
 }
 
 check_cli_settings() {
-	local out; out=$(ast_cli 'amd_ws show settings')
+	local out want dbline; out=$(ast_cli 'amd_ws show settings')
 	printf '%s\n' "$out" >"$LOGDIR/cli-show-settings.txt"
+	dbline=$(printf '%s\n' "$out" | grep -E '^ *db  *:' | head -1 | tr -s ' ')
+	# the module under test must report the DB support it was built with (R3-3)
+	if [ "$DB_BUILD" = 1 ]; then want='^ *db  *: Yes (available)'; else want='^ *db  *: No (unavailable'; fi   # has() is BRE: ( is literal
 	if hasi "$out" 'No such command'; then
 		row FAIL cli_show_settings - - - "'amd_ws show settings' is not a CLI command"
-	elif hasi "$out" 'host' && hasi "$out" 'timeout'; then
-		row PASS cli_show_settings - - - "$(printf '%s\n' "$out" | wc -l) lines, mentions host/timeout; db: $(printf '%s\n' "$out" | grep -i '^ *db' | head -1 | tr -s ' ')"
+	elif ! has "$out" 'host' || ! has "$out" 'timeout_ms' || ! has "$out" 'connects in flight' || ! has "$out" 'parked connects' || ! has "$out" 'max_pending_connects'; then
+		row FAIL cli_show_settings - - - "output lacks host/timeout_ms/connects in flight/parked connects/max_pending_connects: $(echo "$out" | head -2 | tr '\n' ' ')"
+	elif ! has "$out" "$want"; then
+		row FAIL cli_show_settings - - - "db line '$dbline' does not match the build (DB_BUILD=$DB_BUILD, want /$want/)"
+	elif ! has "$out" '^ *astguiclient_conf *: .* (read)'; then
+		row FAIL cli_show_settings - - - "astguiclient.conf not reported as read: $(printf '%s\n' "$out" | grep astguiclient | tr -s ' ')"
 	else
-		row FAIL cli_show_settings - - - "output lacks host/timeout: $(echo "$out" | head -2 | tr '\n' ' ')"
+		row PASS cli_show_settings - - - "$(printf '%s\n' "$out" | wc -l) lines; $dbline; astguiclient read; connects in flight / parked connects / max_pending_connects shown"
 	fi
 }
 
@@ -889,7 +1024,7 @@ check_unload_cycle() {
 	local vid out line
 	# 1. refused while a call is inside AMD_WS
 	set_control "/silent"
-	next_vid unload_probe; vid=$VID
+	next_vid unload_probe; vid=$VID; AMD_CALLS=$((AMD_CALLS + 1))
 	originate "$vid" >"$LOGDIR/scenario-$vid.log" 2>&1
 	sleep 1.5
 	out=$(ast_cli 'module unload app_amd_ws.so')
@@ -920,7 +1055,7 @@ check_unload_cycle() {
 	out=$(ast_cli 'module load app_amd_ws.so')
 	if has "$out" '^Loaded'; then
 		set_control "/human?after=1"
-		next_vid unload_probe; vid=$VID
+		next_vid unload_probe; vid=$VID; AMD_CALLS=$((AMD_CALLS + 1))
 		originate "$vid" >"$LOGDIR/scenario-$vid.log" 2>&1
 		if line=$(wait_result "$vid" 12); then
 			parse_result "$line"
@@ -933,9 +1068,36 @@ check_unload_cycle() {
 	else
 		row FAIL load_again - - - "expected 'Loaded app_amd_ws.so', got '$(echo "$out" | head -1)'"
 	fi
-	# 4. reload re-reads the config
+	# 4. reload re-reads the config: change several keys, reload, read them back from the CLI,
+	#    prove the new extra_statuses token classifies (probe row reload_effect), then restore
+	local ri
+	render_amd_conf -e 's/^timeout_ms *=.*/timeout_ms = 7777/' -e 's/^send_schedule *=.*/send_schedule = 500/' \
+		-e 's/^result_grace_ms *=.*/result_grace_ms = 0/' -e 's/^extra_statuses *=.*/extra_statuses = HONEYPOT,FAS,GOOGLE_VOICE/' \
+		-e 's/^db *=.*/db = no/' -e 's/^max_pending_connects *=.*/max_pending_connects = 9/'
 	out=$(ast_cli 'module reload app_amd_ws.so')
-	hasi "$out" 'error\|No such' && row FAIL module_reload - - - "'$(echo "$out" | head -1)'" || row PASS module_reload - - - "'$(echo "$out" | head -1 | tr -s ' ')'"
+	if hasi "$out" 'error\|No such'; then
+		row FAIL module_reload - - - "'$(echo "$out" | head -1)'"
+	else
+		local st; st=$(ast_cli 'amd_ws show settings'); printf '%s\n' "$st" >"$LOGDIR/cli-show-settings-reloaded.txt"
+		local bad=""
+		has "$st" '^ *timeout_ms *: 7777$' || bad+="timeout_ms "
+		has "$st" '^ *send_schedule *: 500$' || bad+="send_schedule "
+		has "$st" '^ *result_grace_ms *: 0$' || bad+="result_grace_ms "
+		has "$st" '^ *extra_statuses *: HONEYPOT,FAS,GOOGLE_VOICE$' || bad+="extra_statuses "
+		has "$st" '^ *db *: No' || bad+="db "
+		has "$st" '^ *max_pending_connects: 9 ' || bad+="max_pending_connects "
+		if [ -z "$bad" ]; then row PASS module_reload - - - "'$(echo "$out" | head -1 | tr -s ' ')'; timeout_ms/send_schedule/result_grace_ms/extra_statuses/db/max_pending_connects re-read"
+		else row FAIL module_reload - - - "after reload the CLI still shows the old value(s) of: $bad"; fi
+		if ri=$(scenario_index reload_effect); then
+			log "scenario reload_effect (after module reload: send_schedule=500, extra_statuses=+GOOGLE_VOICE)"
+			run_call_scenario "$ri"
+		fi
+	fi
+	render_amd_conf
+	out=$(ast_cli 'module reload app_amd_ws.so')
+	st=$(ast_cli 'amd_ws show settings')
+	has "$st" '^ *timeout_ms *: 10000$' && has "$st" '^ *send_schedule *: 500,1000,1500,2000,3000,4000$' \
+		|| row FAIL module_reload_restore - - - "config not restored after the second reload: $(printf '%s\n' "$st" | grep -E 'timeout_ms|send_schedule' | tr -s ' ' | tr '\n' ';')"
 }
 
 # WARNING/ERROR lines the suite provokes on purpose; anything else in the full log is a failure
@@ -950,10 +1112,14 @@ LOG_NOISE_ALLOW=(
 	'res_http_websocket.c: Invalid HTTP response code 403 from 127.0.0.1'  # reject_upgrade
 	'app_amd_ws.c: AMD_WS: DB .*(connect|unavailable|failed|refused)'      # db_unreachable (dead VARDB port)
 	'app_amd_ws.c: AMD_WS: .*(Web socket|websocket|WebSocket) (closed|error)' # close_midstream
+	'app_amd_ws.c: AMD_WS: [0-9]+ connects to 127\.0\.0\.1 still pending'    # blackhole_cap (max_pending_connects reached)
+	'res_http_websocket.c: Unable to retrieve HTTP status line\.'            # blackhole_release: parked helpers see FIN
+	'app_amd_ws.c: AMD_WS: .* invalid options .*digits masked'               # bad_options (digits masked in the warning)
+	"app.c: Missing closing parenthesis for argument 'k' in string '1'"       # bad_options: the core's own parser (prints only the unterminated argument)
 )
 check_log_noise() { # no WARNING/ERROR in the Asterisk log other than the intentionally provoked ones
 	local all n_all n_left left pat
-	all=$(grep -E '(WARNING|ERROR)\[' "$FULL_LOG" 2>/dev/null || true)
+	all=$(lgrep -E '(WARNING|ERROR)\[' "$FULL_LOG" 2>/dev/null || true)
 	n_all=$(printf '%s' "$all" | grep -c . || true)
 	left=$all
 	for pat in "${LOG_NOISE_ALLOW[@]}"; do left=$(printf '%s\n' "$left" | grep -vE -- "$pat" || true); done
@@ -967,9 +1133,13 @@ check_log_noise() { # no WARNING/ERROR in the Asterisk log other than the intent
 	fi
 }
 
-soak_burst() { # n mockpath -> runs n concurrent human calls to completion; prints "got/n"
+SOAK_R=""
+soak_burst() { # n mockpath -> runs n concurrent human calls to completion; SOAK_R="got/n"
+	# NOT called in a $(...) subshell: next_vid must advance the global call counter, otherwise the
+	# VIDs repeat and wait_result would match the previous burst's (stale) result lines
 	local n=$1 mock=$2 vids=() vid pids=() got=0 line
 	set_control "$mock"
+	AMD_CALLS=$((AMD_CALLS + n))
 	local k; for k in $(seq 1 "$n"); do next_vid soak; vids+=("$VID"); done
 	for vid in "${vids[@]}"; do originate "$vid" >/dev/null 2>&1 & pids+=($!); done
 	wait "${pids[@]}"
@@ -977,7 +1147,7 @@ soak_burst() { # n mockpath -> runs n concurrent human calls to completion; prin
 		if line=$(wait_result "$vid" 12); then parse_result "$line"; [ "$R_STATUS" = HUMAN ] && got=$((got + 1)); fi
 	done
 	for vid in "${vids[@]}"; do wait_quiet "$vid" || true; done
-	echo "$got/$n"
+	SOAK_R="$got/$n"
 }
 fd_count()  { ls "/proc/$AST_PID/fd" 2>/dev/null | wc -l; }
 rss_kb()    { awk '/^VmRSS:/{print $2}' "/proc/$AST_PID/status" 2>/dev/null || echo 0; }
@@ -987,28 +1157,36 @@ check_soak() { # no fd leak over 50 calls, no RSS growth over 200 calls (bursts 
 	t0=$(now_ms)
 	# warm-up (100 calls): thread stacks, format/translator caches, malloc heap growth of the first
 	# concurrent calls are not a leak; measured on this box the heap is flat from ~100 calls on
-	for b in 1 2 3 4; do r=$(soak_burst 25 "/human?after=1"); warm=$((warm + 25)); [ "$r" = 25/25 ] || bad+="warm-up$b $r "; done
+	for b in 1 2 3 4; do soak_burst 25 "/human?after=1"; r=$SOAK_R; warm=$((warm + 25)); [ "$r" = 25/25 ] || bad+="warm-up$b $r "; done
 	fd0=$(fd_count); rss0=$(rss_kb)
-	for b in 1 2; do r=$(soak_burst 25 "/human?after=1"); calls=$((calls + 25)); [ "$r" = 25/25 ] || bad+="burst$b $r "; done
+	for b in 1 2; do soak_burst 25 "/human?after=1"; r=$SOAK_R; calls=$((calls + 25)); [ "$r" = 25/25 ] || bad+="burst$b $r "; done
 	fd1=$(fd_count)
 	[ "$fd1" -le $((fd0 + 2)) ] || bad+="fds $fd0 -> $fd1 after $calls calls "
-	for b in 3 4 5 6 7 8; do r=$(soak_burst 25 "/human?after=1"); calls=$((calls + 25)); [ "$r" = 25/25 ] || bad+="burst$b $r "; done
+	for b in 3 4 5 6 7 8; do soak_burst 25 "/human?after=1"; r=$SOAK_R; calls=$((calls + 25)); [ "$r" = 25/25 ] || bad+="burst$b $r "; done
 	rss1=$(rss_kb); fd1=$(fd_count)
 	# a leaked 8 KB accumulator or 16 KB rx buffer per call would add 1.6 / 3.2 MB here
 	[ $((rss1 - rss0)) -le "$SOAK_RSS_LIMIT_KB" ] || bad+="RSS ${rss0}kB -> ${rss1}kB (+$((rss1 - rss0)) > ${SOAK_RSS_LIMIT_KB}) after $calls calls "
 	[ "$fd1" -le $((fd0 + 2)) ] || bad+="fds $fd0 -> $fd1 after $calls calls "
 	ast_alive || bad+="asterisk not alive "
 	cp "$RESULTS" "$LOGDIR/results.txt" 2>/dev/null
+	local distinct; distinct=$(grep -c '_soak|' "$RESULTS" 2>/dev/null || true)
+	[ "${distinct:-0}" -ge $((warm + calls)) ] || bad+="only $distinct soak result lines for $((warm + calls)) calls (VIDs reused?) "
 	local note="$warm warm-up + $calls measured calls in $(( ($(now_ms) - t0) / 1000 ))s: fds $fd0 -> $fd1, RSS ${rss0} -> ${rss1} kB ($( [ $((rss1 - rss0)) -ge 0 ] && printf '+')$((rss1 - rss0)) kB, limit $SOAK_RSS_LIMIT_KB)"
 	if [ -z "$bad" ]; then row PASS soak_fd_rss - - - "$note"; else row FAIL soak_fd_rss - - - "$(trim "$bad")| $note"; fi
 }
 
-check_log_lines() { # the two mandatory ast_verb lines exist for AMD calls
-	local n1 n2
-	n1=$(grep -cE 'AMD_WS: .* vid=[0-9]{4}_[a-z0-9_]+ host=' "$FULL_LOG" 2>/dev/null || true)
-	n2=$(grep -cE 'AMD_WS: .* status=[A-Z_]+ cause=[A-Z_]+ elapsed=[0-9]+ sent=[0-9]+ chunks=[0-9]+' "$FULL_LOG" 2>/dev/null || true)
-	if [ "${n1:-0}" -gt 0 ] && [ "${n2:-0}" -gt 0 ]; then row PASS log_lines - - - "$n1 start lines, $n2 end lines (SPEC section 6 format)"
-	else row FAIL log_lines - - - "start lines: ${n1:-0}, end lines: ${n2:-0} (expected the SPEC section 6 ast_verb lines)"
+check_log_lines() { # the two mandatory ast_verb lines exist for EVERY AMD call (one start + one end line each)
+	local n1 n2 nvid
+	# the AMD_WS channel is the Local ;1 leg, except for the not-answered scenario (Dial()ed ;2 leg)
+	local ch='AMD_WS: Local/[0-9]{4}@(farside|amdside)-[a-z0-9_]+-[0-9a-f]+;[12]'
+	n1=$(lgrep -cE "$ch vid=.* host=127\.0\.0\.1:[0-9]+ play=" "$FULL_LOG" 2>/dev/null || true)
+	n2=$(lgrep -cE "$ch status=[A-Z_]+ cause=[A-Z_]+ elapsed=[0-9]+ sent=[0-9]+ chunks=[0-9]+" "$FULL_LOG" 2>/dev/null || true)
+	# every channel has exactly one start and one end line
+	nvid=$(lgrep -oE "$ch (vid=|status=)" "$FULL_LOG" 2>/dev/null | sed 's/ vid=$/ S/; s/ status=$/ E/' | sort | uniq -c | awk '$1!=1' | wc -l)
+	if [ "${n1:-0}" = "$AMD_CALLS" ] && [ "${n2:-0}" = "$AMD_CALLS" ] && [ "${nvid:-1}" = 0 ]; then
+		row PASS log_lines - - - "$n1 start + $n2 end lines for $AMD_CALLS AMD_WS calls, one pair per channel (SPEC section 6 format)"
+	else
+		row FAIL log_lines - - - "start lines: ${n1:-0}, end lines: ${n2:-0}, AMD_WS calls: $AMD_CALLS, channels with a missing/duplicate line: $nvid"
 	fi
 }
 
@@ -1020,7 +1198,10 @@ main() {
 	if [ "$LIST" = 1 ]; then
 		printf '%-20s %-6s %-5s %-18s %-24s %s\n' NAME TAGS COUNT FARSIDE MOCK AMDSIDE
 		local i; for i in "${!S_NAME[@]}"; do printf '%-20s %-6s %-5s %-18s %-24s %s\n' "${S_NAME[$i]}" "${S_TAGS[$i]}" "${S_COUNT[$i]}" "${S_FAR[$i]}" "${S_MOCK[$i]}" "${S_AMD[$i]}"; done
-		echo "checks: sounds no_listeners mock_paths log_noise shutdown_clean (self); build_nomysql build_mysql cli_show_application cli_show_settings soak_fd_rss unload_busy_refused unload_idle load_again module_reload log_lines (amd)"
+		echo "checks (also accepted by --only): sounds no_listeners mock_paths log_noise (self, run in both modes);"
+		echo "  cli_show_application cli_show_settings soak_fd_rss log_lines blackhole_release (amd);"
+		echo "  unload_busy = the unload/reload cycle: rows unload_busy_refused unload_idle load_again module_reload + probe reload_effect (amd)"
+		echo "always: build_nomysql build_mysql (full mode), shutdown_clean"
 		exit 0
 	fi
 	mkdir -p "$LOGDIR"
@@ -1045,6 +1226,7 @@ main() {
 
 	prepare_rundir
 	start_mock
+	[ "$MODE" = full ] && start_blackhole
 	render_dialplan
 	start_asterisk
 
@@ -1070,6 +1252,9 @@ main() {
 			if [ "$MODE" = selftest ]; then continue; fi
 			if [ "$MODULE_AVAILABLE" != 1 ]; then row SKIP "${S_NAME[$i]}" - - - "needs app_amd_ws.so"; continue; fi
 			if [ -z "$TLS_PORT" ] && [[ ${S_AMD[$i]} == wstls:* ]]; then row SKIP "${S_NAME[$i]}" - - - "no wss mock (openssl missing?)"; continue; fi
+			if [ -z "$BLACKHOLE_PORT" ] && [[ ${S_AMD[$i]} == wshole:* ]]; then row SKIP "${S_NAME[$i]}" - - - "no blackhole listener"; continue; fi
+			# rows tagged 'db' prove the MySQL code path: meaningless against a MYSQL=0 object
+			if has_tag "$tags" db && [ "$DB_BUILD" != 1 ]; then row SKIP "${S_NAME[$i]}" - - - "module built without MySQL (no client dev files)"; continue; fi
 		fi
 		[ "$(($(date +%s) - SUITE_T0))" -gt "$SUITE_BUDGET_S" ] && { row FAIL suite_budget - - - "suite exceeded ${SUITE_BUDGET_S}s before ${S_NAME[$i]}"; break; }
 		log "scenario ${S_NAME[$i]} (${S_FAR[$i]} -> ${S_AMD[$i]}; mock ${S_MOCK[$i]})"
@@ -1077,9 +1262,13 @@ main() {
 	done
 
 	if [ "$MODE" = full ] && [ "$MODULE_AVAILABLE" = 1 ]; then
+		# the parked black-hole helpers must be released (peer killed) before the unload cycle:
+		# they hold a module reference, so 'module unload' would be refused with 0 calls
+		selected blackhole_release && check_blackhole_release
+		stop_blackhole
 		selected soak_fd_rss && check_soak
-		selected log_lines && check_log_lines
 		selected unload_busy && check_unload_cycle
+		selected log_lines && check_log_lines
 	fi
 	selected log_noise && check_log_noise
 	[ "$KEEP" = 1 ] || stop_asterisk

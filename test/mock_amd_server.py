@@ -58,6 +58,15 @@ from urllib.parse import parse_qs, urlsplit
 
 import websockets
 
+# This server is written against the "legacy" asyncio API (websockets 10-12: process_request(path,
+# headers), ws.path, websockets.serve).  From websockets 13 the top-level serve() is the new
+# implementation with a different handler/process_request signature; the legacy one lives on
+# under websockets.legacy.server for a few releases.  Prefer it explicitly so the same code runs.
+try:
+    from websockets.legacy.server import serve as ws_serve  # websockets >= 9
+except ImportError:  # pragma: no cover - very old websockets: top-level serve IS the legacy one
+    from websockets import serve as ws_serve
+
 DEFAULT_PATH = "/human?after=2"
 
 PRESETS = {
@@ -313,7 +322,7 @@ async def main_async():
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(ARGS.tls_cert, ARGS.tls_key or ARGS.tls_cert)
         kwargs["ssl"] = ctx
-    async with websockets.serve(handler, ARGS.host, ARGS.port, **kwargs) as server:
+    async with ws_serve(handler, ARGS.host, ARGS.port, **kwargs) as server:
         port = server.sockets[0].getsockname()[1]
         if ARGS.port_file:
             with open(ARGS.port_file + ".tmp", "w") as fh:

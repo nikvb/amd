@@ -7,3 +7,4 @@
 app_amd_ws/
 test/run/
 bundles/
+test/local.env

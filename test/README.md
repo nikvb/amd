@@ -9,7 +9,9 @@ network listeners, nothing outside `test/run/` is written.
 test/
   run.sh               the harness: build, start mock + Asterisk, run scenarios, PASS/FAIL table
   scenarios.txt        data-driven scenario table (add a line = add a test)
-  mock_amd_server.py   mock AMD service (websockets 12); behaviour by URL path or control file
+  mock_amd_server.py   mock AMD service (websockets legacy API, 10-12 tested with 12.0); behaviour by URL path or control file
+  blackhole_server.py  accept-and-never-reply TCP listener (server that never finishes the handshake)
+  local.env            OPTIONAL, gitignored: per-box settings such as MYSQL_ROOT=/path
   mock_client.py       amd.py-like client used to test the mock itself
   protocol_test.py     assertions over the mock's recordings (config JSON, chunk timing, bytes, eof, close)
   asterisk/            config templates for the test Asterisk instance
@@ -51,11 +53,18 @@ The AMD_WS scenarios need the built v2 module (`app_amd_ws.c` using
   `/usr/lib64/asterisk/modules` (`AST_MODULES_DIR`) and its XML documentation
   in `/var/lib/asterisk/documentation` (`AST_DATA_DIR`; the core refuses to
   boot without `core-en_US.xml`).
-* python3 with `websockets` >= 10 (12.0 tested), `sox`/`soxi`, GNU make, gcc.
-* For the DB-enabled build: system MariaDB/MySQL client dev files, or the
-  root-less staged copy pointed to by `MYSQL_ROOT` (default: the scratch path
-  from the spec; pass `MYSQL_CFLAGS`/`MYSQL_LIBS` through `MAKE_ARGS` for
-  anything else).
+* python3 with `websockets` 10-12 (12.0 tested; the mock imports the legacy
+  API from `websockets.legacy.server`, so 13+ works while that module ships),
+  `sox`/`soxi`, GNU make, gcc.
+* For the DB-enabled build: system MariaDB/MySQL client dev files, or a
+  root-less staged copy pointed to by `MYSQL_ROOT` (a directory holding
+  `include/mariadb` and `lib/x86_64-linux-gnu`); put
+  `MYSQL_ROOT=/path` into the gitignored `test/local.env` so `test/run.sh`
+  finds it every time. Without either, `build_mysql` and the `db`-tagged
+  scenarios are SKIPped and a hint is printed (pass `MYSQL_CFLAGS`/`MYSQL_LIBS`
+  through `MAKE_ARGS` for anything else).
+* Slow box? `TEST_SLOW_FACTOR=2 test/run.sh` multiplies every upper timing
+  bound (max wall, `elapsed<=`, burst launch, suite budget); lower bounds stay.
 
 ## How a call is made
 
@@ -119,15 +128,19 @@ asserts on it (used by run.sh's `proto` assertions and usable by hand).
 ## Scenario table (`scenarios.txt`)
 
 One `|`-separated line per scenario; run.sh generates the dialplan from it.
-Columns: name, tags (`self` plumbing / `amd` needs module / `probe`), count
+Columns: name, tags (`self` plumbing / `amd` needs module / `db` needs the MySQL build / `probe`), count
 (simultaneous originates), farside behaviour, mock path, amdside spec
 (`ws:<timeout>,<playfile>,<opts>` -> `AMD_WS(127.0.0.1,${MOCK_PORT},${VID},...)`;
-`wsdead:` uses a port nothing listens on; `wsraw:` verbatim args; `app:` any
+`wsdead:` uses a port nothing listens on; `wstls:` the wss mock; `wshole:` the
+accept-and-never-reply listener; `wsraw:` verbatim args; `app:` any
 dialplan apps), post apps, expected AMDSTATUS/AMDCAUSE, min/max wall ms, and
 assertions (`proto`, `chunks=N`, `noconn`, `resp~TEXT`, `elapsed<=N`,
-`heard>THR`, `heard[start:len]<THR`, `heard_dur>S`, `mix>THR`, `log~REGEX`,
-`alive`). The header of the file documents every token. To add a case: add a
-line; no shell code needed.
+`heard>THR`, `heard[start:len]<THR`, `heard_dur>S`, `mix>THR`, `log~REGEX`
+anchored with `Local/%NUM%@farside-%NAME%-[0-9a-f]+;1`, `cli~REGEX` on
+`amd_ws show settings`, `mockvid=TEXT`, `alive`). Bursts get `log~`/`cli~`
+plus a one-connection-per-VID check against the mock records. The header of
+the file documents every token. To add a case: add a line; no shell code
+needed.
 
 ### What each scenario proves
 
@@ -159,6 +172,9 @@ AMD_WS (need the built module):
 | `nothuman` | MACHINE | `NOT_HUMAN` must not be read as HUMAN |
 | `server_down` | NOTSURE/NETERR fast | connect refused; no mock connection |
 | `slow_handshake` | NOTSURE/NETERR ~2 s | upgrade slower than connect_timeout_ms |
+| `opt_c_connto` | NOTSURE/NETERR ~300 ms | `c(300)` overrides the connect timeout per call |
+| `hangup_in_connect` | HANGUP/HANGUP ~1.5 s | callee hangs up while the handshake is pending: no grace, nothing sent, late socket discarded |
+| `expire_in_connect` | NOTSURE/NETERR at timeout_ms | the detection window ends before a slow handshake: NETERR, not a timeout cause |
 | `reject_upgrade` | NOTSURE/NETERR | HTTP 403 handshake |
 | `silent_server` | NOTSURE/AUDIO_TIMEOUT at timeout+grace | 3000 ms timeout + 1000 ms grace; audio kept flowing (>= 4 chunks), eof + close 1000 still sent |
 | `close_midstream` | NOTSURE/NETERR | server CLOSE before a result |
@@ -171,19 +187,26 @@ AMD_WS (need the built module):
 | `playback_list` | HUMAN | `a&b` plays sequentially |
 | `playdelay` | HUMAN | `d(1500)`: first 0.8 s heard is silent, audible later |
 | `no_playback_quiet` | HUMAN | nothing leaks to the callee without a playfile |
-| `opt_n_nodb`, `db_unreachable` | HUMAN | option `n` skips the DB; with db=yes and a refused 127.0.0.1 port the call still completes quickly |
+| `opt_n_nodb` | HUMAN | option `n` skips the DB (no phone in the config frame) |
+| `db_unreachable` (tag `db`) | HUMAN | with db=yes and a refused 127.0.0.1 port the call still completes quickly and the rate-limited `DB connect to 127.0.0.1:<port> failed` warning is in the log; SKIP without the MySQL build |
 | `opt_p_k` | HUMAN | `p()`/`k()` appear as `phone`/`country_code` in the config JSON |
 | `opt_a_unanswered` | NOTSURE/INTERR | option `A` on a not-Up channel refuses instead of answering |
-| `bad_port_default` | HUMAN | invalid port -> warning + conf default |
+| `bad_port_default` | HUMAN | invalid port -> warning + conf default (anchored to the call's channel) |
+| `bad_options` | HUMAN | unbalanced `k(1`: warning with digits masked (`np(XXXXXXXXXX`), the phone never appears through the module, all options ignored |
+| `vid_escape` | HUMAN | caller id name with `"`, `\` and a 0xFF byte round-trips through the config JSON (mock parses `<vid>"q"\z?`) |
 | `default_vid` | HUMAN | vid defaults to CALLERID(name) |
 | `tls_human` | HUMAN | option `s` -> `wss://` to a second mock instance with a self-signed certificate; `tls_verify=yes` with `tls_cafile=<that cert>` (chain verification on, hostname check off as on Asterisk 16). SKIP when `openssl` is missing |
 | `tls_to_plain` | NOTSURE/NETERR fast | option `s` against the plaintext mock port: the TLS handshake fails, no hang, no connection record |
-| `concurrent` | 25 x HUMAN | 25 simultaneous calls, all results, Asterisk alive |
-| `soak_fd_rss` | - | 100 warm-up + 200 measured calls (bursts of 25 through the `soak` probe row): the daemon's fd count must not grow, RSS must grow < `SOAK_RSS_LIMIT_KB` (1024). The test daemon runs with `MALLOC_ARENA_MAX=1` so RSS tracks live allocations instead of per-thread malloc arena high-water marks (measured here: default malloc +3 MB/200 calls and still creeping, one arena +136 kB and flat) |
-| `log_lines` | - | the SPEC section 6 start/end verbose lines exist |
+| `concurrent` | 25 x HUMAN | 25 simultaneous calls, all results, exactly one mock connection per VID, Asterisk alive |
+| `blackhole` | NOTSURE/NETERR at c(700) | peer accepts TCP and never answers: the call returns at the connect timeout, the helper stays parked, `parked connects : 1` |
+| `blackhole_fill` | 7 x NOTSURE/NETERR | a burst of 7 more is not refused (healthy bursts are never capped); afterwards 8 are parked = `max_pending_connects` (test conf) |
+| `blackhole_cap` | NOTSURE/NETERR ~0 ms | a call starting at the cap fails fast with the `8 connects to 127.0.0.1 still pending` warning |
+| `blackhole_release` | - | killing the peer releases the parked helpers: `parked connects` -> 0 within a second |
+| `soak_fd_rss` | - | 100 warm-up + 200 measured calls (bursts of 25 through the `soak` probe row, unique VIDs, 300 result lines asserted): the daemon's fd count must not grow, RSS must grow < `SOAK_RSS_LIMIT_KB` (1024). The test daemon runs with `MALLOC_ARENA_MAX=1` so RSS tracks live allocations instead of per-thread malloc arena high-water marks (measured here: default malloc +3 MB/200 calls and still creeping, one arena +136 kB and flat) |
+| `log_lines` | - | exactly one SPEC section 6 start and one end verbose line per AMD_WS channel; counts equal the number of AMD_WS calls made |
 | `log_noise` | - | every WARNING/ERROR line in the Asterisk log matches `LOG_NOISE_ALLOW` in run.sh (intentionally provoked: unload busy, bad port, option A, connect refused/timeout, HTTP 403, TLS to the plain port, dead DB); anything else fails, listed in `log-noise-unexpected.txt` |
-| `cli_show_application`, `cli_show_settings` | - | `core show application AMD_WS` and `amd_ws show settings` are useful |
-| `unload_busy_refused`, `unload_idle`, `load_again`, `module_reload` | - | unload refused while a call is inside AMD_WS, succeeds when idle, module works after reload |
+| `cli_show_application`, `cli_show_settings` | - | `core show application AMD_WS` is useful; `amd_ws show settings` reports the DB support the module was built with, `astguiclient.conf` read, `connects in flight`, `max_pending_connects` |
+| `unload_busy_refused`, `unload_idle`, `load_again`, `module_reload`, `reload_effect` | - | unload refused while a call is inside AMD_WS, succeeds when idle, module works after load; a changed amd_ws.conf (timeout_ms, send_schedule=500, result_grace_ms=0, extra_statuses=+GOOGLE_VOICE, db=no, max_pending_connects) is read back after `module reload` and a call classifies GOOGLE_VOICE on 500 ms chunks; the config is restored afterwards |
 | `build_nomysql`, `build_mysql` | - | `make MYSQL=0` and `make MYSQL=1 ...` both build; no undefined non-Asterisk symbols |
 
 ## Notes for the integrator
