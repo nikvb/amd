@@ -1,0 +1,716 @@
+#!/bin/bash
+# app_amd_ws installer - AMD via WebSocket for Asterisk (ViciDial dialers)
+#
+# @@GENERATED@@
+#
+# One-liner (as root):   curl -fsSL <url>/install.sh | bash
+# Usage:                 bash install.sh [options]      (bash install.sh --help)
+#
+# Self-contained: this file carries app_amd_ws.c, the Makefile, ast-detect.sh and
+# amd_ws.conf.sample.  It never adds package repositories and never upgrades Asterisk.
+# Everything it prints also goes to /var/log/app_amd_ws-install.log.
+#
+# Exit codes: 0 ok | 1 failure | 2 usage / not root | 3 installed but the OLD module is still
+# loaded (in use; activation pending) | 4 no matching Asterisk headers | 5 build/load failed |
+# 6 dependencies missing
+
+set -Eeuo pipefail
+# -E: the ERR trap (on_err, names the failing line and command) is inherited by functions; without
+# it an unexpected 'set -e' exit inside a function would print nothing but the exit code.
+# NOTE: never 'cmd | grep -q' in a condition here - with pipefail the writer's SIGPIPE makes the
+# pipeline fail although grep matched.  Use 'cmd | grep pattern >/dev/null' (reads all input).
+# Likewise never put a command whose non-zero status carries information (rpm -V, dpkg --verify)
+# in a pipeline: capture its output first ('out=$(cmd || true)'), then test it.
+
+AMD_WS_INSTALLER_VERSION='@@VERSION@@'
+AMD_WS_SOURCE_COMMIT='@@COMMIT@@'
+MODULE=app_amd_ws
+APP=AMD_WS
+
+# ----------------------------------------------------------------------------------------------
+# defaults / options
+# ----------------------------------------------------------------------------------------------
+OPT_UNINSTALL=0; OPT_DEPS_ONLY=0; OPT_BUILD_ONLY=0; OPT_NO_DB=0; OPT_NO_LOAD=0; OPT_DRY_RUN=0
+OPT_YES=0; OPT_ALLOW_CONFIGURE=0; OPT_REMOVE_BACKUPS=0; OPT_KEEP_BUILD=0
+OPT_HEADERS=''; OPT_ASTERISK_SRC=''; OPT_VERSION=''; OPT_TARBALL_FILE=''; OPT_OUTPUT=''
+OPT_WAIT=30
+BUNDLE_URL=${AMD_WS_BUNDLE_URL:-https://download.amdy.io/asterisk-headers}
+CACHE_DIR=${AMD_WS_CACHE_DIR:-/var/cache/app_amd_ws}
+LOG_FILE=${AMD_WS_LOG_FILE:-/var/log/app_amd_ws-install.log}
+ETC_DIR=${AMD_WS_ETCDIR:-/etc/asterisk}
+# https (or a local file:// mirror) only, never a downgrade redirect; retry transient errors
+CURL_OPTS=(-fsSL --connect-timeout 15 --max-time 900 --retry 3 --retry-delay 2 --proto '=https,file' --proto-redir '=https')
+BUILD_DIR=''
+HEADERS_HOW=''
+CACHE_DIR_TEMP=0        # 1 = CACHE_DIR is a mktemp directory of this run (non-root), removed on exit
+LAST_FETCH_VERIFIED=0   # fetch_verified: 1 when the download matched a published or pinned sha256
+
+# sha256 of source tarballs whose origin publishes no checksum (download.vicidial.com), pinned
+# here so that a mirror or redirect cannot hand us a different file.  Checked before the sidecar.
+declare -A KNOWN_SHA256=(
+    [asterisk-16.30.1-vici.tar.gz]=101c5a005bc20a193726610664af5883e7295fe0a9749ec7cafd37527aa910df
+    [asterisk-18.21.0-vici.tar.gz]=cadf952504cdf924cdbaa3c636cabb997b9a3a521b6d3459df35c39507103bdc
+    [asterisk-16.30.1.tar.gz]=8a91b0f8412d8e3dbd7172c118c52ba4ed4e016696f2778a466db094ec4b8b22
+)
+
+usage() {
+    cat <<EOF
+app_amd_ws installer $AMD_WS_INSTALLER_VERSION (module source commit $AMD_WS_SOURCE_COMMIT)
+
+Usage: bash install.sh [options]
+
+  (no option)         install dependencies, resolve Asterisk headers, build, install, load, verify
+  --uninstall         unload and remove the module (+ header cache); keeps amd_ws.conf and packages
+  --deps-only         only install the build dependencies
+  --build-only        only build; write the module to --output (default ./app_amd_ws.so); no root needed
+  --output FILE       with --build-only: where to write the built module
+  --no-db             build without the ViciDial phone/country lookup (no MySQL client needed)
+  --no-load           install the file but do not unload/load the module in the running Asterisk
+  --headers DIR       use this Asterisk include dir (must hold asterisk.h, asterisk/autoconfig.h, buildopts.h)
+  --asterisk-src DIR  use this configured+built Asterisk source tree (DIR/include)
+  --version VER       Asterisk version to build for when it cannot be detected (e.g. 16.30.1-vici)
+  --allow-configure   permit running ./configure in a downloaded source tree if no autoconfig.h is
+                      available (only for a tarball whose sha256 was verified or a --tarball-file)
+  --bundle-url URL    header bundle base URL (default: $BUNDLE_URL)
+  --tarball-file F    use this local Asterisk source tarball instead of downloading one
+  --wait N            seconds to wait for a busy module to become idle before giving up (default 30)
+  --remove-backups    with --uninstall: also delete app_amd_ws.so.bak.* files
+  --dry-run           detect and print the plan; change nothing (no root needed)
+  --keep-build        keep the temporary build directory
+  -y, --yes           no confirmation prompts
+  -h, --help          this text
+
+Environment overrides: ASTERISK ASTVERSION ASTBUILDSUM ASTINCDIR ASTTOPDIR ASTMODDIR AST_SRC_ROOTS
+AST_INC_ROOTS ASTNOCHECK=1 AMD_WS_BUNDLE_URL AMD_WS_CACHE_DIR AMD_WS_LOG_FILE AMD_WS_ETCDIR MYSQL_CFLAGS MYSQL_LIBS
+
+Exit codes: 0 ok, 1 failure, 2 usage/not root, 3 installed but old module still loaded (in use),
+4 no matching headers, 5 build or load failed, 6 dependencies missing
+EOF
+}
+
+# ----------------------------------------------------------------------------------------------
+# logging: console (info -> stdout, warn/error -> stderr) AND the log file.  Functions never
+# return values through stdout, so logging can never pollute a captured result.
+# ----------------------------------------------------------------------------------------------
+_ts() { date '+%Y-%m-%d %H:%M:%S'; }
+_logfile() { { printf '%s %s\n' "$(_ts)" "$*" >> "$LOG_FILE"; } 2>/dev/null || true; }
+log()  { printf '[amd_ws] %s\n' "$*"; _logfile "INFO  $*"; }
+warn() { printf '[amd_ws] WARNING: %s\n' "$*" >&2; _logfile "WARN  $*"; }
+err()  { printf '[amd_ws] ERROR: %s\n' "$*" >&2; _logfile "ERROR $*"; }
+die()  { local rc=$1; shift; err "$@"; exit "$rc"; }
+run_logged() {   # run a command, tee its output to the log; rc preserved (pipefail)
+    _logfile "RUN   $*"
+    "$@" 2>&1 | tee -a "$LOG_FILE"
+}
+
+init_log() {
+    if ! { : >> "$LOG_FILE"; } 2>/dev/null; then
+        # not writable (non-root run): a private temporary log, never a predictable /tmp name
+        LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/app_amd_ws-install.XXXXXX.log" 2>/dev/null) || LOG_FILE=/dev/null
+    fi
+    _logfile "===== install.sh $AMD_WS_INSTALLER_VERSION (commit $AMD_WS_SOURCE_COMMIT) args: $*"
+}
+
+# ----------------------------------------------------------------------------------------------
+# traps: the EXIT trap must never turn a successful run into rc 1 (if-form, explicit return 0)
+# ----------------------------------------------------------------------------------------------
+on_exit() {
+    local rc=$?
+    if [ -n "$BUILD_DIR" ] && [ -d "$BUILD_DIR" ]; then
+        if [ "$OPT_KEEP_BUILD" = 1 ]; then log "build directory kept: $BUILD_DIR"; else rm -rf "$BUILD_DIR"; fi
+    fi
+    if [ "$CACHE_DIR_TEMP" = 1 ] && [ -d "$CACHE_DIR" ]; then
+        if [ "$OPT_KEEP_BUILD" = 1 ]; then log "header cache kept: $CACHE_DIR"; else rm -rf "$CACHE_DIR"; fi
+    fi
+    _logfile "===== exit $rc"
+    return 0
+}
+on_err() { err "command failed at line $1 (exit $2): $3; see $LOG_FILE"; }
+
+# ==============================================================================================
+# embedded ast-detect.sh (identical to the repository file; also written into the build dir)
+# ==============================================================================================
+@@INLINE ast-detect.sh@@
+# ==============================================================================================
+# end of embedded ast-detect.sh
+# ==============================================================================================
+# route the library's diagnostics into the log file as well
+ad_log()  { printf '[ast-detect] %s\n' "$*" >&2; _logfile "DETECT $*"; }
+ad_warn() { printf '[ast-detect] WARNING: %s\n' "$*" >&2; _logfile "DETECT WARNING: $*"; }
+ad_err()  { printf '[ast-detect] ERROR: %s\n' "$*" >&2; _logfile "DETECT ERROR: $*"; }
+
+# ----------------------------------------------------------------------------------------------
+# distro / package manager
+# ----------------------------------------------------------------------------------------------
+PKG=''; DISTRO=''
+detect_distro() {
+    local id='' like=''
+    if [ -r /etc/os-release ]; then
+        id=$(sed -n 's/^ID="\{0,1\}\([^"]*\)"\{0,1\}/\1/p' /etc/os-release | head -n1)
+        like=$(sed -n 's/^ID_LIKE="\{0,1\}\([^"]*\)"\{0,1\}/\1/p' /etc/os-release | head -n1)
+        DISTRO=$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}/\1/p' /etc/os-release | head -n1)
+    fi
+    [ -n "$DISTRO" ] || DISTRO=$(uname -sr)
+    if command -v zypper >/dev/null 2>&1 && case " $id $like " in *suse*|*sles*) true;; *) false;; esac; then PKG=zypper
+    elif command -v dnf >/dev/null 2>&1; then PKG=dnf
+    elif command -v yum >/dev/null 2>&1; then PKG=yum
+    elif command -v apt-get >/dev/null 2>&1; then PKG=apt
+    elif command -v zypper >/dev/null 2>&1; then PKG=zypper
+    else PKG=none; fi
+}
+
+# tools the build needs -> the package that provides them, per package manager
+need_pkgs() {          # sets NEED_PKGS (array) from missing commands
+    NEED_PKGS=()
+    local c p
+    for c in gcc make pkg-config strings tar curl; do
+        command -v "$c" >/dev/null 2>&1 && continue
+        case $c in
+            gcc) p='gcc';; make) p='make';; tar) p='tar';; curl) p='curl';; strings) p='binutils';;
+            pkg-config) case $PKG in dnf|yum) p='pkgconfig';; *) p='pkg-config';; esac;;
+        esac
+        NEED_PKGS+=("$p")
+    done
+}
+
+have_mysql_dev() {
+    [ -n "${MYSQL_CFLAGS:-}${MYSQL_LIBS:-}" ] && return 0
+    local p
+    for p in libmariadb mariadb mysqlclient; do pkg-config --exists "$p" 2>/dev/null && return 0; done
+    mariadb_config --cflags >/dev/null 2>&1 && return 0
+    mysql_config --cflags >/dev/null 2>&1 && return 0
+    return 1
+}
+
+mysql_dev_candidates() {   # sets MYSQL_DEV_PKGS (array), most likely first
+    case $PKG in
+        zypper) MYSQL_DEV_PKGS=(libmariadb-devel mariadb-devel libmysqlclient-devel);;
+        dnf|yum) MYSQL_DEV_PKGS=(mariadb-connector-c-devel mariadb-devel mysql-devel);;
+        apt) MYSQL_DEV_PKGS=(libmariadb-dev default-libmysqlclient-dev libmysqlclient-dev libmariadbclient-dev);;
+        *) MYSQL_DEV_PKGS=();;
+    esac
+}
+
+pkg_install() {   # install the given packages; never touches repositories; rc from the manager
+    [ $# -gt 0 ] || return 0
+    log "installing packages: $*"
+    case $PKG in
+        zypper) run_logged zypper --non-interactive install --no-recommends "$@";;
+        dnf)    run_logged dnf -y install "$@";;
+        yum)    run_logged yum -y install "$@";;
+        apt)    export DEBIAN_FRONTEND=noninteractive
+                # no package index at all (fresh install, 'apt-get clean', container): fetch one first;
+                # 'lists/partial' and 'lock' always exist, so test for actual *_Packages index files
+                if ! ls /var/lib/apt/lists/*_Packages* >/dev/null 2>&1; then
+                    run_logged apt-get update -qq || warn "apt-get update failed - trying to install from the existing package lists"
+                fi
+                run_logged apt-get install -y --no-install-recommends "$@";;
+        *)      err "no supported package manager (zypper/dnf/yum/apt-get); install by hand: $*"; return 1;;
+    esac
+}
+
+install_deps() {
+    need_pkgs
+    local rc=0
+    if [ ${#NEED_PKGS[@]} -gt 0 ]; then
+        pkg_install "${NEED_PKGS[@]}" || rc=1
+        need_pkgs
+        [ ${#NEED_PKGS[@]} -eq 0 ] || { err "still missing after install: ${NEED_PKGS[*]}"; rc=1; }
+    else
+        log "build tools present (gcc make pkg-config strings tar curl)"
+    fi
+    if [ "$OPT_NO_DB" = 1 ]; then
+        log "--no-db: MySQL/MariaDB client development files not needed"
+    elif have_mysql_dev; then
+        log "MySQL/MariaDB client development files present"
+    else
+        mysql_dev_candidates
+        local p ok=0
+        for p in ${MYSQL_DEV_PKGS[@]+"${MYSQL_DEV_PKGS[@]}"}; do   # (empty-array safe on bash 4.2)
+            if pkg_install "$p" && have_mysql_dev; then ok=1; break; fi
+        done
+        if [ $ok = 0 ]; then
+            warn "no MySQL/MariaDB client development package could be installed (tried: ${MYSQL_DEV_PKGS[*]:-none}) - building WITHOUT the vicidial_auto_calls phone/country lookup (use --no-db to silence this)"
+            OPT_NO_DB=1
+        fi
+    fi
+    return $rc
+}
+
+# ----------------------------------------------------------------------------------------------
+# header resolution.  Order: (1) local trees / installed headers validated by ast-detect;
+# (2) the distro's -devel package, only when the RUNNING binary is that distro package and is
+# unmodified, pinned to the exact installed version; (3) header bundle from BUNDLE_URL;
+# (4) headers-only extraction of the upstream / ViciDial source tarball + synthesised buildopts.h.
+# Result: ASTINCDIR (validated) and HEADERS_HOW.  rc 1 when everything failed.
+# ----------------------------------------------------------------------------------------------
+resolve_headers() {
+    ASTINCDIR=${ASTINCDIR:-$OPT_HEADERS}
+    [ -n "${ASTTOPDIR:-}" ] || ASTTOPDIR=$OPT_ASTERISK_SRC
+    if ast_find_incdir; then HEADERS_HOW="local: $ASTINCDIR ($ASTINCDIR_SRC)"; return 0; fi
+    [ -z "${ASTINCDIR:-}${ASTTOPDIR:-}" ] || return 1     # an explicit --headers/--asterisk-src that fails is final
+    [ -n "${ASTVERSION:-}" ] || { err "cannot fetch headers without knowing the Asterisk version - pass --version <ver> (e.g. 16.30.1-vici) or --asterisk-src DIR"; return 1; }
+    if [ "$OPT_DRY_RUN" = 1 ]; then
+        HEADERS_HOW="none locally; would try: distro devel package (if Asterisk is the distro package), $(bundle_urls | tr '\n' ' '), then $(tarball_urls | tr '\n' ' ')"
+        return 0
+    fi
+    if try_devel_package; then ASTINCDIR=''; if ast_find_incdir; then HEADERS_HOW="distro devel package: $ASTINCDIR"; return 0; fi; fi
+    if fetch_header_bundle; then HEADERS_HOW="header bundle: $ASTINCDIR"; return 0; fi
+    if fetch_tarball_headers; then HEADERS_HOW="source tarball headers + synthesised buildopts.h: $ASTINCDIR"; return 0; fi
+    return 1
+}
+
+# (2) -devel package pinned to the running binary's package version
+try_devel_package() {
+    local bin=${ASTERISK:-} pkg='' evr='' ver=''
+    [ -n "$bin" ] && [ -e "$bin" ] || return 1
+    local verify
+    if command -v rpm >/dev/null 2>&1 && pkg=$(rpm -qf "$bin" 2>/dev/null) && [ -n "$pkg" ] && [ "${pkg#file }" = "$pkg" ]; then
+        # rpm -V exits 1 whenever ANY file of the package differs, so it must not sit in a pipeline
+        # under pipefail (the pipeline would be false exactly when grep matched): capture, then test
+        verify=$(rpm -Vf "$bin" 2>/dev/null || true)
+        if printf '%s\n' "$verify" | grep " $bin\$" >/dev/null; then
+            log "$bin is owned by $pkg but was modified (source build over the package) - not using the distro devel package"; return 1
+        fi
+        evr=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$pkg")
+        log "Asterisk is the distro package $pkg - installing asterisk-devel-$evr (exact same version, never an upgrade)"
+        case $PKG in
+            zypper) run_logged zypper --non-interactive install --no-recommends --oldpackage "asterisk-devel-$evr" || return 1;;
+            dnf)    run_logged dnf -y install "asterisk-devel-$evr" || return 1;;
+            yum)    run_logged yum -y install "asterisk-devel-$evr" || return 1;;
+            *)      return 1;;
+        esac
+        return 0
+    fi
+    if command -v dpkg-query >/dev/null 2>&1 && pkg=$(dpkg -S "$bin" 2>/dev/null | sed 's/:.*//;q') && [ -n "$pkg" ]; then
+        verify=$(dpkg --verify "$pkg" 2>/dev/null || true)
+        if printf '%s\n' "$verify" | grep " $bin\$" >/dev/null; then
+            log "$bin belongs to $pkg but was modified (source build over the package) - not using asterisk-dev"; return 1
+        fi
+        ver=$(dpkg-query -W -f '${Version}' "$pkg" 2>/dev/null)
+        log "Asterisk is the distro package $pkg $ver - installing asterisk-dev=$ver"
+        export DEBIAN_FRONTEND=noninteractive
+        run_logged apt-get install -y --no-install-recommends "asterisk-dev=$ver" || return 1
+        return 0
+    fi
+    log "Asterisk binary is not owned by a distro package - skipping the devel-package route"
+    return 1
+}
+
+# pure helpers (stdout = data, no logging): candidate URLs for the running version.
+# Bundle and cache names never contain a slash: 'certified/18.9-cert1' -> 'certified-18.9-cert1'
+# (the name tools/make-header-bundle.sh produces); the .version INSIDE a tree keeps the real string.
+bundle_name_version() { printf '%s\n' "${ASTVERSION/certified\//certified-}"; }
+bundle_urls() {
+    local v bv
+    bv=$(bundle_name_version)
+    printf '%s/asterisk-%s-headers.tar.gz\n' "$BUNDLE_URL" "$bv"
+    v=${ASTVERSION#certified/}
+    [ -n "${ASTVERBASE:-}" ] && [ "$ASTVERBASE" != "$v" ] && printf '%s/asterisk-%s-headers.tar.gz\n' "$BUNDLE_URL" "$ASTVERBASE"
+    return 0
+}
+tarball_urls() {
+    local v=$ASTVERSION base=${ASTVERBASE:-}
+    case $v in
+        *-vici)      printf 'https://download.vicidial.com/required-apps/asterisk-%s.tar.gz\n' "$v";;
+        certified/*) printf 'https://downloads.asterisk.org/pub/telephony/certified-asterisk/releases/asterisk-certified-%s.tar.gz\n' "${v#certified/}"
+                     printf 'https://downloads.asterisk.org/pub/telephony/certified-asterisk/old-releases/asterisk-certified-%s.tar.gz\n' "${v#certified/}"; return 0;;
+    esac
+    [ -n "$base" ] || return 0
+    printf 'https://downloads.asterisk.org/pub/telephony/asterisk/releases/asterisk-%s.tar.gz\n' "$base"
+    printf 'https://downloads.asterisk.org/pub/telephony/asterisk/old-releases/asterisk-%s.tar.gz\n' "$base"
+}
+
+# download $1 to $2; verify against the pinned KNOWN_SHA256 entry for its file name, else against the
+# sidecar checksum $3 (URL, optional, may 404) when present.  LAST_FETCH_VERIFIED says which happened.
+fetch_verified() {
+    local url=$1 out=$2 sumurl=${3:-} want='' have how=''
+    LAST_FETCH_VERIFIED=0
+    log "downloading $url"
+    curl "${CURL_OPTS[@]}" -o "$out" "$url" || { rm -f "$out"; return 1; }
+    if [ -n "${KNOWN_SHA256[${url##*/}]:-}" ]; then
+        want=${KNOWN_SHA256[${url##*/}]}; how="pinned in this installer"
+    elif [ -n "$sumurl" ]; then
+        if want=$(curl "${CURL_OPTS[@]}" "$sumurl" 2>/dev/null | awk 'NF{print $1; exit}') && [ -n "$want" ]; then
+            how="published at $sumurl"
+        else
+            want=''
+        fi
+    fi
+    if [ -n "$want" ]; then
+        have=$(sha256sum "$out" | cut -c1-64)
+        [ "$have" = "$want" ] || { err "sha256 mismatch for $url (got $have, expected $want, $how)"; rm -f "$out"; return 1; }
+        log "sha256 verified ($want, $how)"
+        LAST_FETCH_VERIFIED=1
+    else
+        log "no checksum published for $url and none pinned - continuing unverified"
+    fi
+    return 0
+}
+
+# (3) header bundle: asterisk-<ver>-headers.tar.gz (+ .sha256) -> CACHE_DIR/asterisk-<ver>/include
+fetch_header_bundle() {
+    local url tmp dir name
+    tmp=$(mktemp) || return 1
+    while read -r url; do
+        [ -n "$url" ] || continue
+        fetch_verified "$url" "$tmp" "$url.sha256" || { log "no header bundle at $url"; continue; }
+        name=${url##*/}; name=${name%-headers.tar.gz}
+        dir="$CACHE_DIR/$name"
+        rm -rf "$dir"; mkdir -p "$dir"
+        if ! tar xzf "$tmp" -C "$dir" --strip-components=1; then err "cannot extract $url"; rm -rf "$dir"; continue; fi
+        rm -f "$tmp"
+        [ -f "$dir/include/asterisk.h" ] || { err "bundle $url has no include/asterisk.h"; rm -rf "$dir"; continue; }
+        rm -f "$dir/include/asterisk/buildopts.h"
+        ast_synth_buildopts "$dir/include" "${ASTBUILDSUM:-}" || { rm -rf "$dir"; return 1; }
+        ASTINCDIR="$dir/include"
+        if ast_check_incdir "$ASTINCDIR"; then return 0; fi
+        ASTINCDIR=''; rm -rf "$dir"
+    done < <(bundle_urls)
+    rm -f "$tmp"
+    return 1
+}
+
+# (4) source tarball, headers only: */include/asterisk.h, */include/asterisk/*.h, */.version
+fetch_tarball_headers() {
+    local tmp='' url got=0 dir ac trusted=0
+    dir="$CACHE_DIR/asterisk-$(bundle_name_version)"
+    if [ -n "$OPT_TARBALL_FILE" ]; then
+        [ -f "$OPT_TARBALL_FILE" ] || { err "--tarball-file $OPT_TARBALL_FILE: no such file"; return 1; }
+        tmp=$OPT_TARBALL_FILE; got=1; trusted=1; log "using local tarball $tmp (supplied by you, taken as trusted)"
+    else
+        tmp=$(mktemp) || return 1
+        while read -r url; do
+            [ -n "$url" ] || continue
+            case $url in *downloads.asterisk.org*) fetch_verified "$url" "$tmp" "${url%.tar.gz}.sha256" && { got=1; break; };;
+                          *) fetch_verified "$url" "$tmp" '' && { got=1; break; };;
+            esac
+            log "not available: $url"
+        done < <(tarball_urls)
+        [ $got = 1 ] || { rm -f "$tmp"; err "no source tarball found for Asterisk $ASTVERSION (tried: $(tarball_urls | tr '\n' ' '))"; return 1; }
+        trusted=$LAST_FETCH_VERIFIED
+    fi
+    rm -rf "$dir"; mkdir -p "$dir"
+    log "extracting headers only (include/ and .version) into $dir"
+    if ! tar xzf "$tmp" -C "$dir" --strip-components=1 --wildcards '*/include/asterisk.h' '*/include/asterisk/*.h' '*/.version' 2>>"$LOG_FILE"; then
+        [ -f "$dir/include/asterisk.h" ] || { err "tar could not extract include/ from the tarball"; rm -rf "$dir"; [ -n "$OPT_TARBALL_FILE" ] || rm -f "$tmp"; return 1; }
+    fi
+    rm -f "$dir/include/asterisk/buildopts.h" "$dir/include/asterisk/build.h"
+    [ -f "$dir/.version" ] || printf '%s\n' "$ASTVERSION" > "$dir/.version"
+    # autoconfig.h: the tarball's own (built-tree tarball) > a cached bundle of the same major > ./configure
+    if [ -f "$dir/include/asterisk/autoconfig.h" ]; then
+        log "using the autoconfig.h shipped inside the tarball"
+    elif ac=$(ls "$CACHE_DIR"/asterisk-"${ASTMAJOR:-x}".*/include/asterisk/autoconfig.h 2>/dev/null | head -n1) && [ -n "$ac" ]; then
+        log "using autoconfig.h from the cached header bundle $ac (same major version, same platform)"
+        cp -p "$ac" "$dir/include/asterisk/autoconfig.h"
+    elif [ "$OPT_ALLOW_CONFIGURE" = 1 ] && [ "$trusted" = 1 ]; then
+        run_configure "$tmp" "$dir" || { rm -rf "$dir"; [ -n "$OPT_TARBALL_FILE" ] || rm -f "$tmp"; return 1; }
+    elif [ "$OPT_ALLOW_CONFIGURE" = 1 ]; then
+        # ./configure executes code from the tarball as root: never from an unverified download
+        err "--allow-configure refused: the tarball's sha256 could neither be verified against a published checksum nor against one pinned in this installer"
+        err "download it yourself, verify it out of band, then re-run with --tarball-file /path/asterisk-$ASTVERSION.tar.gz --allow-configure"
+        rm -rf "$dir"; rm -f "$tmp"; return 1
+    else
+        err "the tarball carries no include/asterisk/autoconfig.h (it is generated by ./configure) and no header bundle for Asterisk ${ASTMAJOR:-?}.x is cached"
+        err "options: re-run with --allow-configure (runs ./configure in $CACHE_DIR/src; needs gcc-c++, libedit/ncurses, libuuid, jansson >= 2.11, libxml2, sqlite3 -devel packages),"
+        err "         or configure the tree yourself and pass --asterisk-src DIR, or pass --headers DIR"
+        rm -rf "$dir"; [ -n "$OPT_TARBALL_FILE" ] || rm -f "$tmp"; return 1
+    fi
+    [ -n "$OPT_TARBALL_FILE" ] || rm -f "$tmp"
+    ast_synth_buildopts "$dir/include" "${ASTBUILDSUM:-}" || { rm -rf "$dir"; return 1; }
+    ASTINCDIR="$dir/include"
+    ast_check_incdir "$ASTINCDIR" && return 0
+    ASTINCDIR=''; return 1
+}
+
+run_configure() {   # $1 = tarball, $2 = header dir to receive autoconfig.h
+    local tb=$1 dir=$2 src
+    src="$CACHE_DIR/src-$(bundle_name_version)"
+    rm -rf "$src"; mkdir -p "$src"
+    log "--allow-configure: extracting the full source into $src and running ./configure (this takes a minute)"
+    tar xzf "$tb" -C "$src" --strip-components=1 || { err "full extraction failed"; return 1; }
+    if ! ( cd "$src" && ./configure --quiet >"$src/configure.log" 2>&1 ); then
+        err "./configure failed - last lines of $src/configure.log:"; tail -n 15 "$src/configure.log" >&2
+        err "install the missing -devel packages named there and re-run, or pass --headers/--asterisk-src"
+        return 1
+    fi
+    cp -p "$src/include/asterisk/autoconfig.h" "$dir/include/asterisk/autoconfig.h" || return 1
+    log "autoconfig.h generated by ./configure"
+}
+
+# ----------------------------------------------------------------------------------------------
+# build in a temporary directory with the embedded sources; the Makefile runs the gates
+# ----------------------------------------------------------------------------------------------
+write_sources() {
+    local d=$1
+    cat > "$d/app_amd_ws.c" <<'__APP_AMD_WS_EMBED_EOF__'
+@@EMBED app_amd_ws.c@@
+__APP_AMD_WS_EMBED_EOF__
+    cat > "$d/Makefile" <<'__APP_AMD_WS_EMBED_EOF__'
+@@EMBED Makefile@@
+__APP_AMD_WS_EMBED_EOF__
+    cat > "$d/ast-detect.sh" <<'__APP_AMD_WS_EMBED_EOF__'
+@@EMBED ast-detect.sh@@
+__APP_AMD_WS_EMBED_EOF__
+    cat > "$d/amd_ws.conf.sample" <<'__APP_AMD_WS_EMBED_EOF__'
+@@EMBED amd_ws.conf.sample@@
+__APP_AMD_WS_EMBED_EOF__
+    chmod 755 "$d/ast-detect.sh"
+}
+
+is_placeholder() { grep -q '@@PLACEHOLDER' "$1" 2>/dev/null; }
+
+build_module() {
+    BUILD_DIR=$(mktemp -d "${TMPDIR:-/tmp}/app_amd_ws-build.XXXXXX")
+    write_sources "$BUILD_DIR"
+    if is_placeholder "$BUILD_DIR/app_amd_ws.c"; then
+        die 5 "this installer was generated without app_amd_ws.c (development build) - use a release installer or run 'make installer' in a checkout that has the module source"
+    fi
+    local -a mk=(ASTERISK="${ASTERISK:-}" ASTVERSION="${ASTVERSION:-}" ASTBUILDSUM="${ASTBUILDSUM:-}"
+                 ASTINCDIR="$ASTINCDIR" ASTMODDIR="${ASTMODDIR:-}" ASTNOCHECK="${ASTNOCHECK:-0}")
+    if [ "$OPT_NO_DB" = 1 ]; then mk+=(MYSQL=0); else mk+=(MYSQL=auto); fi
+    [ -z "${MYSQL_CFLAGS:-}" ] || mk+=(MYSQL_CFLAGS="$MYSQL_CFLAGS")
+    [ -z "${MYSQL_LIBS:-}" ]   || mk+=(MYSQL_LIBS="$MYSQL_LIBS")
+    log "building in $BUILD_DIR (headers: $ASTINCDIR)"
+    run_logged make -C "$BUILD_DIR" "${mk[@]}" || die 5 "build failed - see $LOG_FILE"
+    [ -f "$BUILD_DIR/$MODULE.so" ] || die 5 "build produced no $MODULE.so"
+    log "built $BUILD_DIR/$MODULE.so ($(stat -c %s "$BUILD_DIR/$MODULE.so") bytes, AST_BUILDOPT_SUM $(strings -a "$BUILD_DIR/$MODULE.so" | grep -xE '[0-9a-f]{32}' | head -n1))"
+}
+
+# ----------------------------------------------------------------------------------------------
+# module state in the running Asterisk ('asterisk -rx' always exits 0: parse the replies)
+# ----------------------------------------------------------------------------------------------
+# shellcheck disable=SC2086
+ast_rx() { ad_run "$ASTERISK" ${ASTERISK_OPTS:-} -rx "$1" || true; }
+module_row() { ast_rx "module show like $MODULE" | awk -v m="$MODULE.so" '$1==m'; }
+module_loaded()  { [ -n "$(module_row)" ]; }
+module_running() { case "$(module_row)" in *"Not Running"*) return 1;; *Running*) return 0;; *) return 1;; esac; }
+module_usecount() { module_row | awk '{ if ($0 ~ /Not Running/) print $(NF-3); else print $(NF-2) }'; }
+app_registered() { ast_rx "core show application $APP" | grep "Info about application '$APP'" >/dev/null; }
+
+soft_unload() {   # rc 0 unloaded (or not loaded), rc 3 still in use after --wait seconds
+    module_loaded || { log "$MODULE.so is not loaded in the running Asterisk"; return 0; }
+    local waited=0 out
+    while :; do
+        out=$(ast_rx "module unload $MODULE.so")
+        case $out in "Unloaded "*) log "unloaded old $MODULE.so"; return 0;; esac
+        module_loaded || return 0
+        if [ "$waited" -ge "$OPT_WAIT" ]; then
+            warn "$MODULE.so is still in use after ${waited}s (use count $(module_usecount)); calls are NEVER hung up by this installer"
+            return 3
+        fi
+        [ "$waited" = 0 ] && log "module in use by active calls (use count $(module_usecount)) - waiting up to ${OPT_WAIT}s for it to become idle"
+        sleep 2; waited=$((waited+2))
+    done
+}
+
+load_and_verify() {   # rc 0 loaded and AMD_WS registered
+    local out
+    out=$(ast_rx "module load $MODULE.so")
+    case $out in "Loaded "*) ;; *) err "module load replied: ${out:-<nothing>}"; return 1;; esac
+    module_running || { err "$MODULE.so is not Running after load"; return 1; }
+    app_registered || { err "application $APP is not registered although the module loaded"; return 1; }
+    return 0
+}
+
+old_code_resident() {   # the previous (deleted) file still mapped by the daemon?
+    local pid; pid=$(ast_daemon_pid) || return 1
+    grep -q "$MODULE\.so (deleted)" "/proc/$pid/maps" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------------------------
+# install / uninstall
+# ----------------------------------------------------------------------------------------------
+install_module() {
+    local dest="$ASTMODDIR/$MODULE.so" bak='' running=0 rc=0
+    [ -n "${ASTMODDIR:-}" ] && [ -d "$ASTMODDIR" ] || die 1 "Asterisk module directory unknown - pass ASTMODDIR=/path in the environment"
+    ast_running && running=1
+    if [ -f "$dest" ]; then
+        bak="$dest.bak.$(date +%Y%m%d%H%M%S)"; cp -p "$dest" "$bak"; log "backed up the previous module to $bak"
+    fi
+    install -m 755 "$BUILD_DIR/$MODULE.so" "$ASTMODDIR/.$MODULE.so.new"
+    mv -f "$ASTMODDIR/.$MODULE.so.new" "$dest"
+    log "installed $dest"
+    if [ -f "$BUILD_DIR/amd_ws.conf.sample" ] && ! is_placeholder "$BUILD_DIR/amd_ws.conf.sample" && [ -d "$ETC_DIR" ]; then
+        if install -m 644 "$BUILD_DIR/amd_ws.conf.sample" "$ETC_DIR/amd_ws.conf.sample" 2>/dev/null; then
+            log "installed $ETC_DIR/amd_ws.conf.sample (copy to amd_ws.conf to change defaults; an existing amd_ws.conf is never touched)"
+        else warn "could not write $ETC_DIR/amd_ws.conf.sample (permissions) - the sample is also in the repository"; fi
+    fi
+    if [ "$OPT_NO_LOAD" = 1 ]; then log "--no-load: not touching the running Asterisk; run: asterisk -rx 'module load $MODULE.so'"; return 0; fi
+    if [ $running = 0 ]; then log "Asterisk is not running - the module will be loaded at the next start (autoload) or with: asterisk -rx 'module load $MODULE.so'"; return 0; fi
+    soft_unload || rc=$?
+    if [ $rc = 3 ]; then
+        err "the new $dest is installed but the OLD module is still loaded and serving calls."
+        err "Activate it when the dialer is idle with:"
+        err "    asterisk${ASTERISK_OPTS:+ $ASTERISK_OPTS} -rx 'module unload $MODULE.so' && asterisk${ASTERISK_OPTS:+ $ASTERISK_OPTS} -rx 'module load $MODULE.so'"
+        err "or at the next Asterisk restart. Nothing else is required."
+        return 3
+    fi
+    if ! load_and_verify; then
+        if [ -n "$bak" ]; then
+            warn "restoring the previous module from $bak"
+            cp -p "$bak" "$dest"; ast_rx "module load $MODULE.so" >/dev/null
+            module_running && warn "previous module restored and running"
+        fi
+        die 5 "new module failed to load - see 'asterisk -rx \"core show settings\"' / /var/log/asterisk/messages and $LOG_FILE"
+    fi
+    if old_code_resident; then warn "the daemon still maps a deleted $MODULE.so - the old code may still be resident; a restart will clear it"; fi
+    log "module loaded: $(module_row | sed 's/  */ /g')"
+    log "application $APP registered: $(ast_rx "core show application $APP" | sed -n "s/.*-= Info about application '$APP' =-.*/ok/p" | head -n1)"
+    log "module version (amd_ws show settings): $(ast_rx 'amd_ws show settings' | sed -n 's/^AMD_WS \([0-9][0-9.]*\).*/\1/p' | head -n1)"
+}
+
+uninstall_module() {
+    local d rc=0
+    ast_detect_core
+    if ast_running; then
+        soft_unload || rc=$?
+        [ $rc = 0 ] || warn "module still in use - removing the file anyway; it stays resident until Asterisk restarts"
+    fi
+    for d in ${ASTMODDIR:-} $AST_MODDIR_CANDS; do
+        [ -f "$d/$MODULE.so" ] || continue
+        rm -f "$d/$MODULE.so"; log "removed $d/$MODULE.so"
+        if [ "$OPT_REMOVE_BACKUPS" = 1 ]; then rm -f "$d/$MODULE.so".bak.*; log "removed backups in $d"; else ls "$d/$MODULE.so".bak.* >/dev/null 2>&1 && log "backups kept: $d/$MODULE.so.bak.* (--remove-backups deletes them)"; fi
+    done
+    if [ -d "$CACHE_DIR" ]; then rm -rf "$CACHE_DIR"; log "removed header cache $CACHE_DIR"; fi
+    log "kept: $ETC_DIR/amd_ws.conf*, installed packages, $LOG_FILE"
+    return $rc
+}
+
+# ----------------------------------------------------------------------------------------------
+# plan / dry run
+# ----------------------------------------------------------------------------------------------
+print_plan() {
+    need_pkgs
+    local deps="${NEED_PKGS[*]:-none}" db
+    if [ "$OPT_NO_DB" = 1 ]; then db="disabled (--no-db)"; elif have_mysql_dev; then db="client dev files present"; else mysql_dev_candidates; db="would install one of: ${MYSQL_DEV_PKGS[*]:-none}"; fi
+    cat <<EOF
+
+app_amd_ws installer $AMD_WS_INSTALLER_VERSION - plan for this box
+  distro / pkg manager : $DISTRO / $PKG
+  build tools to add   : $deps
+  MySQL client (DB)    : $db
+  asterisk binary      : ${ASTERISK:-none} (${ASTERISK_SRC:-?}); daemon $(ast_running && echo running || echo "not running")
+  asterisk version     : ${ASTVERSION:-unknown} (${ASTVERSION_SRC:-?})
+  AST_BUILDOPT_SUM     : ${ASTBUILDSUM:-unknown} (${ASTBUILDSUM_SRC:-?})
+  module directory     : ${ASTMODDIR:-unknown} (${ASTMODDIR_SRC:-?})
+  headers              : ${HEADERS_HOW:-NONE FOUND}
+  would install        : ${ASTMODDIR:-?}/$MODULE.so (backup of any existing file as .bak.<timestamp>), $ETC_DIR/amd_ws.conf.sample
+  then                 : module unload (wait up to ${OPT_WAIT}s if busy, never hang up calls), module load, verify '$APP' registered
+  log file             : $LOG_FILE
+EOF
+}
+
+print_dialplan() {
+    cat <<EOF
+
+Dialplan example (extensions.conf), see README for all options:
+    exten => 8370,1,AMD_WS(api.amdy.io,2700,\${CALLERID(name)},10000)
+     same => n,GotoIf(\$["\${AMDCAUSE}"="NETERR" | "\${AMDCAUSE}"="INTERR"]?amd_fallback)
+     same => n,GotoIf(\$["\${AMDSTATUS}"="HUMAN"]?human)
+     ...
+Settings: /etc/asterisk/amd_ws.conf (see amd_ws.conf.sample).  CLI: asterisk -rx 'amd_ws show settings'
+EOF
+}
+
+# ----------------------------------------------------------------------------------------------
+# main
+# ----------------------------------------------------------------------------------------------
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --uninstall) OPT_UNINSTALL=1;;
+            --deps-only) OPT_DEPS_ONLY=1;;
+            --build-only) OPT_BUILD_ONLY=1;;
+            --no-db) OPT_NO_DB=1;;
+            --no-load) OPT_NO_LOAD=1;;
+            --headers) OPT_HEADERS=${2:?--headers needs a directory}; shift;;
+            --asterisk-src) OPT_ASTERISK_SRC=${2:?--asterisk-src needs a directory}; shift;;
+            --version) OPT_VERSION=${2:?--version needs a value}; shift;;
+            --allow-configure) OPT_ALLOW_CONFIGURE=1;;
+            --bundle-url) BUNDLE_URL=${2:?--bundle-url needs a URL}; shift;;
+            --tarball-file) OPT_TARBALL_FILE=${2:?--tarball-file needs a file}; shift;;
+            --wait) OPT_WAIT=${2:?--wait needs seconds}; shift;;
+            --remove-backups) OPT_REMOVE_BACKUPS=1;;
+            --dry-run) OPT_DRY_RUN=1;;
+            --keep-build) OPT_KEEP_BUILD=1;;
+            --output) OPT_OUTPUT=${2:?--output needs a path}; shift;;
+            -y|--yes) OPT_YES=1;;
+            -h|--help) usage; exit 0;;
+            *) usage >&2; die 2 "unknown option: $1";;
+        esac
+        shift
+    done
+    case $OPT_WAIT in ''|*[!0-9]*) die 2 "--wait needs a whole number of seconds";; esac
+    [ -z "$OPT_VERSION" ] || ASTVERSION=$OPT_VERSION
+}
+
+main() {
+    parse_args "$@"
+    init_log "$@"
+    trap on_exit EXIT
+    trap 'on_err "$LINENO" "$?" "$BASH_COMMAND"' ERR
+    detect_distro
+    log "app_amd_ws installer $AMD_WS_INSTALLER_VERSION (module commit $AMD_WS_SOURCE_COMMIT) on $DISTRO"
+    [ "$LOG_FILE" = "${AMD_WS_LOG_FILE:-/var/log/app_amd_ws-install.log}" ] || log "log file: $LOG_FILE"
+
+    if [ "$(id -u)" != 0 ] && [ "$OPT_DRY_RUN" = 0 ] && [ "$OPT_BUILD_ONLY" = 0 ]; then
+        die 2 "run as root (sudo) - only --dry-run and --build-only work without root"
+    fi
+    if [ "$(id -u)" != 0 ]; then
+        # non-root: a private, unpredictable cache directory (never a fixed /tmp path another user
+        # could pre-create), removed on exit unless --keep-build
+        case $CACHE_DIR in /var/cache/*)
+            CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/app_amd_ws-cache.XXXXXX") || die 1 "cannot create a temporary cache directory"
+            CACHE_DIR_TEMP=1;;
+        esac
+    fi
+
+    if [ "$OPT_UNINSTALL" = 1 ]; then uninstall_module; exit $?; fi
+
+    ast_detect_core
+    if [ "$OPT_DRY_RUN" = 1 ]; then
+        resolve_headers || true
+        print_plan; exit 0
+    fi
+    if [ "$OPT_DEPS_ONLY" = 1 ]; then install_deps || exit 6; log "dependencies done"; exit 0; fi
+
+    if [ "$OPT_BUILD_ONLY" = 1 ] && [ "$(id -u)" != 0 ]; then
+        need_pkgs; [ ${#NEED_PKGS[@]} -eq 0 ] || die 6 "missing build tools (install as root or run --deps-only): ${NEED_PKGS[*]}"
+        have_mysql_dev || [ "$OPT_NO_DB" = 1 ] || { warn "no MySQL client dev files - building without the DB lookup"; OPT_NO_DB=1; }
+    else
+        install_deps || exit 6
+    fi
+    # what could not be read before the toolchain existed (strings(1) from binutils was just
+    # installed on a minimal box): the core's build-option sum and, without a daemon, its version
+    if [ -z "${ASTBUILDSUM:-}" ]; then ast_find_buildsum && log "AST_BUILDOPT_SUM read after installing binutils: $ASTBUILDSUM"; fi
+    if [ -z "${ASTVERSION:-}" ]; then ast_find_version && log "Asterisk version read after installing binutils: $ASTVERSION"; fi
+    mkdir -p "$CACHE_DIR" 2>/dev/null || true
+
+    if ! resolve_headers; then
+        err "no Asterisk headers matching the running Asterisk ${ASTVERSION:-<unknown>} (sum ${ASTBUILDSUM:-<unknown>}) could be found or fetched."
+        err "Next steps: --headers DIR | --asterisk-src DIR (configured+built tree) | --version VER | --allow-configure | --tarball-file FILE"
+        err "            (details above; full log in $LOG_FILE)"
+        exit 4
+    fi
+    log "headers: $HEADERS_HOW"
+    print_plan
+    if [ "$OPT_YES" = 0 ] && [ "$OPT_BUILD_ONLY" = 0 ] && [ -t 0 ]; then
+        printf '[amd_ws] proceed? [Y/n] '; read -r ans; case $ans in n*|N*) log "aborted"; exit 1;; esac
+    fi
+
+    build_module
+    if [ "$OPT_BUILD_ONLY" = 1 ]; then
+        local out=${OPT_OUTPUT:-./$MODULE.so}
+        cp -p "$BUILD_DIR/$MODULE.so" "$out"; log "--build-only: module written to $out"; exit 0
+    fi
+    local rc=0
+    install_module || rc=$?
+    [ $rc = 0 ] || exit $rc
+    print_dialplan
+    log "done. Log: $LOG_FILE"
+}
+
+if [ -z "${AMD_WS_INSTALL_LIB:-}" ]; then
+    main "$@"
+fi

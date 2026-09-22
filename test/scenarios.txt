@@ -1,0 +1,112 @@
+# app_amd_ws test scenarios - one call per line, '|' separated, '#' comments.
+# run.sh generates a [farside-<name>] and an [amdside-<name>] context per row
+# (extension pattern _XXXX = call counter) and runs the rows whose tags match the mode.
+#
+# columns:
+#  name     scenario name = context suffix and VID suffix; [a-z0-9_] only, unique
+#  tags     self  = plumbing scenario, runs in --selftest and in full mode
+#           amd   = needs the built app_amd_ws.so (full mode only)
+#           db    = proves the MySQL code path; SKIP when the module was built without MySQL
+#           probe = not run on its own; used by the unload/reload checks
+#  count    number of simultaneous originates (all within 1 s); 1 for a single call
+#  farside  behaviour subroutine [fs-<farside>] in asterisk/extensions.conf.in:
+#           speech8 speech8-mix speech1500-hangup noaudio silence8 record3 dial-noanswer
+#  mock     mock server path written to the control file before the call
+#           ('-' = leave as is; the mock is not involved)
+#  amdside  what the amdside runs between the T0/T1 timestamps:
+#           ws:<timeout_ms>,<playfile>,<options>   -> AMD_WS(127.0.0.1,${MOCK_PORT},${VID},<...>)
+#           wsdead:<timeout_ms>,<playfile>,<options> -> same but ${DEAD_PORT} (nothing listens)
+#           wstls:<timeout_ms>,<playfile>,<options>  -> same but ${TLS_PORT} (wss mock; put 's' in the options; SKIP without openssl)
+#           wshole:<timeout_ms>,<playfile>,<options> -> same but ${BLACKHOLE_PORT} (accepts TCP, never answers the upgrade)
+#           wsraw:<full argument string>            -> AMD_WS(<full argument string>)
+#           app:App1(args) && App2(args) ...        -> those dialplan applications verbatim
+#  post     dialplan apps to run after amdside returned, before Hangup ('-' = none)
+#  status   expected AMDSTATUS   ('*' = do not check)
+#  cause    expected AMDCAUSE    ('*' = do not check)
+#  min/max  bounds for the wall-clock ms the amdside step took (T1 - T0);
+#           NOTE: the farside Answer() returns up to 500 ms after the amdside
+#           started when the amdside sends no media, so audio-driven results
+#           land ~500 ms later than the AMD clock (AMDELAPSED) suggests.
+#  asserts  comma list, evaluated after the status/cause/timing checks:
+#           proto                      protocol_test.py config,schedule,bytes,eof,close (+ no phone keys)
+#           proto:c1;c2[;phone=N][;country=C]   explicit protocol_test checks (';' separated)
+#           chunks=N chunks>=N chunks<=N   number of binary chunks the mock received
+#           noconn                     the mock has NO connection record for this VID
+#           resp~TEXT resp=TEXT        decoded AMDRESPONSE contains / equals TEXT
+#           elapsed>=N elapsed<=N      AMDELAPSED (module's own clock) bounds
+#           heard>THR heard<THR        sox RMS of <VID>-heard.wav (what the callee heard)
+#           heard[start:len]>THR / <THR   RMS of a segment (seconds), file time 0 = farside Answer
+#           heard_dur<S heard_dur>S    duration of <VID>-heard.wav in seconds
+#           mix>THR                    RMS of <VID>-mix.wav (both directions)
+#           log~REGEX nolog~REGEX      full log (grep -E) contains / lacks REGEX; %VID% %NUM% %NAME% are replaced
+#           cli~REGEX                  'amd_ws show settings' (grep -E) after the call ended
+#           mockvid=TEXT               the mock parsed exactly TEXT as the VID (%VID% replaced; JSON escaping round trip)
+#           (assert tokens are comma separated: no commas inside a token; use "." in a regex)
+#           alive                      asterisk still answers the CLI afterwards (always checked too)
+#           Bursts (count > 1) get log~/nolog~/cli~/alive with %VID% = the first call, plus a check
+#           that the mock saw exactly one connection per VID.
+#  Upper bounds (max_ms, elapsed<=) are multiplied by TEST_SLOW_FACTOR (default 1); lower bounds are not.
+#  The AMD_WS channel in log~ patterns is  Local/%NUM%@farside-%NAME%-[0-9a-f]+;1  (anchors the line to THIS call).
+#
+# name             | tags  | count | farside            | mock                     | amdside                                   | post      | status   | cause            | min_ms | max_ms | asserts
+# ---------------- self-test plumbing (no module needed) ------------------------------------------------------------------------------------------------------------------------------
+self_originate     | self  | 1     | speech8            | -                        | app:Set(AMDSTATUS=SELFTEST) && Set(AMDCAUSE=ORIGINATE) && Wait(1) | - | SELFTEST | ORIGINATE | 900 | 1700 | log~Executing \[%NUM%@amdside-%NAME%:.*Wait\(
+self_playback_rec  | self  | 1     | record3            | -                        | app:Set(AMDSTATUS=SELFTEST) && Set(AMDCAUSE=PLAYBACK) && Playback(amd-prompt) | - | SELFTEST | PLAYBACK | 2700 | 3900 | heard>0.05,heard_dur>2.5,log~Executing \[%NUM%@amdside-%NAME%:.*Playback\("[^"]*". "amd-prompt"\)
+self_echo          | self  | 1     | speech1500-hangup  | -                        | app:Set(AMDSTATUS=SELFTEST) && Set(AMDCAUSE=ECHO) && Playback(amd-beep) && Echo() | - | SELFTEST | ECHO | 1200 | 2400 | log~Executing \[%NUM%@amdside-%NAME%:.*Echo\(
+self_mix           | self  | 1     | speech8-mix        | -                        | app:Set(AMDSTATUS=SELFTEST) && Set(AMDCAUSE=MIX) && Playback(amd-prompt-short) && Wait(1) | - | SELFTEST | MIX | 1900 | 2800 | heard>0.05,heard[0.1:0.7]>0.05,heard[1.4:0.5]<0.005,mix>0.05,heard_dur>1.8
+self_noaudio       | self  | 1     | noaudio            | -                        | app:Set(AMDSTATUS=SELFTEST) && Set(AMDCAUSE=NOAUDIO) && Wait(1) | - | SELFTEST | NOAUDIO | 900 | 1700 |
+self_hangup        | self  | 1     | speech1500-hangup  | -                        | app:Set(AMDSTATUS=SELFTEST) && Set(AMDCAUSE=HANGUP) && Wait(10) | - | SELFTEST | HANGUP | 1600 | 2800 | log~Executing \[h@amdside-%NAME%:1\]
+self_noanswer      | self  | 1     | dial-noanswer      | -                        | app:Set(AMDSTATUS=SELFTEST) && Set(AMDCAUSE=${IF($["${CHANNEL(state)}"="Up"]?UP:NOTUP)}) | - | SELFTEST | NOTUP | 0 | 900 |
+self_burst         | self  | 25    | speech8            | -                        | app:Set(AMDSTATUS=SELFTEST) && Set(AMDCAUSE=BURST) && Wait(1) | - | SELFTEST | BURST | 900 | 3500 | alive
+# ---------------- AMD_WS scenarios (need ../app_amd_ws.so) ------------------------------------------------------------------------------------------------------------------------------
+human              | amd   | 1     | speech8            | /human?after=3           | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1800   | 3000   | proto,chunks=4,resp~HUMAN,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 vid=%VID% host=127\.0\.0\.1:[0-9]+ play=none,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 status=HUMAN cause=HUMAN elapsed=[0-9]+ sent=[0-9]+ chunks=4
+machine            | amd   | 1     | speech8            | /machine?after=2         | ws:8000,,                                 | -         | MACHINE  | MACHINE          | 1300   | 2600   | proto,chunks=3
+amd_token          | amd   | 1     | speech8            | /amd?after=2             | ws:8000,,                                 | -         | MACHINE  | MACHINE          | 1300   | 2600   | proto,resp=AMD
+honeypot           | amd   | 1     | speech8            | /honeypot?after=2        | ws:8000,,                                 | -         | HONEYPOT | HONEYPOT         | 1300   | 2600   | proto
+json               | amd   | 1     | speech8            | /json?after=2            | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1300   | 2600   | proto,resp~"status": "HUMAN"
+amdy_ack           | amd   | 1     | speech8            | /amdy?after=3            | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1800   | 3000   | proto,chunks=4
+nothuman           | amd   | 1     | speech8            | /nothuman?after=2        | ws:8000,,                                 | -         | MACHINE  | MACHINE          | 1300   | 2600   | proto,chunks=3
+server_down        | amd   | 1     | speech8            | -                        | wsdead:8000,,                             | -         | NOTSURE  | NETERR           | 0      | 2500   | noconn
+slow_handshake     | amd   | 1     | speech8            | /slow?handshake=3500     | ws:8000,,                                 | -         | NOTSURE  | NETERR           | 1700   | 3200   | noconn
+opt_c_connto       | amd   | 1     | speech8            | /slow?handshake=1500     | wsraw:127.0.0.1,${MOCK_PORT},${VID},8000,,c(300) | - | NOTSURE | NETERR          | 200    | 1200   | noconn,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 status=NOTSURE cause=NETERR
+hangup_in_connect  | amd   | 1     | speech1500-hangup  | /slow?handshake=3000     | ws:8000,,                                 | -         | HANGUP   | HANGUP           | 1600   | 2600   | noconn,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 status=HANGUP cause=HANGUP elapsed=[0-9]+ sent=0 chunks=0
+expire_in_connect  | amd   | 1     | speech8            | /slow?handshake=2500     | wsraw:127.0.0.1,${MOCK_PORT},${VID},1500,,c(5000) | - | NOTSURE | NETERR         | 1500   | 2700   | noconn,elapsed>=1400,elapsed<=1700
+reject_upgrade     | amd   | 1     | speech8            | /reject                  | ws:8000,,                                 | -         | NOTSURE  | NETERR           | 0      | 2500   | noconn
+silent_server      | amd   | 1     | speech8            | /silent                  | ws:3000,,                                 | -         | NOTSURE  | AUDIO_TIMEOUT    | 3700   | 5300   | proto:config;eof;close;noresult;chunks,chunks>=4
+close_midstream    | amd   | 1     | speech8            | /close?after=2           | ws:8000,,                                 | -         | NOTSURE  | NETERR           | 1200   | 2500   | proto:config;chunks,chunks=2
+big_result         | amd   | 1     | speech8            | /big?after=2             | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1300   | 2600   | proto
+fragmented         | amd   | 1     | speech8            | /fragmented?after=2      | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1300   | 2600   | proto
+ping_frames        | amd   | 1     | speech8            | /ping?after=2            | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1300   | 2600   | proto
+slow_reply         | amd   | 1     | speech8            | /delay?reply=400&after=2 | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1600   | 3100   | proto
+hangup             | amd   | 1     | speech1500-hangup  | /silent                  | ws:8000,,                                 | -         | HANGUP   | HANGUP           | 1600   | 2600   | proto:config;chunks,chunks>=2,elapsed>=1300,elapsed<=1900
+no_audio           | amd   | 1     | noaudio            | /human?after=1           | ws:3000,,                                 | -         | NOTSURE  | NO_AUDIO_TIMEOUT | 2800   | 4400   | proto:config;eof;close;chunks,chunks=0
+silence_frames     | amd   | 1     | silence8           | /silent                  | ws:3000,,                                 | -         | NOTSURE  | AUDIO_TIMEOUT    | 3700   | 5300   | proto,chunks>=4
+schedule_full      | amd   | 1     | speech8            | /human?after=8           | ws:9000,,                                 | -         | HUMAN    | HUMAN            | 5300   | 7000   | proto,chunks=9,elapsed>=5400,elapsed<=6000
+playback           | amd   | 1     | speech8-mix        | /human?after=3           | ws:8000,amd-prompt,                       | Wait(1.5) | HUMAN    | HUMAN            | 1600   | 3000   | proto,heard>0.05,heard[0.3:1.2]>0.05,heard[2.7:0.6]<0.005,heard_dur>3.2,mix>0.05,log~AMD_WS: .*vid=%VID% host=127\.0\.0\.1:[0-9]+ play=amd-prompt
+playback_list      | amd   | 1     | speech8-mix        | /human?after=3           | ws:8000,amd-prompt-short&amd-prompt,      | -         | HUMAN    | HUMAN            | 1600   | 3000   | heard>0.05,heard[0.2:1.6]>0.05
+playdelay          | amd   | 1     | speech8-mix        | /human?after=5           | ws:8000,amd-prompt,d(1500)                | -         | HUMAN    | HUMAN            | 2800   | 5400   | heard[0:0.8]<0.005,heard[1.3:1.0]>0.05
+no_playback_quiet  | amd   | 1     | speech8-mix        | /human?after=3           | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1800   | 3000   | heard<0.005
+opt_n_nodb         | amd   | 1     | speech8            | /human?after=1           | ws:8000,,n                                | -         | HUMAN    | HUMAN            | 800    | 2200   | proto,chunks=2
+db_unreachable     | amd db | 1    | speech8            | /human?after=1           | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 800    | 3200   | proto,chunks=2,log~AMD_WS: DB connect to 127\.0\.0\.1:[0-9]+ failed
+opt_p_k            | amd   | 1     | speech8            | /human?after=1           | ws:8000,,p(3135551212)k(1)                | -         | HUMAN    | HUMAN            | 800    | 2200   | proto:config;schedule;bytes;eof;close;phone=3135551212;country=1
+opt_a_unanswered   | amd   | 1     | dial-noanswer      | /human?after=1           | ws:8000,,A                                | -         | NOTSURE  | INTERR           | 0      | 1000   | noconn
+bad_port_default   | amd   | 1     | speech8            | /human?after=1           | wsraw:127.0.0.1,notaport,${VID},8000      | -         | HUMAN    | HUMAN            | 800    | 2200   | proto,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 invalid port .notaport.
+bad_options        | amd   | 1     | speech8            | /human?after=1           | wsraw:127.0.0.1,${MOCK_PORT},${VID},8000,,np(3135551212)k(1 | - | HUMAN | HUMAN         | 800    | 2200   | proto,nolog~app_amd_ws\.c: .*3135551212,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 invalid options .np.XXXXXXXXXX. .digits masked
+vid_escape         | amd   | 1     | speech8            | /human?after=1           | app:Set(CALLERID(name)=${VID}${QUOTE(q)}${BASE64_DECODE(XA==)}z${BASE64_DECODE(/w==)}) && AMD_WS(127.0.0.1,${MOCK_PORT},,8000) | - | HUMAN | HUMAN | 800 | 2200 | mockvid=%VID%"q"\z?
+default_vid        | amd   | 1     | speech8            | /human?after=1           | app:Set(CALLERID(name)=${VID}) && AMD_WS(127.0.0.1,${MOCK_PORT},,8000) | - | HUMAN | HUMAN | 800 | 2200 | proto
+tls_human          | amd   | 1     | speech8            | /human?after=2           | wstls:8000,,s                             | -         | HUMAN    | HUMAN            | 1300   | 2700   | proto,chunks=3,log~AMD_WS: .*vid=%VID% host=127\.0\.0\.1:
+tls_to_plain       | amd   | 1     | speech8            | /human?after=1           | ws:8000,,s                                | -         | NOTSURE  | NETERR           | 0      | 2500   | noconn
+concurrent         | amd   | 25    | speech8            | /human?after=3           | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1800   | 6000   | alive
+# accept-and-never-reply peer (R1-1): NETERR at c(ms) although the helper stays parked in the core's handshake
+# read; parked helpers are counted per host once their call gave up (healthy bursts are never capped);
+# with max_pending_connects = 8 (amd_ws.conf.in) a call that starts while 8 are parked fails fast.
+# check blackhole_release then kills the peer and asserts "parked connects" drops to 0.
+blackhole          | amd   | 1     | speech8            | -                        | wshole:8000,,c(700)                       | -         | NOTSURE  | NETERR           | 600    | 1500   | cli~parked connects *: 1 ,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 status=NOTSURE cause=NETERR
+blackhole_fill     | amd   | 7     | speech8            | -                        | wshole:8000,,c(700)                       | -         | NOTSURE  | NETERR           | 600    | 1500   | cli~parked connects *: 8 ,cli~127\.0\.0\.1 *: 8 +.cap reached,nolog~AMD_WS: [0-9]+ connects to 127\.0\.0\.1 still pending
+blackhole_cap      | amd   | 1     | speech8            | -                        | wshole:8000,,c(700)                       | -         | NOTSURE  | NETERR           | 0      | 400    | cli~parked connects *: 8 ,log~AMD_WS: 8 connects to 127\.0\.0\.1 still pending .max_pending_connects.. failing fast with NETERR,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 status=NOTSURE cause=NETERR elapsed=[0-9]+ sent=0 chunks=0
+# ---------------- probe used by the unload/reload checks (not run on its own) -------------------------------------------------------------------------------------------------------
+unload_probe       | probe | 1     | speech8            | /silent                  | ws:5000,,                                 | -         | *        | *                | 0      | 99999  |
+# ---------------- probe used by the fd/RSS soak check (soak_fd_rss: 25-call bursts, 200 calls) --------------------------------------------------------------------------------------
+soak               | probe | 1     | speech8            | /human?after=1           | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 0      | 99999  |
+# ---------------- probe run by check_unload_cycle AFTER 'module reload' with send_schedule=500, extra_statuses=+GOOGLE_VOICE, result_grace_ms=0, db=no
+reload_effect      | probe | 1     | speech8            | /status?value=GOOGLE_VOICE&after=1 | ws:8000,,                       | -         | GOOGLE_VOICE | GOOGLE_VOICE | 800  | 2200   | proto:config;eof;close,chunks=2,resp=GOOGLE_VOICE

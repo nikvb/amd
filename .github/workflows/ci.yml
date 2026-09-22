@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Asterisk headers, MariaDB client dev files and shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            asterisk-dev libmariadb-dev pkg-config shellcheck binutils
+
+      - name: Shell syntax (sh and bash)
+        run: |
+          for f in ast-detect.sh tools/*.sh install.sh; do sh -n "$f" 2>/dev/null || bash -n "$f"; done
+          bash -n install.sh
+
+      - name: shellcheck
+        run: |
+          shellcheck -S warning -s sh ast-detect.sh tools/gen-installer.sh tools/check-embedded.sh tools/make-header-bundle.sh
+          shellcheck -S warning -s bash install.sh
+
+      - name: Detection report (no daemon on the runner)
+        run: make show-config ASTNOCHECK=1
+
+      # No Asterisk daemon runs here and the packaged headers cannot be tied to a running core,
+      # so ASTNOCHECK=1 accepts /usr/include (asterisk-dev).  WERROR=1: the module must compile
+      # warning-free against these (18.x) headers.
+      - name: Build (MySQL auto-detected)
+        run: make ASTNOCHECK=1 WERROR=1
+
+      - name: Build without MySQL
+        run: make clean && make ASTNOCHECK=1 WERROR=1 MYSQL=0
+
+      - name: Compile matrix against header bundles (if any under ./bundles)
+        run: make check ASTNOCHECK=1 WERROR=1
+
+      - name: install.sh is generated from the sources and carries no placeholder
+        run: tools/check-embedded.sh
+
+      - name: Installer smoke tests (no root, no changes)
+        run: |
+          bash install.sh --help
+          bash install.sh --dry-run || true
+          AMD_WS_INSTALL_LIB=1 bash -c 'source ./install.sh; set +e; ASTVERSION=16.30.1-vici ASTVERBASE=16.30.1; tarball_urls; bundle_urls'
+
+      - name: Python test harness compiles
+        run: |
+          if ls test/*.py >/dev/null 2>&1; then python3 -m py_compile test/*.py; else echo "no test/*.py"; fi

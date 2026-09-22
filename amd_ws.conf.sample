@@ -1,0 +1,146 @@
+;
+; amd_ws.conf -- configuration for the AMD_WS() dialplan application
+; (Answering Machine Detection over WebSocket, app_amd_ws.so v2)
+;
+; Install as /etc/asterisk/amd_ws.conf.  The file and every key are OPTIONAL;
+; the values shown are the built-in defaults, except host= which defaults to
+; 127.0.0.1 when no file is present.  Dialplan arguments override this file
+; per call:  AMD_WS([host[,port[,vid[,timeout_ms[,playfile[,options]]]]]])
+;
+; Apply changes with:   asterisk -rx 'module reload app_amd_ws.so'
+; Inspect the result:   asterisk -rx 'amd_ws show settings'
+;
+
+[general]
+
+; ---------------------------------------------------------------------------
+; Service endpoint
+; ---------------------------------------------------------------------------
+; AMD service host name or IP address, and TCP port.  The module connects to
+; ws://host:port/ (or wss:// when tls=yes / option 's').  Hostnames are
+; resolved by the core's resolver for every call, off the channel thread.
+; An IPv6 literal (2001:db8::10) is accepted and bracketed automatically.
+host=api.amdy.io
+port=2700
+
+; TLS (wss://).  tls=yes makes every call use wss unless the dialplan says
+; otherwise; the per-call option 's' turns TLS on for one call.
+tls=no
+
+; Verify the server certificate chain against a CA bundle.  With tls_verify=yes
+; and no tls_cafile the first of these that exists is used:
+;   /etc/ssl/certs/ca-certificates.crt, /etc/pki/tls/certs/ca-bundle.crt,
+;   /etc/ssl/ca-bundle.pem, /etc/ssl/cert.pem   (else capath /etc/ssl/certs)
+; tls_verify=no accepts any certificate (encryption without authentication).
+tls_verify=yes
+tls_cafile=
+
+; Also check that the certificate's common name / subjectAltName matches the
+; host.  Leave this at "no" on Asterisk 16: its WebSocket client does not pass
+; the hostname to the check, so every connection would fail with
+; "Certificate common name from peer ... did not match ()".  On Asterisk 18+
+; it works and may be enabled.  (Not part of the frozen v2 key list; extra.)
+tls_check_hostname=no
+
+; ---------------------------------------------------------------------------
+; Timing (milliseconds)
+; ---------------------------------------------------------------------------
+; Overall detection window, measured from the first captured audio frame
+; (from application start while no audio has arrived).  When it expires
+; without a result: AMDSTATUS=NOTSURE, AMDCAUSE=AUDIO_TIMEOUT (or
+; NO_AUDIO_TIMEOUT if no audio was ever captured).  Dialplan argument 4
+; overrides it; <= 0 there means "use this default".  amd.py: MAX_WAIT_TIME.
+timeout_ms=10000
+
+; How long the WebSocket connect (DNS + TCP + HTTP upgrade) may take.  The
+; connect runs on a helper thread while audio is already being captured;
+; when this expires AMDCAUSE=NETERR is returned immediately.  Option c(ms)
+; overrides it per call.  The connect deadline is never later than the
+; detection deadline.  The optional DB lookup (below) runs on the same helper
+; right before the connect, inside this window.
+connect_timeout_ms=2000
+
+; PARKED connect helpers allowed PER HOST.  A server that accepts the TCP
+; connection but never answers the HTTP upgrade (hung process, black-holing
+; middlebox) keeps its helper thread parked in the core's handshake read
+; until the peer closes or Asterisk restarts: the call itself still returns
+; NETERR at connect_timeout_ms, but the thread stays.  Only helpers whose
+; call has already given up count (a burst of healthy connects never does).
+; Beyond this many parked helpers new calls to THAT host fail fast with
+; NETERR (one WARNING per minute); other hosts are unaffected.
+; 'amd_ws show settings' prints "connects in flight" (all helpers) and
+; "parked connects" per host.  Range 8..1024.
+max_pending_connects=64
+
+; After timeout_ms the remaining audio is flushed and the server gets this
+; long to answer before AUDIO_TIMEOUT is returned.  The channel is still
+; serviced (a hangup is seen immediately).  0 disables the grace period.
+result_grace_ms=1000
+
+; ---------------------------------------------------------------------------
+; Audio transport (matches the amdy.io EAGI client amd.py)
+; ---------------------------------------------------------------------------
+; Time marks, measured from the first captured frame, at which everything
+; accumulated so far is sent as one BINARY frame (8 kHz 16-bit mono slin,
+; 16000 bytes per second).  Strictly increasing, max 16 entries.  After the
+; last mark a send happens whenever chunk_bytes are pending.  A single value
+; "500" gives plain 500 ms chunks.  Audio is never dropped or truncated:
+; frames of any size (10/20/30/60 ms) are accumulated whole.
+send_schedule=500,1000,1500,2000,3000,4000
+chunk_bytes=8000
+
+; ---------------------------------------------------------------------------
+; Result classification
+; ---------------------------------------------------------------------------
+; Every server TEXT frame is split into tokens (letters, digits, underscore);
+; tokens are uppercased and the FIRST terminal token decides:
+;   HUMAN            -> AMDSTATUS=HUMAN
+;   MACHINE or AMD   -> AMDSTATUS=MACHINE
+;   any token listed here -> AMDSTATUS=<token> verbatim (AMDCAUSE the same)
+; Anything else (e.g. "{}", "ack", "AMDY ack", "NOT_HUMAN", "OK") is an
+; acknowledgement and detection continues.  If the text is JSON with a
+; "status", "result" or "classification" key only that value is tokenised.
+; An empty list is allowed (only HUMAN/MACHINE terminate).
+extra_statuses=HONEYPOT,FAS,FASAMD,AUDIO,NOTSURE
+
+; ---------------------------------------------------------------------------
+; Parallel playback
+; ---------------------------------------------------------------------------
+; Delay before the optional playfile (dialplan argument 5) starts playing
+; into the channel, measured from application start.  Option d(ms) overrides
+; it per call.  Playback is stopped as soon as a result arrives or the
+; application exits; end of the file list does not end detection.
+playdelay_ms=0
+
+; ---------------------------------------------------------------------------
+; ViciDial phone / country enrichment (optional)
+; ---------------------------------------------------------------------------
+; When the module was built with MySQL support, look up
+;   SELECT phone_code,phone_number FROM vicidial_auto_calls
+;    WHERE callerid='<vid>' ORDER BY auto_call_id DESC LIMIT 1
+; and send the values as "phone" and "country_code" in the config frame.
+; Credentials come from the VARDB_* lines of astguiclient.conf (read at load
+; and on 'module reload app_amd_ws.so').  The per-call option 'n' skips the
+; lookup, and so do explicit p(phone) / k(code) values.  A module built
+; without MySQL reports db "unavailable" and ignores db=yes.
+db=yes
+
+; Time budget for the lookup.  Waiting for the shared connection is bounded
+; by this value; the connect, read and write socket timeouts are each set to
+; this value rounded UP to whole seconds (minimum 1 s), so a DB that accepts
+; TCP but stalls can hold the lookup for a few seconds.  The lookup runs on
+; the connect helper thread (never on the channel thread): a stalled DB
+; costs that call its connect window (NETERR -> AMD() fallback), not audio.
+; After a failure the DB is skipped for 5 s so a dead DB costs one timeout,
+; not one per call; failures are logged at WARNING at most once per minute
+; and the call continues without phone.  A connection the server dropped
+; while idle (wait_timeout) is reconnected once within the same budget.
+db_timeout_ms=1000
+
+; Where to read VARDB_server / VARDB_database / VARDB_user / VARDB_pass /
+; VARDB_port from.  Parsing tolerates tabs, trailing spaces, inline '#' or
+; ';' comments and '=>' inside values, like ViciDial itself.  When the file
+; cannot be read the lookup is skipped entirely (one NOTICE at load/reload,
+; 'amd_ws show settings' says "NOT READ"); no connection is attempted with
+; built-in defaults.
+astguiclient_conf=/etc/astguiclient.conf

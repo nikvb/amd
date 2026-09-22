@@ -1,3 +1,10 @@
 *.o
 *.so
+*.d
 *.tar.gz
+.buildflags
+.ast-detect.mk
+app_amd_ws/
+test/run/
+bundles/
+test/local.env
