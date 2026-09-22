@@ -36,6 +36,8 @@ PYTHON=${PYTHON:-python3}
 MAKE_ARGS=${MAKE_ARGS:-}
 # MariaDB client staged without root (SPEC section 1); used when the system has no MySQL dev files
 MYSQL_ROOT=${MYSQL_ROOT:-/tmp/claude-1000/-home-na/ba3f2cc5-ea24-44ec-aebc-c050b41abe5d/scratchpad/mariadb/usr}
+TEST_MALLOC_ARENA_MAX=${TEST_MALLOC_ARENA_MAX:-1}   # for the test daemon only, see start_asterisk
+SOAK_RSS_LIMIT_KB=${SOAK_RSS_LIMIT_KB:-1024}         # allowed RSS growth over the 200 measured soak calls
 SUITE_BUDGET_S=${SUITE_BUDGET_S:-240}
 
 MODE=full           # full | selftest
@@ -287,7 +289,12 @@ mysql_flavour() {
 
 build_module() {
 	if [ "$NO_BUILD" = 1 ]; then
-		if [ -f "$MODULE_SO" ]; then MODULE_AVAILABLE=1; log "using module $MODULE_SO (no build)"; else log "module $MODULE_SO not found"; fi
+		if [ -f "$MODULE_SO" ]; then MODULE_AVAILABLE=1; log "using module $MODULE_SO (no build)"; else log "module $MODULE_SO not found"; return; fi
+		# a prebuilt DB-enabled module may need the staged libmariadb at run time
+		if ldd "$MODULE_SO" 2>/dev/null | grep -q 'not found' && [ -d "$MYSQL_ROOT/lib/x86_64-linux-gnu" ]; then
+			EXTRA_LD=$MYSQL_ROOT/lib/x86_64-linux-gnu
+			log "module needs libraries outside the default path: adding $EXTRA_LD to the daemon's LD_LIBRARY_PATH"
+		fi
 		return
 	fi
 	if [ ! -f "$REPO/Makefile" ] || [ ! -f "$REPO/app_amd_ws.c" ]; then
@@ -314,9 +321,13 @@ build_module() {
 	none) row SKIP build_mysql - - - "no MySQL/MariaDB client dev files (system or $MYSQL_ROOT)"; MODULE_AVAILABLE=1; return ;;
 	esac
 	log "build 2/2: make ${margs[*]}"
+	# the Makefile's post-link gate runs 'ldd -r': the staged libmariadb must be resolvable
+	local ldp=$AST_LD_LIBRARY_PATH${EXTRA_LD:+:$EXTRA_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+	mk=(env "LD_LIBRARY_PATH=$ldp" make)
 	if (cd "$REPO" && "${mk[@]}" clean >/dev/null 2>&1; "${mk[@]}" "${margs[@]}" $MAKE_ARGS) >"$blog" 2>&1 && [ -f "$REPO/app_amd_ws.so" ]; then
 		local und
-		und=$(ldd -r "$REPO/app_amd_ws.so" 2>&1 | grep 'undefined symbol' | grep -vE 'symbol: (_?_?ast_|__ao2_|ao2_|pbx_)' || true)
+		# option_debug/option_verbose are core globals read by the ast_debug()/ast_verb() macros (stock app_amd.so has them too)
+		und=$(LD_LIBRARY_PATH=$ldp ldd -r "$REPO/app_amd_ws.so" 2>&1 | grep 'undefined symbol' | grep -vE 'symbol: (_?_?ast_|__ao2_|ao2_|pbx_|option_debug|option_verbose)' || true)
 		if [ -n "$und" ]; then
 			row FAIL build_mysql - - - "unresolved non-Asterisk symbols: $(echo "$und" | awk '{print $3}' | tr '\n' ' ')"
 		elif grep -qi 'mysql: *yes\|HAVE_MYSQL' "$blog"; then
@@ -376,9 +387,10 @@ prepare_rundir() {
 
 	cp "$TESTDIR/asterisk/modules.conf" "$TESTDIR/asterisk/logger.conf" "$TESTDIR/asterisk/http.conf" "$TESTDIR/asterisk/indications.conf" "$AST_RUN/etc/"
 	# empty stubs so the core does not log "Unable to load config file" for optional subsystems
-	for f in cdr cel features acl udptl ccss manager rtp stasis codecs cli_permissions; do
+	for f in cdr cel features udptl ccss manager rtp stasis codecs cli_permissions; do
 		printf '; stub written by test/run.sh\n[general]\n' >"$AST_RUN/etc/$f.conf"
 	done
+	printf '; stub written by test/run.sh (acl.conf holds named ACLs only; a [general] section is an ERROR)\n' >"$AST_RUN/etc/acl.conf"
 	printf '; manager (AMI) stays off: no network listeners in the test instance\n[general]\nenabled = no\n' >"$AST_RUN/etc/manager.conf"
 	sed -e "s|@RUN@|$AST_RUN|g" -e "s|@LOGDIR@|$LOGDIR|g" -e "s|@RUNDIR@|$AST_RUNDIR|g" "$TESTDIR/asterisk/asterisk.conf.in" >"$AST_CONF"
 	sed -e "s|@DBPORT@|$DB_PORT|g" "$TESTDIR/asterisk/astguiclient.conf.in" >"$AST_RUN/etc/astguiclient.conf"
@@ -416,8 +428,12 @@ stop_stale_asterisk() {
 start_asterisk() {
 	local i
 	stop_stale_asterisk
-	log "starting asterisk: LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH${EXTRA_LD:+:$EXTRA_LD} $ASTERISK_BIN -C $AST_CONF -F -mq"
-	LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH${EXTRA_LD:+:$EXTRA_LD} "$ASTERISK_BIN" -C "$AST_CONF" -F -mq >"$LOGDIR/asterisk-console.log" 2>&1
+	# MALLOC_ARENA_MAX=1: every call runs on a fresh PBX thread (+ the module's connect helper) and
+	# glibc keeps a per-thread arena's high-water mark, which shows as slow RSS growth for hundreds
+	# of calls without a single byte leaked.  One arena makes RSS track live allocations, so the
+	# soak_fd_rss check can use a tight limit.  Production is unaffected (this is a test knob).
+	log "starting asterisk: MALLOC_ARENA_MAX=$TEST_MALLOC_ARENA_MAX LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH${EXTRA_LD:+:$EXTRA_LD} $ASTERISK_BIN -C $AST_CONF -F -mq"
+	MALLOC_ARENA_MAX=$TEST_MALLOC_ARENA_MAX LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH${EXTRA_LD:+:$EXTRA_LD} "$ASTERISK_BIN" -C "$AST_CONF" -F -mq >"$LOGDIR/asterisk-console.log" 2>&1
 	for i in $(seq 1 100); do
 		[ -S "$AST_RUNDIR/asterisk.ctl" ] && break
 		sleep 0.1
@@ -566,16 +582,19 @@ check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 	local vid=$1 list=$2 tok checks extra v thr seg st ln pat rc rest toks parts
 	A_FAIL=""; A_NOTE=""
 	[ -z "$list" ] && return 0
+	# the module's send schedule is clocked from its first captured frame = when the farside
+	# started sending audio (TA in the results line), not from the WebSocket connect
+	local anchor=(); [[ ${R_TA:-} =~ ^[0-9]+$ ]] && anchor=(--audio-start "$R_TA")
 	IFS=',' read -r -a toks <<<"$list"
 	for tok in "${toks[@]}"; do
 		tok=$(trim "$tok")
 		[ -z "$tok" ] && continue
 		case "$tok" in
 		proto)
-			v=$("$PYTHON" "$TESTDIR/protocol_test.py" --record "$LOGDIR/mock-record.jsonl" --vid "$vid" --checks config,schedule,bytes,eof,close --no-phone 2>&1); rc=$?
+			v=$("$PYTHON" "$TESTDIR/protocol_test.py" --record "$LOGDIR/mock-record.jsonl" --vid "$vid" --checks config,schedule,bytes,eof,close --no-phone "${anchor[@]}" 2>&1); rc=$?
 			printf '%s\n' "$v" >>"$LOGDIR/scenario-$vid.log"
 			[ $rc = 0 ] || A_FAIL+="proto[$(printf '%s' "$v" | grep '^FAIL' | cut -d: -f1 | sed 's/FAIL //' | tr '\n' ' ')] "
-			A_NOTE+="$(printf '%s' "$v" | awk '/^PASS schedule/ {sub(/^PASS schedule: chunks at /,""); sub(/ ms after config/,""); print "sched " $0}' | head -1) "
+			A_NOTE+="$(printf '%s' "$v" | awk '/^PASS schedule/ {sub(/^PASS schedule: chunks at /,""); sub(/ ms after .*/,""); print "sched " $0}' | head -1) "
 			;;
 		proto:*)
 			checks=""; extra=()
@@ -588,7 +607,7 @@ check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 				esac
 			done
 			[ ${#extra[@]} = 0 ] && extra=(--no-phone)
-			v=$("$PYTHON" "$TESTDIR/protocol_test.py" --record "$LOGDIR/mock-record.jsonl" --vid "$vid" --checks "${checks%,}" "${extra[@]}" 2>&1); rc=$?
+			v=$("$PYTHON" "$TESTDIR/protocol_test.py" --record "$LOGDIR/mock-record.jsonl" --vid "$vid" --checks "${checks%,}" "${extra[@]}" "${anchor[@]}" 2>&1); rc=$?
 			printf '%s\n' "$v" >>"$LOGDIR/scenario-$vid.log"
 			[ $rc = 0 ] || A_FAIL+="proto[$(printf '%s' "$v" | grep '^FAIL' | cut -d: -f1 | sed 's/FAIL //' | tr '\n' ' ')] "
 			;;
@@ -897,6 +916,69 @@ check_unload_cycle() {
 	hasi "$out" 'error\|No such' && row FAIL module_reload - - - "'$(echo "$out" | head -1)'" || row PASS module_reload - - - "'$(echo "$out" | head -1 | tr -s ' ')'"
 }
 
+# WARNING/ERROR lines the suite provokes on purpose; anything else in the full log is a failure
+LOG_NOISE_ALLOW=(
+	'loader.c: Soft unload failed, .app_amd_ws.so. has use count'          # unload_busy_refused
+	'app_amd_ws.c: AMD_WS: .* invalid port .notaport.'                     # bad_port_default
+	'app_amd_ws.c: AMD_WS: .* channel not answered and option A given'     # opt_a_unanswered
+	'tcptls.c: Unable to connect websocket client to 127.0.0.1:[0-9]+: Connection refused'   # server_down
+	'app_amd_ws.c: AMD_WS: connect to ws://127.0.0.1:[0-9]+ (failed|timed out)'              # server_down / slow_handshake
+	'res_http_websocket.c: Invalid HTTP response code 403 from 127.0.0.1'  # reject_upgrade
+	'app_amd_ws.c: AMD_WS: DB .*(connect|unavailable|failed|refused)'      # db_unreachable (dead VARDB port)
+	'app_amd_ws.c: AMD_WS: .*(Web socket|websocket|WebSocket) (closed|error)' # close_midstream
+)
+check_log_noise() { # no WARNING/ERROR in the Asterisk log other than the intentionally provoked ones
+	local all n_all n_left left pat
+	all=$(grep -E '(WARNING|ERROR)\[' "$FULL_LOG" 2>/dev/null || true)
+	n_all=$(printf '%s' "$all" | grep -c . || true)
+	left=$all
+	for pat in "${LOG_NOISE_ALLOW[@]}"; do left=$(printf '%s\n' "$left" | grep -vE -- "$pat" || true); done
+	left=$(printf '%s\n' "$left" | grep . || true)
+	n_left=$(printf '%s' "$left" | grep -c . || true)
+	printf '%s\n' "$left" >"$LOGDIR/log-noise-unexpected.txt"
+	if [ "${n_left:-0}" = 0 ]; then
+		row PASS log_noise - - - "$n_all WARNING/ERROR lines, all intentionally provoked (unload busy, bad port, option A, connect refused/timeout, 403, dead DB)"
+	else
+		row FAIL log_noise - - - "$n_left unexpected WARNING/ERROR line(s), e.g. $(printf '%s\n' "$left" | head -1 | sed -E 's/^\[[^]]*\] //' | cut -c1-110) (see log-noise-unexpected.txt)"
+	fi
+}
+
+soak_burst() { # n mockpath -> runs n concurrent human calls to completion; prints "got/n"
+	local n=$1 mock=$2 vids=() vid pids=() got=0 line
+	set_control "$mock"
+	local k; for k in $(seq 1 "$n"); do next_vid soak; vids+=("$VID"); done
+	for vid in "${vids[@]}"; do originate "$vid" >/dev/null 2>&1 & pids+=($!); done
+	wait "${pids[@]}"
+	for vid in "${vids[@]}"; do
+		if line=$(wait_result "$vid" 12); then parse_result "$line"; [ "$R_STATUS" = HUMAN ] && got=$((got + 1)); fi
+	done
+	for vid in "${vids[@]}"; do wait_quiet "$vid" || true; done
+	echo "$got/$n"
+}
+fd_count()  { ls "/proc/$AST_PID/fd" 2>/dev/null | wc -l; }
+rss_kb()    { awk '/^VmRSS:/{print $2}' "/proc/$AST_PID/status" 2>/dev/null || echo 0; }
+check_soak() { # no fd leak over 50 calls, no RSS growth over 200 calls (bursts of 25 concurrent calls)
+	[ -n "$AST_PID" ] && [ -d "/proc/$AST_PID/fd" ] || { row SKIP soak_fd_rss - - - "no /proc/$AST_PID"; return; }
+	local t0 fd0 fd1 rss0 rss1 r b bad="" calls=0 warm=0
+	t0=$(now_ms)
+	# warm-up (100 calls): thread stacks, format/translator caches, malloc heap growth of the first
+	# concurrent calls are not a leak; measured on this box the heap is flat from ~100 calls on
+	for b in 1 2 3 4; do r=$(soak_burst 25 "/human?after=1"); warm=$((warm + 25)); [ "$r" = 25/25 ] || bad+="warm-up$b $r "; done
+	fd0=$(fd_count); rss0=$(rss_kb)
+	for b in 1 2; do r=$(soak_burst 25 "/human?after=1"); calls=$((calls + 25)); [ "$r" = 25/25 ] || bad+="burst$b $r "; done
+	fd1=$(fd_count)
+	[ "$fd1" -le $((fd0 + 2)) ] || bad+="fds $fd0 -> $fd1 after $calls calls "
+	for b in 3 4 5 6 7 8; do r=$(soak_burst 25 "/human?after=1"); calls=$((calls + 25)); [ "$r" = 25/25 ] || bad+="burst$b $r "; done
+	rss1=$(rss_kb); fd1=$(fd_count)
+	# a leaked 8 KB accumulator or 16 KB rx buffer per call would add 1.6 / 3.2 MB here
+	[ $((rss1 - rss0)) -le "$SOAK_RSS_LIMIT_KB" ] || bad+="RSS ${rss0}kB -> ${rss1}kB (+$((rss1 - rss0)) > ${SOAK_RSS_LIMIT_KB}) after $calls calls "
+	[ "$fd1" -le $((fd0 + 2)) ] || bad+="fds $fd0 -> $fd1 after $calls calls "
+	ast_alive || bad+="asterisk not alive "
+	cp "$RESULTS" "$LOGDIR/results.txt" 2>/dev/null
+	local note="$warm warm-up + $calls measured calls in $(( ($(now_ms) - t0) / 1000 ))s: fds $fd0 -> $fd1, RSS ${rss0} -> ${rss1} kB ($( [ $((rss1 - rss0)) -ge 0 ] && printf '+')$((rss1 - rss0)) kB, limit $SOAK_RSS_LIMIT_KB)"
+	if [ -z "$bad" ]; then row PASS soak_fd_rss - - - "$note"; else row FAIL soak_fd_rss - - - "$(trim "$bad")| $note"; fi
+}
+
 check_log_lines() { # the two mandatory ast_verb lines exist for AMD calls
 	local n1 n2
 	n1=$(grep -cE 'AMD_WS: .* vid=[0-9]{4}_[a-z0-9_]+ host=' "$FULL_LOG" 2>/dev/null || true)
@@ -914,7 +996,7 @@ main() {
 	if [ "$LIST" = 1 ]; then
 		printf '%-20s %-6s %-5s %-18s %-24s %s\n' NAME TAGS COUNT FARSIDE MOCK AMDSIDE
 		local i; for i in "${!S_NAME[@]}"; do printf '%-20s %-6s %-5s %-18s %-24s %s\n' "${S_NAME[$i]}" "${S_TAGS[$i]}" "${S_COUNT[$i]}" "${S_FAR[$i]}" "${S_MOCK[$i]}" "${S_AMD[$i]}"; done
-		echo "checks: sounds no_listeners mock_paths shutdown_clean (self); build_nomysql build_mysql cli_show_application cli_show_settings unload_busy_refused unload_idle load_again module_reload log_lines (amd)"
+		echo "checks: sounds no_listeners mock_paths log_noise shutdown_clean (self); build_nomysql build_mysql cli_show_application cli_show_settings soak_fd_rss unload_busy_refused unload_idle load_again module_reload log_lines (amd)"
 		exit 0
 	fi
 	mkdir -p "$LOGDIR"
@@ -970,9 +1052,11 @@ main() {
 	done
 
 	if [ "$MODE" = full ] && [ "$MODULE_AVAILABLE" = 1 ]; then
+		selected soak_fd_rss && check_soak
 		selected log_lines && check_log_lines
 		selected unload_busy && check_unload_cycle
 	fi
+	selected log_noise && check_log_noise
 	[ "$KEEP" = 1 ] || stop_asterisk
 	local dt=$(($(date +%s) - SUITE_T0))
 	[ "$dt" -le "$SUITE_BUDGET_S" ] || row FAIL suite_budget - - - "suite took ${dt}s > ${SUITE_BUDGET_S}s"

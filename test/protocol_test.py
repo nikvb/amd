@@ -11,9 +11,14 @@ Checks (comma list, default: config,schedule,bytes,eof,close):
             frame and has the shape {"config":{"sample_rate":8000,"VID":vid[,"phone"][,"country_code"]}}
             with no other keys; --phone/--country assert their presence/value,
             --no-phone asserts absence.
-  schedule  chunk k arrives at t_config + schedule[k] +/- tol (default schedule
+  schedule  chunk k arrives at anchor + schedule[k] +/- tol (default schedule
             500,1000,1500,2000,3000,4000, tol 150 ms); chunks after the last mark
             are >= chunk-bytes (8000) and spaced by about chunk-bytes/16 ms.
+            The module's schedule clock starts at its FIRST CAPTURED FRAME, so the
+            anchor is --audio-start (epoch ms when the far side began sending
+            audio, i.e. TA from the results line) relative to the connection;
+            without --audio-start the config frame is the anchor (right for
+            mock_client.py, which streams immediately).
   bytes     every chunk carries ~16 B/ms of audio for its interval (+/- max(10 %,
             2 frames)) and the total is ~16000 B/s * covered duration (+/- 10 %).
   eof       the client sent {"eof":1} as its last text frame.
@@ -88,9 +93,15 @@ def check_config(rec, vid, phone=None, country=None, no_phone=False):
     return True, "shape ok: %s" % rec.get("config_raw")
 
 
-def check_schedule(rec, schedule, tol_ms, chunk_bytes):
+def check_schedule(rec, schedule, tol_ms, chunk_bytes, audio_start=None):
     chunks = rec.get("chunks") or []
     t0 = rec.get("t_config")
+    anchor = "config"
+    if audio_start is not None and rec.get("t_connect") is not None:
+        # first captured frame ~= when the far side started sending; may be < 0 when the
+        # audio began before the WebSocket was up (the module holds and flushes it)
+        t0 = audio_start - rec["t_connect"]
+        anchor = "first audio (%+d ms vs connect)" % t0
     if t0 is None:
         return False, "no config frame, cannot anchor schedule"
     if not chunks:
@@ -114,7 +125,7 @@ def check_schedule(rec, schedule, tol_ms, chunk_bytes):
                 problems.append("post-schedule chunk %d gap %d ms, expected ~%d" % (k + 1, gap, exp_gap))
     if problems:
         return False, "; ".join(problems) + " [" + " ".join(details) + "]"
-    return True, "chunks at " + " ".join(details) + " ms after config"
+    return True, "chunks at " + " ".join(details) + " ms after " + anchor
 
 
 def check_bytes(rec, schedule, tol_frac, chunk_bytes):
@@ -185,7 +196,7 @@ def check_chunks(rec, expect=None, min_chunks=None, max_chunks=None):
 
 def run_checks(recs, vid, checks, *, schedule=DEFAULT_SCHEDULE, tol_ms=150, bytes_tol=0.10,
                chunk_bytes=8000, close_code=1000, phone=None, country=None, no_phone=False,
-               expect_chunks=None, min_chunks=None, max_chunks=None):
+               expect_chunks=None, min_chunks=None, max_chunks=None, audio_start=None):
     results = []
     mine = find_vid(recs, vid)
     if len(mine) != 1:
@@ -196,7 +207,7 @@ def run_checks(recs, vid, checks, *, schedule=DEFAULT_SCHEDULE, tol_ms=150, byte
         if c == "config":
             ok, d = check_config(rec, vid, phone=phone, country=country, no_phone=no_phone)
         elif c == "schedule":
-            ok, d = check_schedule(rec, schedule, tol_ms, chunk_bytes)
+            ok, d = check_schedule(rec, schedule, tol_ms, chunk_bytes, audio_start)
         elif c == "bytes":
             ok, d = check_bytes(rec, schedule, bytes_tol, chunk_bytes)
         elif c == "eof":
@@ -231,6 +242,7 @@ def main():
     ap.add_argument("--expect-chunks", type=int)
     ap.add_argument("--min-chunks", type=int)
     ap.add_argument("--max-chunks", type=int)
+    ap.add_argument("--audio-start", type=int, help="epoch ms when the far side started sending audio (schedule anchor)")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
     schedule = [int(x) for x in a.schedule.split(",") if x]
@@ -239,7 +251,7 @@ def main():
     results = run_checks(recs, a.vid, checks, schedule=schedule, tol_ms=a.tol_ms, bytes_tol=a.bytes_tol,
                          chunk_bytes=a.chunk_bytes, close_code=a.close_code, phone=a.phone,
                          country=a.country, no_phone=a.no_phone, expect_chunks=a.expect_chunks,
-                         min_chunks=a.min_chunks, max_chunks=a.max_chunks)
+                         min_chunks=a.min_chunks, max_chunks=a.max_chunks, audio_start=a.audio_start)
     ok_all = all(ok for _, ok, _ in results)
     if a.json:
         print(json.dumps({"vid": a.vid, "ok": ok_all,
