@@ -156,6 +156,7 @@ containing `HUMAN`, `MACHINE` or `AMD`. `AMDSTATUS` is `NOTSURE`.
 | Response looks like an error or account message | Contact the AMD service with the VID; the module does not treat error text as a result on purpose. |
 | `sent=` bytes in the end line is much lower than `16000 * elapsed/1000` | The channel delivered little audio (silence suppression, one-way audio). Check the media path. |
 | Happens on every call | The server is accepting connections but not classifying. The `AMD()` fallback does not trigger for `SERVER_TIMEOUT` (it is not an error cause, `amd.py` behaves the same), so consider temporarily routing the campaign to extension 8369. |
+| `${AMDRESPONSE}` is empty (not even an ack) | The server accepted the connection and never replied at all. The module reports this as `SERVER_TIMEOUT` at `timeout_ms`; `amd.py` would have sat in its blocking `recv()` for 10 s and reported `PROCESSING_ERROR` later (see [protocol.md](protocol.md#differences-from-amdpy-july-2026)). Same server-side incident either way. |
 
 ### `AMDCAUSE=NOAUDIODATA-<ms>`
 

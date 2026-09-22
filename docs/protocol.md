@@ -110,6 +110,13 @@ replaced by `?` so the TEXT frame is always valid UTF-8 (RFC 6455 requires it).
   (`amd.py`'s "fallback send").
 - A `send_schedule` with a single value (for example `500`) means plain
   fixed-interval chunks of that length.
+- A single send larger than 16000 bytes (1 s of audio, which only happens
+  when audio piled up during a slow connect) goes out as several binary
+  frames of at most 16000 bytes each, back to back. `amd.py` sends one
+  message of any size; the core's `ast_websocket_write()` copies each frame
+  onto the calling thread's stack (`ast_alloca`), so the module bounds it.
+  The audio is the same; a server that acknowledges per message replies
+  once per piece, and `AMDSTATS` counts the pieces as chunks.
 
 Expected frame sizes with the defaults and continuous 20 ms audio:
 
@@ -304,13 +311,22 @@ both cases. `amd.py` put the server's reply text there, and only on `HUMAN`.
 
 ## Differences from `amd.py` (July 2026)
 
-Bytes on the wire are identical (same config frame incl. `caller_id`, same
+What goes on the wire is the same (same config frame incl. `caller_id`, same
 schedule and fallback sends, same `{"eof":1}` finalisation and cleanup, same
-result words). Behavioural differences:
+result words). The only byte-level differences are in the config frame's
+JSON encoding: `amd.py`'s `json.dumps` writes
+`{"config": {"sample_rate": 8000, "VID": "..."}}` with a space after every
+`:` and `,` and writes non-ASCII characters as `\uXXXX` escapes; the module
+writes the compact form shown above and passes valid UTF-8 through (invalid
+bytes become `?`). Any JSON parser reads both as the same document. Sends
+larger than 16000 bytes are split into several frames (see section 3).
+Behavioural differences:
 
 | Aspect | `amd.py` (EAGI) | `AMD_WS()` |
 |---|---|---|
 | Waiting for the reply | blocks in `recv()` after every send; after the last mark polls 50 ms once a second when idle | never blocks; reads whenever the socket is readable, channel serviced with a bounded wait every iteration |
+| Server stops replying altogether | the blocking `recv()` hits the 10 s socket timeout (`CONNECTION_TIMEOUT` doubles as the read timeout) → `HUMAN` / `PROCESSING_ERROR`, 10 s after the send that got no answer (10.5-19 s into the call) | `NOTSURE` / `SERVER_TIMEOUT` at `timeout_ms` (10 s), as `amd.py` reports a server that acknowledges but never classifies; no `AMD()` fallback line fires for it |
+| DB configuration missing | file unreadable or without `VARDB_` lines: "DB ERROR: no config", no lookup | identical (one NOTICE at load/reload, `amd_ws show settings` says so) |
 | Result matching | `'HUMAN' in text`, then `'AMD' in text or 'MACHINE' in text` | identical, plus the `AMDY` guard |
 | Detection window anchor | its audio loop start | the first captured audio frame |
 | Grace after the window | none | `result_grace_ms`, default 0 |
