@@ -16,6 +16,7 @@
 #
 # Overrides (environment, or on the make command line):
 #     ASTERISK=/path/to/asterisk        the binary to fingerprint (default: the running daemon's image)
+#     ASTERISK_OPTS='-C /etc/asterisk/asterisk.conf'   extra options for 'asterisk -rx' (auto: the daemon's -C)
 #     ASTVERSION=16.30.1-vici           skip version detection
 #     ASTBUILDSUM=<32 hex>              skip AST_BUILDOPT_SUM detection
 #     ASTINCDIR=/path/include           use exactly this include dir (still validated unless ASTNOCHECK=1)
@@ -49,19 +50,24 @@ ad_run()  { timeout "$AST_TIMEOUT" "$@" 2>/dev/null; }     # never hang on a bro
 ast_daemon_pid() {
     # prints the PID of the daemon (not of a remote console), or nothing
     for p in $(pgrep -x asterisk 2>/dev/null); do
-        tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -q -- ' -r' && continue
+        tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | grep -- ' -r' >/dev/null && continue
         printf '%s\n' "$p"; return 0
     done
     return 1
 }
 
+# '-C <file>' of the daemon's command line, so that 'asterisk -rx' reaches a daemon started with a
+# non-default asterisk.conf (its control socket lives wherever that file says)
+ast_ctl_opts_of() { tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | awk '$0 == "-C" { getline f; printf "-C %s", f; exit }'; }
+
 ast_find_binary() {
+    ASTERISK_OPTS=${ASTERISK_OPTS:-}
     [ -n "${ASTERISK:-}" ] && { ASTERISK_SRC=override; return 0; }
     ASTERISK=''; ASTERISK_SRC=''
     p=$(ast_daemon_pid) || p=''
     if [ -n "$p" ]; then
         ASTERISK=$(readlink "/proc/$p/exe" 2>/dev/null | sed 's/ (deleted)$//')
-        [ -n "$ASTERISK" ] && ASTERISK_SRC="running process $p"
+        [ -n "$ASTERISK" ] && { ASTERISK_SRC="running process $p"; ASTERISK_OPTS=$(ast_ctl_opts_of "$p"); }
     fi
     [ -z "$ASTERISK" ] && { ASTERISK=$(command -v asterisk 2>/dev/null); ASTERISK_SRC=PATH; }
     if [ -z "$ASTERISK" ]; then
@@ -76,7 +82,8 @@ ast_find_binary() {
 # rc 0 when a daemon answers the CLI (the only reliable definition of "running")
 ast_running() {
     [ -n "${ASTERISK:-}" ] || ast_find_binary || return 1
-    ad_run "$ASTERISK" -rx 'core show version' | grep -q '^Asterisk '
+    # shellcheck disable=SC2086
+    ad_run "$ASTERISK" ${ASTERISK_OPTS:-} -rx 'core show version' | grep '^Asterisk ' >/dev/null
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -99,7 +106,8 @@ ast_find_version() {
     else
         ASTVERSION=''; ASTVERSION_SRC=unknown
         if [ -n "${ASTERISK:-}" ]; then
-            ASTVERSION=$(ad_run "$ASTERISK" -rx 'core show version' | ast_version_filter); ASTVERSION_SRC="running daemon (core show version)"
+            # shellcheck disable=SC2086
+            ASTVERSION=$(ad_run "$ASTERISK" ${ASTERISK_OPTS:-} -rx 'core show version' | ast_version_filter); ASTVERSION_SRC="running daemon (core show version)"
             if [ -z "$ASTVERSION" ]; then ASTVERSION=$(ad_run "$ASTERISK" -V | ast_version_filter); ASTVERSION_SRC="'$ASTERISK -V' (daemon not running; version on disk)"; fi
             if [ -z "$ASTVERSION" ]; then ASTVERSION=$(ast_version_from_strings "$ASTERISK"); ASTVERSION_SRC="strings(1) on $ASTERISK (binary does not run here)"; fi
             [ -n "$ASTVERSION" ] || ASTVERSION_SRC=unknown
@@ -125,7 +133,8 @@ ast_find_moddir() {
     [ -n "${ASTMODDIR:-}" ] && { ASTMODDIR_SRC=override; return 0; }
     ASTMODDIR=''; ASTMODDIR_SRC=''
     if [ -n "${ASTERISK:-}" ]; then
-        ASTMODDIR=$(ad_run "$ASTERISK" -rx 'core show settings' | sed -n 's/^ *Module directory: *//p' | head -n 1)
+        # shellcheck disable=SC2086
+        ASTMODDIR=$(ad_run "$ASTERISK" ${ASTERISK_OPTS:-} -rx 'core show settings' | sed -n 's/^ *Module directory: *//p' | head -n 1)
         [ -n "$ASTMODDIR" ] && ASTMODDIR_SRC="running daemon (core show settings)"
     fi
     if [ -z "$ASTMODDIR" ]; then
@@ -342,7 +351,7 @@ ast_detect_core() {
     ast_find_version  || ad_warn "cannot determine the Asterisk version${ASTERISK:+ from $ASTERISK}"
     ast_find_moddir   || ad_warn "no Asterisk module directory found (pass ASTMODDIR=/path)"
     ast_find_buildsum || ad_warn "cannot read AST_BUILDOPT_SUM from the core or its modules"
-    ad_log "binary   : ${ASTERISK:-none} ($ASTERISK_SRC)"
+    ad_log "binary   : ${ASTERISK:-none}${ASTERISK_OPTS:+ $ASTERISK_OPTS} ($ASTERISK_SRC)"
     ad_log "version  : ${ASTVERSION:-unknown} (base ${ASTVERBASE:-?}, major ${ASTMAJOR:-?}) via $ASTVERSION_SRC"
     ad_log "buildsum : ${ASTBUILDSUM:-unknown} via $ASTBUILDSUM_SRC"
     ad_log "moddir   : ${ASTMODDIR:-unknown} ($ASTMODDIR_SRC)"
@@ -352,11 +361,11 @@ ast_detect() {
     ast_detect_core
     ast_find_incdir || return 1
     ad_log "headers  : $ASTINCDIR ($ASTINCDIR_SRC)"
-    export ASTERISK ASTVERSION ASTVERBASE ASTMAJOR ASTBUILDSUM ASTMODDIR ASTINCDIR
+    export ASTERISK ASTERISK_OPTS ASTVERSION ASTVERBASE ASTMAJOR ASTBUILDSUM ASTMODDIR ASTINCDIR
     return 0
 }
 
-AST_DETECT_VARS="ASTERISK ASTVERSION ASTVERBASE ASTMAJOR ASTBUILDSUM ASTMODDIR ASTINCDIR ASTERISK_SRC ASTVERSION_SRC ASTBUILDSUM_SRC ASTMODDIR_SRC ASTINCDIR_SRC"
+AST_DETECT_VARS="ASTERISK ASTERISK_OPTS ASTVERSION ASTVERBASE ASTMAJOR ASTBUILDSUM ASTMODDIR ASTINCDIR ASTERISK_SRC ASTVERSION_SRC ASTBUILDSUM_SRC ASTMODDIR_SRC ASTINCDIR_SRC"
 
 ast_print_vars() {   # $1 = sh | make
     for v in $AST_DETECT_VARS; do

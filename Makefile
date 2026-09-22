@@ -198,7 +198,7 @@ uninstall:
 
 # ---- load / unload / reload: 'asterisk -rx' exits 0 whatever happened, so parse the reply ------
 define ast_rx
-$(SHELL) -c 'timeout $(or $(AST_TIMEOUT),5) "$(ASTERISK)" -rx "$(1)" 2>&1'
+$(SHELL) -c 'timeout $(or $(AST_TIMEOUT),5) "$(ASTERISK)" $(ASTERISK_OPTS) -rx "$(1)" 2>&1'
 endef
 ast_status = $(SHELL) -c '$(call ast_rx,module show like $(MODULE)) | awk -v m="$(MODULE).so" '"'"'$$1==m'"'"
 
