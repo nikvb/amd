@@ -207,7 +207,7 @@
 					<para>Raw last server text (printable ASCII only, max 255 chars).</para>
 				</variable>
 				<variable name="AMDELAPSED">
-					<para>Milliseconds from the first captured audio frame to exit.</para>
+					<para>Milliseconds from the first captured audio frame to exit (from application start when no audio was captured).</para>
 				</variable>
 			</variablelist>
 			<para>Always returns 0; the PBX detects hangup itself.</para>
@@ -263,7 +263,7 @@ static const char description[] =
 "               NO_AUDIO_TIMEOUT  timeout_ms elapsed, no audio ever captured\n"
 "               HANGUP            channel hung up before a result\n"
 "  AMDRESPONSE  raw last server text (printable ASCII, max 255 chars)\n"
-"  AMDELAPSED   milliseconds from the first captured audio frame to exit\n"
+"  AMDELAPSED   ms from the first captured audio frame to exit (from start if none)\n"
 "\n"
 "Wire protocol (matches the amdy.io EAGI client): on connect a TEXT frame\n"
 "  {\"config\":{\"sample_rate\":8000,\"VID\":\"<vid>\"[,\"phone\":\"..\"][,\"country_code\":\"..\"]}}\n"
@@ -524,7 +524,7 @@ static int load_config(int reload)
 			ast_log(LOG_WARNING, "AMD_WS: amd_ws.conf: unknown option '%s' at line %d\n", name, v->lineno);
 		}
 		if (!ok) {
-			ast_log(LOG_WARNING, "AMD_WS: amd_ws.conf: invalid value '%s' for '%s' at line %d, keeping default\n",
+			ast_log(LOG_WARNING, "AMD_WS: amd_ws.conf: invalid value '%s' for '%s' at line %d, ignored\n",
 				S_OR(val, ""), name, v->lineno);
 		}
 	}
