@@ -204,7 +204,7 @@ never touched).
    checkout of the branch:
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- -y
+   curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
    ```
 
    It backs up the 1.x module to `app_amd_ws.so.bak.<timestamp>`, builds

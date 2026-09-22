@@ -6,8 +6,11 @@ All notable changes to `app_amd_ws` are documented here. The format follows
 
 ## [Unreleased]
 
-The 2.0.0 rewrite, until it is merged to `main` and tagged (`v2.0.0`; the
-heading then gets its date). Complete rewrite of the module, build system and
+Nothing yet.
+
+## [2.0.0] - 2026-09-21
+
+Complete rewrite of the module, build system and
 installer. Operators upgrading from 1.x: read
 [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md).
 
@@ -97,7 +100,7 @@ vocabulary of their own; see the "was" table in
   three-way mapping 1.x → `amd.py` → 2.0 with the reasons for the two stock
   `AMD()` values.
 
-### Review round 2 (fixes to the unreleased 2.0.0 code)
+### Review round 2 (fixes made during the 2.0.0 pull-request review)
 
 - **Connect cap is per host and configurable** (`max_pending_connects=`,
   default 64, range 8..1024): a server that accepts TCP but never answers the
@@ -354,5 +357,6 @@ MySQL lookup of `phone_number`/`phone_code` from `vicidial_auto_calls` using
 (security and robustness fixes merged 2026-04-01; `/usr/src/asterisk/asterisk-*`
 header search and `./configure` fallback added 2026-04-02).
 
-[Unreleased]: https://github.com/nikvb/amd/compare/main...feat/v2-res-http-websocket
-[1.0.0]: https://github.com/nikvb/amd/tree/main
+[Unreleased]: https://github.com/nikvb/amd/compare/v2.0.0...main
+[2.0.0]: https://github.com/nikvb/amd/compare/5851696...v2.0.0
+[1.0.0]: https://github.com/nikvb/amd/tree/5851696

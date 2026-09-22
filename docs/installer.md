@@ -10,7 +10,7 @@ fails if the embedded copies are stale).
 ## Running it
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
 ```
 
 Or from a checkout: `sudo ./install.sh -y`. Run it as root on the telephony
@@ -194,7 +194,7 @@ recommended (see [migration-v1-to-v2.md](migration-v1-to-v2.md)).
 ## Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- --uninstall
 ```
 
 Unloads the module (softly; refused while in use, exit code 3 in that case,
