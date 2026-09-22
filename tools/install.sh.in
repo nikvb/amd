@@ -14,9 +14,13 @@
 # loaded (in use; activation pending) | 4 no matching Asterisk headers | 5 build/load failed |
 # 6 dependencies missing
 
-set -euo pipefail
+set -Eeuo pipefail
+# -E: the ERR trap (on_err, names the failing line and command) is inherited by functions; without
+# it an unexpected 'set -e' exit inside a function would print nothing but the exit code.
 # NOTE: never 'cmd | grep -q' in a condition here - with pipefail the writer's SIGPIPE makes the
 # pipeline fail although grep matched.  Use 'cmd | grep pattern >/dev/null' (reads all input).
+# Likewise never put a command whose non-zero status carries information (rpm -V, dpkg --verify)
+# in a pipeline: capture its output first ('out=$(cmd || true)'), then test it.
 
 AMD_WS_INSTALLER_VERSION='@@VERSION@@'
 AMD_WS_SOURCE_COMMIT='@@COMMIT@@'
@@ -34,9 +38,20 @@ BUNDLE_URL=${AMD_WS_BUNDLE_URL:-https://download.amdy.io/asterisk-headers}
 CACHE_DIR=${AMD_WS_CACHE_DIR:-/var/cache/app_amd_ws}
 LOG_FILE=${AMD_WS_LOG_FILE:-/var/log/app_amd_ws-install.log}
 ETC_DIR=${AMD_WS_ETCDIR:-/etc/asterisk}
-CURL_OPTS=(-fsSL --connect-timeout 15 --max-time 900)
+# https (or a local file:// mirror) only, never a downgrade redirect; retry transient errors
+CURL_OPTS=(-fsSL --connect-timeout 15 --max-time 900 --retry 3 --retry-delay 2 --proto '=https,file' --proto-redir '=https')
 BUILD_DIR=''
 HEADERS_HOW=''
+CACHE_DIR_TEMP=0        # 1 = CACHE_DIR is a mktemp directory of this run (non-root), removed on exit
+LAST_FETCH_VERIFIED=0   # fetch_verified: 1 when the download matched a published or pinned sha256
+
+# sha256 of source tarballs whose origin publishes no checksum (download.vicidial.com), pinned
+# here so that a mirror or redirect cannot hand us a different file.  Checked before the sidecar.
+declare -A KNOWN_SHA256=(
+    [asterisk-16.30.1-vici.tar.gz]=101c5a005bc20a193726610664af5883e7295fe0a9749ec7cafd37527aa910df
+    [asterisk-18.21.0-vici.tar.gz]=cadf952504cdf924cdbaa3c636cabb997b9a3a521b6d3459df35c39507103bdc
+    [asterisk-16.30.1.tar.gz]=8a91b0f8412d8e3dbd7172c118c52ba4ed4e016696f2778a466db094ec4b8b22
+)
 
 usage() {
     cat <<EOF
@@ -54,7 +69,8 @@ Usage: bash install.sh [options]
   --headers DIR       use this Asterisk include dir (must hold asterisk.h, asterisk/autoconfig.h, buildopts.h)
   --asterisk-src DIR  use this configured+built Asterisk source tree (DIR/include)
   --version VER       Asterisk version to build for when it cannot be detected (e.g. 16.30.1-vici)
-  --allow-configure   permit running ./configure in a downloaded source tree if no autoconfig.h is available
+  --allow-configure   permit running ./configure in a downloaded source tree if no autoconfig.h is
+                      available (only for a tarball whose sha256 was verified or a --tarball-file)
   --bundle-url URL    header bundle base URL (default: $BUNDLE_URL)
   --tarball-file F    use this local Asterisk source tarball instead of downloading one
   --wait N            seconds to wait for a busy module to become idle before giving up (default 30)
@@ -89,8 +105,8 @@ run_logged() {   # run a command, tee its output to the log; rc preserved (pipef
 
 init_log() {
     if ! { : >> "$LOG_FILE"; } 2>/dev/null; then
-        LOG_FILE="${TMPDIR:-/tmp}/app_amd_ws-install.log"
-        { : >> "$LOG_FILE"; } 2>/dev/null || LOG_FILE=/dev/null
+        # not writable (non-root run): a private temporary log, never a predictable /tmp name
+        LOG_FILE=$(mktemp "${TMPDIR:-/tmp}/app_amd_ws-install.XXXXXX.log" 2>/dev/null) || LOG_FILE=/dev/null
     fi
     _logfile "===== install.sh $AMD_WS_INSTALLER_VERSION (commit $AMD_WS_SOURCE_COMMIT) args: $*"
 }
@@ -103,10 +119,13 @@ on_exit() {
     if [ -n "$BUILD_DIR" ] && [ -d "$BUILD_DIR" ]; then
         if [ "$OPT_KEEP_BUILD" = 1 ]; then log "build directory kept: $BUILD_DIR"; else rm -rf "$BUILD_DIR"; fi
     fi
+    if [ "$CACHE_DIR_TEMP" = 1 ] && [ -d "$CACHE_DIR" ]; then
+        if [ "$OPT_KEEP_BUILD" = 1 ]; then log "header cache kept: $CACHE_DIR"; else rm -rf "$CACHE_DIR"; fi
+    fi
     _logfile "===== exit $rc"
     return 0
 }
-on_err() { err "command failed at line $1 (exit $2); see $LOG_FILE"; }
+on_err() { err "command failed at line $1 (exit $2): $3; see $LOG_FILE"; }
 
 # ==============================================================================================
 # embedded ast-detect.sh (identical to the repository file; also written into the build dir)
@@ -132,7 +151,7 @@ detect_distro() {
         DISTRO=$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}/\1/p' /etc/os-release | head -n1)
     fi
     [ -n "$DISTRO" ] || DISTRO=$(uname -sr)
-    if command -v zypper >/dev/null 2>&1 && case " $id $like " in *suse*|*sles*|*opensuse*) true;; *) false;; esac; then PKG=zypper
+    if command -v zypper >/dev/null 2>&1 && case " $id $like " in *suse*|*sles*) true;; *) false;; esac; then PKG=zypper
     elif command -v dnf >/dev/null 2>&1; then PKG=dnf
     elif command -v yum >/dev/null 2>&1; then PKG=yum
     elif command -v apt-get >/dev/null 2>&1; then PKG=apt
@@ -147,8 +166,8 @@ need_pkgs() {          # sets NEED_PKGS (array) from missing commands
     for c in gcc make pkg-config strings tar curl; do
         command -v "$c" >/dev/null 2>&1 && continue
         case $c in
-            gcc) p=gcc;; make) p=make;; tar) p=tar;; curl) p=curl;; strings) p=binutils;;
-            pkg-config) case $PKG in dnf|yum) p=pkgconfig;; *) p=pkg-config;; esac;;
+            gcc) p='gcc';; make) p='make';; tar) p='tar';; curl) p='curl';; strings) p='binutils';;
+            pkg-config) case $PKG in dnf|yum) p='pkgconfig';; *) p='pkg-config';; esac;;
         esac
         NEED_PKGS+=("$p")
     done
@@ -180,7 +199,9 @@ pkg_install() {   # install the given packages; never touches repositories; rc f
         dnf)    run_logged dnf -y install "$@";;
         yum)    run_logged yum -y install "$@";;
         apt)    export DEBIAN_FRONTEND=noninteractive
-                if [ ! -d /var/lib/apt/lists ] || [ -z "$(ls -A /var/lib/apt/lists 2>/dev/null | grep -v lock)" ]; then
+                # no package index at all (fresh install, 'apt-get clean', container): fetch one first;
+                # 'lists/partial' and 'lock' always exist, so test for actual *_Packages index files
+                if ! ls /var/lib/apt/lists/*_Packages* >/dev/null 2>&1; then
                     run_logged apt-get update -qq || warn "apt-get update failed - trying to install from the existing package lists"
                 fi
                 run_logged apt-get install -y --no-install-recommends "$@";;
@@ -243,8 +264,12 @@ resolve_headers() {
 try_devel_package() {
     local bin=${ASTERISK:-} pkg='' evr='' ver=''
     [ -n "$bin" ] && [ -e "$bin" ] || return 1
+    local verify
     if command -v rpm >/dev/null 2>&1 && pkg=$(rpm -qf "$bin" 2>/dev/null) && [ -n "$pkg" ] && [ "${pkg#file }" = "$pkg" ]; then
-        if rpm -Vf "$bin" 2>/dev/null | grep " $bin\$" >/dev/null; then
+        # rpm -V exits 1 whenever ANY file of the package differs, so it must not sit in a pipeline
+        # under pipefail (the pipeline would be false exactly when grep matched): capture, then test
+        verify=$(rpm -Vf "$bin" 2>/dev/null || true)
+        if printf '%s\n' "$verify" | grep " $bin\$" >/dev/null; then
             log "$bin is owned by $pkg but was modified (source build over the package) - not using the distro devel package"; return 1
         fi
         evr=$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$pkg")
@@ -258,7 +283,8 @@ try_devel_package() {
         return 0
     fi
     if command -v dpkg-query >/dev/null 2>&1 && pkg=$(dpkg -S "$bin" 2>/dev/null | sed 's/:.*//;q') && [ -n "$pkg" ]; then
-        if dpkg --verify "$pkg" 2>/dev/null | grep " $bin\$" >/dev/null; then
+        verify=$(dpkg --verify "$pkg" 2>/dev/null || true)
+        if printf '%s\n' "$verify" | grep " $bin\$" >/dev/null; then
             log "$bin belongs to $pkg but was modified (source build over the package) - not using asterisk-dev"; return 1
         fi
         ver=$(dpkg-query -W -f '${Version}' "$pkg" 2>/dev/null)
@@ -271,16 +297,20 @@ try_devel_package() {
     return 1
 }
 
-# pure helpers (stdout = data, no logging): candidate URLs for the running version
+# pure helpers (stdout = data, no logging): candidate URLs for the running version.
+# Bundle and cache names never contain a slash: 'certified/18.9-cert1' -> 'certified-18.9-cert1'
+# (the name tools/make-header-bundle.sh produces); the .version INSIDE a tree keeps the real string.
+bundle_name_version() { printf '%s\n' "${ASTVERSION/certified\//certified-}"; }
 bundle_urls() {
-    local v
-    printf '%s/asterisk-%s-headers.tar.gz\n' "$BUNDLE_URL" "$ASTVERSION"
+    local v bv
+    bv=$(bundle_name_version)
+    printf '%s/asterisk-%s-headers.tar.gz\n' "$BUNDLE_URL" "$bv"
     v=${ASTVERSION#certified/}
     [ -n "${ASTVERBASE:-}" ] && [ "$ASTVERBASE" != "$v" ] && printf '%s/asterisk-%s-headers.tar.gz\n' "$BUNDLE_URL" "$ASTVERBASE"
     return 0
 }
 tarball_urls() {
-    local v=${1:-$ASTVERSION} base=${2:-${ASTVERBASE:-}}
+    local v=$ASTVERSION base=${ASTVERBASE:-}
     case $v in
         *-vici)      printf 'https://download.vicidial.com/required-apps/asterisk-%s.tar.gz\n' "$v";;
         certified/*) printf 'https://downloads.asterisk.org/pub/telephony/certified-asterisk/releases/asterisk-certified-%s.tar.gz\n' "${v#certified/}"
@@ -291,19 +321,29 @@ tarball_urls() {
     printf 'https://downloads.asterisk.org/pub/telephony/asterisk/old-releases/asterisk-%s.tar.gz\n' "$base"
 }
 
-# download $1 to $2; verify against the sidecar checksum $3 (URL, optional, may 404) when present
+# download $1 to $2; verify against the pinned KNOWN_SHA256 entry for its file name, else against the
+# sidecar checksum $3 (URL, optional, may 404) when present.  LAST_FETCH_VERIFIED says which happened.
 fetch_verified() {
-    local url=$1 out=$2 sumurl=${3:-} want have
+    local url=$1 out=$2 sumurl=${3:-} want='' have how=''
+    LAST_FETCH_VERIFIED=0
     log "downloading $url"
     curl "${CURL_OPTS[@]}" -o "$out" "$url" || { rm -f "$out"; return 1; }
-    if [ -n "$sumurl" ]; then
+    if [ -n "${KNOWN_SHA256[${url##*/}]:-}" ]; then
+        want=${KNOWN_SHA256[${url##*/}]}; how="pinned in this installer"
+    elif [ -n "$sumurl" ]; then
         if want=$(curl "${CURL_OPTS[@]}" "$sumurl" 2>/dev/null | awk 'NF{print $1; exit}') && [ -n "$want" ]; then
-            have=$(sha256sum "$out" | cut -c1-64)
-            [ "$have" = "$want" ] || { err "sha256 mismatch for $url (got $have, published $want)"; rm -f "$out"; return 1; }
-            log "sha256 verified ($want)"
+            how="published at $sumurl"
         else
-            log "no checksum published at $sumurl - continuing unverified"
+            want=''
         fi
+    fi
+    if [ -n "$want" ]; then
+        have=$(sha256sum "$out" | cut -c1-64)
+        [ "$have" = "$want" ] || { err "sha256 mismatch for $url (got $have, expected $want, $how)"; rm -f "$out"; return 1; }
+        log "sha256 verified ($want, $how)"
+        LAST_FETCH_VERIFIED=1
+    else
+        log "no checksum published for $url and none pinned - continuing unverified"
     fi
     return 0
 }
@@ -333,21 +373,22 @@ fetch_header_bundle() {
 
 # (4) source tarball, headers only: */include/asterisk.h, */include/asterisk/*.h, */.version
 fetch_tarball_headers() {
-    local tmp='' url got=0 dir ac
-    dir="$CACHE_DIR/asterisk-$ASTVERSION"
+    local tmp='' url got=0 dir ac trusted=0
+    dir="$CACHE_DIR/asterisk-$(bundle_name_version)"
     if [ -n "$OPT_TARBALL_FILE" ]; then
         [ -f "$OPT_TARBALL_FILE" ] || { err "--tarball-file $OPT_TARBALL_FILE: no such file"; return 1; }
-        tmp=$OPT_TARBALL_FILE; got=1; log "using local tarball $tmp"
+        tmp=$OPT_TARBALL_FILE; got=1; trusted=1; log "using local tarball $tmp (supplied by you, taken as trusted)"
     else
         tmp=$(mktemp) || return 1
         while read -r url; do
             [ -n "$url" ] || continue
             case $url in *downloads.asterisk.org*) fetch_verified "$url" "$tmp" "${url%.tar.gz}.sha256" && { got=1; break; };;
-                          *) fetch_verified "$url" "$tmp" '' && { log "(download.vicidial.com publishes no checksums)"; got=1; break; };;
+                          *) fetch_verified "$url" "$tmp" '' && { got=1; break; };;
             esac
             log "not available: $url"
         done < <(tarball_urls)
         [ $got = 1 ] || { rm -f "$tmp"; err "no source tarball found for Asterisk $ASTVERSION (tried: $(tarball_urls | tr '\n' ' '))"; return 1; }
+        trusted=$LAST_FETCH_VERIFIED
     fi
     rm -rf "$dir"; mkdir -p "$dir"
     log "extracting headers only (include/ and .version) into $dir"
@@ -362,8 +403,13 @@ fetch_tarball_headers() {
     elif ac=$(ls "$CACHE_DIR"/asterisk-"${ASTMAJOR:-x}".*/include/asterisk/autoconfig.h 2>/dev/null | head -n1) && [ -n "$ac" ]; then
         log "using autoconfig.h from the cached header bundle $ac (same major version, same platform)"
         cp -p "$ac" "$dir/include/asterisk/autoconfig.h"
-    elif [ "$OPT_ALLOW_CONFIGURE" = 1 ]; then
+    elif [ "$OPT_ALLOW_CONFIGURE" = 1 ] && [ "$trusted" = 1 ]; then
         run_configure "$tmp" "$dir" || { rm -rf "$dir"; [ -n "$OPT_TARBALL_FILE" ] || rm -f "$tmp"; return 1; }
+    elif [ "$OPT_ALLOW_CONFIGURE" = 1 ]; then
+        # ./configure executes code from the tarball as root: never from an unverified download
+        err "--allow-configure refused: the tarball's sha256 could neither be verified against a published checksum nor against one pinned in this installer"
+        err "download it yourself, verify it out of band, then re-run with --tarball-file /path/asterisk-$ASTVERSION.tar.gz --allow-configure"
+        rm -rf "$dir"; rm -f "$tmp"; return 1
     else
         err "the tarball carries no include/asterisk/autoconfig.h (it is generated by ./configure) and no header bundle for Asterisk ${ASTMAJOR:-?}.x is cached"
         err "options: re-run with --allow-configure (runs ./configure in $CACHE_DIR/src; needs gcc-c++, libedit/ncurses, libuuid, jansson >= 2.11, libxml2, sqlite3 -devel packages),"
@@ -378,7 +424,8 @@ fetch_tarball_headers() {
 }
 
 run_configure() {   # $1 = tarball, $2 = header dir to receive autoconfig.h
-    local tb=$1 dir=$2 src="$CACHE_DIR/src-$ASTVERSION"
+    local tb=$1 dir=$2 src
+    src="$CACHE_DIR/src-$(bundle_name_version)"
     rm -rf "$src"; mkdir -p "$src"
     log "--allow-configure: extracting the full source into $src and running ./configure (this takes a minute)"
     tar xzf "$tb" -C "$src" --strip-components=1 || { err "full extraction failed"; return 1; }
@@ -510,6 +557,7 @@ install_module() {
     if old_code_resident; then warn "the daemon still maps a deleted $MODULE.so - the old code may still be resident; a restart will clear it"; fi
     log "module loaded: $(module_row | sed 's/  */ /g')"
     log "application $APP registered: $(ast_rx "core show application $APP" | sed -n "s/.*-= Info about application '$APP' =-.*/ok/p" | head -n1)"
+    log "module version (amd_ws show settings): $(ast_rx 'amd_ws show settings' | sed -n 's/^AMD_WS \([0-9][0-9.]*\).*/\1/p' | head -n1)"
 }
 
 uninstall_module() {
@@ -601,15 +649,21 @@ main() {
     parse_args "$@"
     init_log "$@"
     trap on_exit EXIT
-    trap 'on_err $LINENO $?' ERR
+    trap 'on_err "$LINENO" "$?" "$BASH_COMMAND"' ERR
     detect_distro
     log "app_amd_ws installer $AMD_WS_INSTALLER_VERSION (module commit $AMD_WS_SOURCE_COMMIT) on $DISTRO"
+    [ "$LOG_FILE" = "${AMD_WS_LOG_FILE:-/var/log/app_amd_ws-install.log}" ] || log "log file: $LOG_FILE"
 
     if [ "$(id -u)" != 0 ] && [ "$OPT_DRY_RUN" = 0 ] && [ "$OPT_BUILD_ONLY" = 0 ]; then
         die 2 "run as root (sudo) - only --dry-run and --build-only work without root"
     fi
     if [ "$(id -u)" != 0 ]; then
-        case $CACHE_DIR in /var/cache/*) CACHE_DIR="${TMPDIR:-/tmp}/app_amd_ws-cache-$(id -u)";; esac
+        # non-root: a private, unpredictable cache directory (never a fixed /tmp path another user
+        # could pre-create), removed on exit unless --keep-build
+        case $CACHE_DIR in /var/cache/*)
+            CACHE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/app_amd_ws-cache.XXXXXX") || die 1 "cannot create a temporary cache directory"
+            CACHE_DIR_TEMP=1;;
+        esac
     fi
 
     if [ "$OPT_UNINSTALL" = 1 ]; then uninstall_module; exit $?; fi
@@ -627,6 +681,10 @@ main() {
     else
         install_deps || exit 6
     fi
+    # what could not be read before the toolchain existed (strings(1) from binutils was just
+    # installed on a minimal box): the core's build-option sum and, without a daemon, its version
+    if [ -z "${ASTBUILDSUM:-}" ]; then ast_find_buildsum && log "AST_BUILDOPT_SUM read after installing binutils: $ASTBUILDSUM"; fi
+    if [ -z "${ASTVERSION:-}" ]; then ast_find_version && log "Asterisk version read after installing binutils: $ASTVERSION"; fi
     mkdir -p "$CACHE_DIR" 2>/dev/null || true
 
     if ! resolve_headers; then

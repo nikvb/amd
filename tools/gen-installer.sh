@@ -81,6 +81,9 @@ CONF_SAMPLE=$(resolve amd_ws.conf.sample "$CONF_SAMPLE")
 EOFMARK=__APP_AMD_WS_EMBED_EOF__
 for f in "$MODULE_C" "$MAKEFILE" "$AST_DETECT" "$CONF_SAMPLE"; do
     ! grep -qxF "$EOFMARK" "$f" || die "$f contains the heredoc terminator $EOFMARK"
+    # the heredoc always ends its last line with a newline; a source without one could never be
+    # embedded byte for byte and check-embedded.sh would report it STALE for ever
+    [ "$(tail -c 1 "$f" | od -An -c | tr -d ' ')" = '\n' ] || die "$f must end with a newline (the embedded copy would differ from the source)"
 done
 
 # the inlined library: drop the shebang, keep everything else verbatim

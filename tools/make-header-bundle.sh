@@ -52,8 +52,9 @@ if [ -n "$TARBALL" ]; then
         mkdir -p "$TMP/src"
         tar xzf "$TARBALL" -C "$TMP/src" --strip-components=1
         log "running ./configure (this needs the Asterisk build dependencies)"
-        ( cd "$TMP/src" && ./configure --quiet >"$TMP/configure.log" 2>&1 ) || die "./configure failed - see $TMP/configure.log (not removed)"
-        trap - EXIT
+        # on failure keep the tree so the operator can read configure.log; on success it is removed
+        # with everything else by the EXIT trap
+        ( cd "$TMP/src" && ./configure --quiet >"$TMP/configure.log" 2>&1 ) || { trap - EXIT INT TERM; die "./configure failed - see $TMP/configure.log (not removed)"; }
     else
         log "extracting headers from $TARBALL"
         mkdir -p "$TMP/src"
@@ -68,9 +69,12 @@ fi
 [ -f "$TREE/include/asterisk/autoconfig.h" ] || die "$TREE/include/asterisk/autoconfig.h missing - run ./configure in the tree first (or use --tarball FILE --configure)"
 [ -n "$VER" ] || VER=$(sed -n 1p "$TREE/.version" 2>/dev/null || true)
 [ -n "$VER" ] || die "cannot read $TREE/.version - pass --version <ver>"
-case $VER in */*) die "version '$VER' contains a slash - pass --version, e.g. --version certified-18.9-cert1";; esac
+# Certified builds are 'certified/18.9-cert1' in .version.  The bundle NAME cannot carry a slash, so
+# it uses 'certified-18.9-cert1' (install.sh derives the same name); the .version written INTO the
+# bundle keeps the real string, which is what ast-detect.sh compares with the running version.
+NAMEVER=$(printf '%s' "$VER" | tr '/' '-')
 
-NAME="asterisk-$VER"
+NAME="asterisk-$NAMEVER"
 STAGE="$TMP/stage/$NAME"
 mkdir -p "$STAGE/include/asterisk" "$OUT"
 cp -p "$TREE/include/asterisk.h" "$STAGE/include/"
