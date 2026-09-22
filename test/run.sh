@@ -47,7 +47,9 @@ SOAK_RSS_LIMIT_KB=${SOAK_RSS_LIMIT_KB:-1024}         # allowed RSS growth over t
 # budget) by this integer; lower bounds stay (they catch early exits).
 TEST_SLOW_FACTOR=${TEST_SLOW_FACTOR:-1}
 case "$TEST_SLOW_FACTOR" in ''|*[!0-9]*|0) echo "TEST_SLOW_FACTOR must be a positive integer" >&2; exit 2 ;; esac
-SUITE_BUDGET_S=${SUITE_BUDGET_S:-$((240 * TEST_SLOW_FACTOR))}
+# 300 s: a full run takes ~215 s on the reference box since the July-2026 protocol rows (schedule_full ~10.5 s,
+# eof_human/eof_ack/eof_machine ~3.5 s each, eof_silent ~6.5 s, eof_hangup ~5 s, the classification rows) were added
+SUITE_BUDGET_S=${SUITE_BUDGET_S:-$((300 * TEST_SLOW_FACTOR))}
 
 MODE=full           # full | selftest
 ONLY=""
@@ -155,6 +157,14 @@ has() { grep -q -- "$2" <<<"$1"; }       # has "$haystack" 'regex' (BRE)
 # treat it as binary or stop '.' from matching -> byte semantics, always
 lgrep() { LC_ALL=C grep -a "$@"; }
 hasi() { grep -qi -- "$2" <<<"$1"; }
+# expected AMDCAUSE column: '*' = any, '~REGEX' = grep -E match (e.g. ~^NOAUDIODATA-[0-9]+$), else exact
+cause_matches() { # actual expected
+	case "$2" in
+	'*') return 0 ;;
+	'~'*) grep -qE -- "${2#\~}" <<<"$1" ;;
+	*) [ "$1" = "$2" ] ;;
+	esac
+}
 ast_alive() { local o; o=$(ast_cli 'core show version' 2>/dev/null); has "$o" '^Asterisk'; }
 
 our_asterisk_pids() { # daemons (not -r consoles) started with our asterisk.conf
@@ -271,7 +281,10 @@ gen_sounds() { # dir
 	mkdir -p "$d"
 	[ -s "$d/amd-speech8.wav" ]      || $sx "$d/amd-speech8.wav"      synth 8 sine 200-2600 sine mix 350-1900 tremolo 3.3 70 vol 0.45
 	[ -s "$d/amd-speech1500.wav" ]   || $sx "$d/amd-speech1500.wav"   synth 1.5 sine 200-2600 sine mix 350-1900 tremolo 3.3 70 vol 0.45
+	[ -s "$d/amd-speech1200.wav" ]   || $sx "$d/amd-speech1200.wav"   synth 1.2 sine 200-2600 sine mix 350-1900 tremolo 3.3 70 vol 0.45
+	[ -s "$d/amd-speech12.wav" ]     || $sx "$d/amd-speech12.wav"     synth 12 sine 200-2600 sine mix 350-1900 tremolo 3.3 70 vol 0.45
 	[ -s "$d/amd-beep.wav" ]         || $sx "$d/amd-beep.wav"         synth 0.5 sine 1000 vol 0.4
+	[ -s "$d/amd-beep300.wav" ]      || $sx "$d/amd-beep300.wav"      synth 0.3 sine 1000 vol 0.4
 	[ -s "$d/amd-silence8.wav" ]     || $sx "$d/amd-silence8.wav"     trim 0 8
 	[ -s "$d/amd-prompt.wav" ]       || $sx "$d/amd-prompt.wav"       synth 6 square 440 tremolo 2 90 vol 0.35
 	[ -s "$d/amd-prompt-short.wav" ] || $sx "$d/amd-prompt-short.wav" synth 1 sine 660 vol 0.35
@@ -628,13 +641,28 @@ wait_file_stable() { # file: wait until size stops changing (recording finalised
 	return 1
 }
 
-# result line: VID|AMDSTATUS|AMDCAUSE|AMDELAPSED|T0|T1|TA|R64|CHANNEL
+# result line: VID|AMDSTATUS|C64|AMDELAPSED|T0|T1|TA|R64|CHANNEL|AMDSTATS  (C64/R64 = base64 of "x"+AMDCAUSE/AMDRESPONSE)
 parse_result() {
-	IFS='|' read -r R_VID R_STATUS R_CAUSE R_ELAPSED R_T0 R_T1 R_TA R_R64 R_CHAN <<<"$1"
+	IFS='|' read -r R_VID R_STATUS R_C64 R_ELAPSED R_T0 R_T1 R_TA R_R64 R_CHAN R_STATS <<<"$1"
+	R_CAUSE=$(printf '%s' "$R_C64" | base64 -d 2>/dev/null | cut -c2- || true)
 	R_RESP=$(printf '%s' "$R_R64" | base64 -d 2>/dev/null | cut -c2- || true)
+	R_STATS=$(trim "${R_STATS:-}")
 	R_WALL=""; R_AUDIO=""
 	[[ $R_T0 =~ ^[0-9]+$ && $R_T1 =~ ^[0-9]+$ ]] && R_WALL=$((R_T1 - R_T0))
 	[[ $R_TA =~ ^[0-9]+$ && $R_T1 =~ ^[0-9]+$ ]] && R_AUDIO=$((R_T1 - R_TA))
+}
+
+# AMDSTATS on every AMD_WS exit: <elapsed_ms>-<audio_ms_sent>-<chunks>-<bytes_sent>, all integers (stock app_amd shape);
+# VD_amd.agi takes the first field as run_time, so it must be the module's own AMDELAPSED (+/- 150 ms);
+# audio_ms * 16 == bytes.  Prints a failure text or nothing.
+check_stats() { # -> echoes "" (ok) or the problem
+	local st=$R_STATS el=$R_ELAPSED f1 f2 f3 f4
+	[[ $st =~ ^[0-9]+-[0-9]+-[0-9]+-[0-9]+$ ]] || { echo "AMDSTATS='$st' (want ^[0-9]+-[0-9]+-[0-9]+-[0-9]+$) "; return; }
+	IFS='-' read -r f1 f2 f3 f4 <<<"$st"
+	[[ $el =~ ^[0-9]+$ ]] || { echo "AMDELAPSED='$el' not numeric "; return; }
+	{ [ $((f1 - el)) -le 150 ] && [ $((el - f1)) -le 150 ]; } || { echo "AMDSTATS run_time=$f1 vs AMDELAPSED=$el (want +/-150) "; return; }
+	[ "$f2" = $((f4 / 16)) ] || { echo "AMDSTATS audio_ms=$f2 != bytes=$f4 / 16 "; return; }
+	[ "$f3" -gt 0 ] || [ "$f4" = 0 ] || echo "AMDSTATS chunks=$f3 with bytes=$f4 "
 }
 
 mock_chunks() { # vid -> number of chunks in the mock record (or "none")
@@ -701,7 +729,7 @@ EOF
 }
 
 check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
-	local vid=$1 list=$2 tok checks extra v thr seg st ln pat rc rest toks parts
+	local vid=$1 list=$2 tok checks extra v thr seg st ln pat rc rest toks parts cid_given ph_given
 	A_FAIL=""; A_NOTE=""
 	[ -z "$list" ] && return 0
 	# the module's send schedule is clocked from its first captured frame = when the farside
@@ -719,16 +747,19 @@ check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 			A_NOTE+="$(printf '%s' "$v" | awk '/^PASS schedule/ {sub(/^PASS schedule: chunks at /,""); sub(/ ms after .*/,""); print "sched " $0}' | head -1) "
 			;;
 		proto:*)
-			checks=""; extra=()
+			checks=""; extra=(); cid_given=0; ph_given=0
 			IFS=';' read -r -a parts <<<"${tok#proto:}"
 			for v in "${parts[@]}"; do
 				case "$v" in
-				phone=*) extra+=(--phone "${v#phone=}") ;;
-				country=*) extra+=(--country "${v#country=}") ;;
+				phone=*) extra+=(--phone "${v#phone=}"); ph_given=1 ;;
+				country=*) extra+=(--country "${v#country=}"); ph_given=1 ;;
+				callerid=*) extra+=(--callerid "${v#callerid=}"); cid_given=1 ;;
+				schedule=*) extra+=(--schedule "${v#schedule=}") ;;
 				*) checks+="$v," ;;
 				esac
 			done
-			[ ${#extra[@]} = 0 ] && extra=(--no-phone)
+			[ "$ph_given" = 1 ] || extra+=(--no-phone)
+			[ "$cid_given" = 1 ] || extra+=(--no-callerid)
 			v=$("$PYTHON" "$TESTDIR/protocol_test.py" --record "$LOGDIR/mock-record.jsonl" --vid "$vid" --checks "${checks%,}" "${extra[@]}" "${anchor[@]}" 2>&1); rc=$?
 			printf '%s\n' "$v" >>"$LOGDIR/scenario-$vid.log"
 			[ $rc = 0 ] || A_FAIL+="proto[$(printf '%s' "$v" | grep '^FAIL' | cut -d: -f1 | sed 's/FAIL //' | tr '\n' ' ')] "
@@ -807,7 +838,8 @@ run_call_scenario() { # index [mock-override]
 	local exp_s=${S_STATUS[$i]} exp_c=${S_CAUSE[$i]} min=${S_MIN[$i]} max=$(( S_MAX[$1] * TEST_SLOW_FACTOR ))
 	local vids=() vid line fail="" note="" t_launch0 t_launch1 deadline=$(( max / 1000 + 12 ))
 	# every row whose amdside runs AMD_WS() (ws*: specs, or an app: chain naming it) is an AMD call
-	case "${S_AMD[$i]}" in ws*|*AMD_WS*) AMD_CALLS=$((AMD_CALLS + count)) ;; esac
+	local is_amd=0
+	case "${S_AMD[$i]}" in ws*|*AMD_WS*) AMD_CALLS=$((AMD_CALLS + count)); is_amd=1 ;; esac
 	set_control "$mock"
 	local scen_log
 	if [ "$count" -le 1 ]; then
@@ -831,7 +863,7 @@ run_call_scenario() { # index [mock-override]
 		# 25 parallel 'asterisk -rx' consoles: 70-85 ms on the reference box; the bound only catches a wedged CLI
 		[ $((t_launch1 - t_launch0)) -le $((2500 * TEST_SLOW_FACTOR)) ] || fail+="originates took $((t_launch1 - t_launch0))ms (>$((2500 * TEST_SLOW_FACTOR))) "
 	fi
-	local got=0 wall_max="" el_show="" sc_show="" first_line="" bad_s=0 bad_c=0 bad_t=0 missing=0 example=""
+	local got=0 wall_max="" el_show="" sc_show="" first_line="" bad_s=0 bad_c=0 bad_t=0 bad_st=0 missing=0 example="" v
 	for vid in "${vids[@]}"; do
 		if line=$(wait_result "$vid" "$deadline"); then
 			got=$((got + 1))
@@ -839,7 +871,9 @@ run_call_scenario() { # index [mock-override]
 			parse_result "$line"
 			[ -z "$first_line" ] && first_line=$line
 			if [ "$exp_s" != '*' ] && [ "$R_STATUS" != "$exp_s" ]; then bad_s=$((bad_s + 1)); example=${example:-"$vid status=${R_STATUS:-<empty>}"}; fi
-			if [ "$exp_c" != '*' ] && [ "$R_CAUSE" != "$exp_c" ]; then bad_c=$((bad_c + 1)); example=${example:-"$vid cause=${R_CAUSE:-<empty>}"}; fi
+			if ! cause_matches "$R_CAUSE" "$exp_c"; then bad_c=$((bad_c + 1)); example=${example:-"$vid cause=${R_CAUSE:-<empty>}"}; fi
+			# every AMD_WS exit carries AMDSTATS in the stock app_amd shape, run_time = AMDELAPSED
+			if [ "$is_amd" = 1 ]; then v=$(check_stats); [ -z "$v" ] || { bad_st=$((bad_st + 1)); example=${example:-"$vid $v"}; }; fi
 			if [ -n "$R_WALL" ]; then
 				if [ "$R_WALL" -lt "$min" ] || [ "$R_WALL" -gt "$max" ]; then bad_t=$((bad_t + 1)); example=${example:-"$vid wall=${R_WALL}ms"}; fi
 				[ -z "$wall_max" ] || [ "$R_WALL" -gt "$wall_max" ] && wall_max=$R_WALL
@@ -852,14 +886,16 @@ run_call_scenario() { # index [mock-override]
 	done
 	if [ "$count" -le 1 ]; then
 		[ "$bad_s" = 0 ] || fail+="status=${R_STATUS:-<empty>}(want $exp_s) "
-		[ "$bad_c" = 0 ] || fail+="cause=${R_CAUSE:-<empty>}(want $exp_c) "
+		[ "$bad_c" = 0 ] || fail+="cause='${R_CAUSE:-<empty>}'(want $exp_c) "
 		[ "$bad_t" = 0 ] || fail+="wall=${R_WALL:-?}ms(want $min..$max) "
+		[ "$bad_st" = 0 ] || fail+="$(check_stats)"
 		[ "$missing" = 0 ] || fail+="no result within ${deadline}s "
 	else
 		[ "$missing" = 0 ] || fail+="$missing/$count without result "
 		[ "$bad_s" = 0 ] || fail+="$bad_s/$count wrong status "
 		[ "$bad_c" = 0 ] || fail+="$bad_c/$count wrong cause "
 		[ "$bad_t" = 0 ] || fail+="$bad_t/$count outside $min..${max}ms "
+		[ "$bad_st" = 0 ] || fail+="$bad_st/$count bad AMDSTATS "
 		[ -z "$example" ] || fail+="(e.g. $example) "
 	fi
 	if [ -n "$first_line" ]; then
@@ -867,6 +903,7 @@ run_call_scenario() { # index [mock-override]
 		sc_show="${R_STATUS:-?}/${R_CAUSE:-?}"; el_show=${R_ELAPSED:--}
 		[ -n "$R_AUDIO" ] && note+="audio->end=${R_AUDIO}ms "
 		[ -n "$R_RESP" ] && note+="resp='${R_RESP:0:40}' "
+		[ -n "$R_STATS" ] && note+="stats=$R_STATS "
 	fi
 	[ "$count" -gt 1 ] && note+="results=$got/$count "
 	for vid in "${vids[@]}"; do wait_quiet "$vid" || note+="(channels of $vid lingered) "; done
@@ -908,14 +945,14 @@ run_call_scenario() { # index [mock-override]
 # ---------------------------------------------------------------------------
 check_sounds() {
 	local f missing="" d
-	for f in amd-speech8 amd-speech1500 amd-beep amd-silence8 amd-prompt amd-prompt-short; do
+	for f in amd-speech8 amd-speech1500 amd-speech1200 amd-speech12 amd-beep amd-beep300 amd-silence8 amd-prompt amd-prompt-short; do
 		[ -s "$AST_RUN/var/lib/sounds/en/$f.wav" ] || missing+="$f "
 	done
 	d=$(dur_of "$AST_RUN/var/lib/sounds/en/amd-speech8.wav")
 	if [ -n "$missing" ]; then row FAIL sounds - - - "missing: $missing"
 	elif ! fcmp "$(rms_of "$AST_RUN/var/lib/sounds/en/amd-speech8.wav")" ">" 0.05; then row FAIL sounds - - - "amd-speech8.wav is silent"
 	elif ! fcmp "$(rms_of "$AST_RUN/var/lib/sounds/en/amd-silence8.wav")" "<" 0.001; then row FAIL sounds - - - "amd-silence8.wav is not silent"
-	else row PASS sounds - - - "6 wavs 8 kHz/16-bit, speech8 ${d}s rms=$(rms_of "$AST_RUN/var/lib/sounds/en/amd-speech8.wav"), sox RMS assertion works"
+	else row PASS sounds - - - "9 wavs 8 kHz/16-bit, speech8 ${d}s rms=$(rms_of "$AST_RUN/var/lib/sounds/en/amd-speech8.wav"), sox RMS assertion works"
 	fi
 }
 
@@ -935,14 +972,15 @@ check_mock_paths() {
 		"mc_human|/human?after=3|HUMAN|--timeout 6000|config,schedule,bytes,eof,close,result,chunks|--expect-chunks 4"
 		"mc_machine|/machine?after=2|MACHINE||config,schedule,bytes,eof,close,result,chunks|--expect-chunks 3"
 		"mc_amd|/amd?after=1|MACHINE||config,eof,close,result|"
-		"mc_honeypot|/honeypot?after=1|HONEYPOT||config,eof,close,result|"
+		"mc_amd_detected|/status?value=AMD_DETECTED&after=1|MACHINE||config,eof,close,result|"
+		"mc_honeypot|/honeypot?after=1|NOTSURE|--timeout 1500|config,eof,close,result,chunks|--min-chunks 2"
 		"mc_json|/json?after=1|HUMAN||config,eof,close,result|"
 		"mc_amdy|/amdy?after=3|HUMAN||config,schedule,bytes,eof,close,chunks|--expect-chunks 4"
-		"mc_nothuman|/nothuman?after=2|MACHINE||config,schedule,eof,close,chunks|--expect-chunks 3"
-		"mc_silent|/silent|NOTSURE|--timeout 1500 --grace 300|config,schedule,bytes,eof,close,noresult,chunks|--min-chunks 3"
-		"mc_slow|/slow?handshake=2500|NOTSURE|--connect-timeout 800|-|"
-		"mc_reject|/reject|NOTSURE||-|"
-		"mc_close|/close?after=2|NOTSURE||config,close,noresult,chunks|--close-code 1011 --expect-chunks 2"
+		"mc_nothuman|/nothuman?after=2|HUMAN||config,schedule,eof,close,chunks|--expect-chunks 1"
+		"mc_silent|/silent|NOTSURE|--timeout 1500|config,schedule,bytes,eof,close,noresult,chunks|--min-chunks 2"
+		"mc_slow|/slow?handshake=2500|HUMAN|--connect-timeout 800|-|"
+		"mc_reject|/reject|HUMAN||-|"
+		"mc_close|/close?after=2|HUMAN||config,close,noresult,chunks|--close-code 1011 --expect-chunks 2"
 		"mc_big|/big?after=1|HUMAN||config,eof,close,result|"
 		"mc_fragmented|/fragmented?after=1|HUMAN||config,eof,close,result|"
 		"mc_ping|/ping?after=1|HUMAN||config,eof,close,result|"
@@ -951,6 +989,7 @@ check_mock_paths() {
 		"mc_abort|/human?after=9|NOTSURE|--abort-after 2|config,close,chunks|--close-code 1006 --expect-chunks 2"
 		"mc_phone|/human?after=0|HUMAN|--phone 3135551212 --country 1|config,chunks|--phone 3135551212 --country 1 --expect-chunks 1"
 		"mc_noaudio|/human?after=0|NOTSURE|--no-audio --timeout 800|config,eof,close,chunks|--expect-chunks 0"
+		"mc_eof_human|/eof_human|HUMAN|--timeout 1200 --eof-wait 500|config,eof,close,noresult,chunks|--expect-chunks 2"
 	)
 	set_control "/human?after=1"      # for mc_control (path "/")
 	# the selftest records go to their own file: restart-free by pointing the client at the same server and filtering by vid
@@ -983,9 +1022,18 @@ check_mock_paths() {
 	grep -q '"event":"handshake".*"delay_ms":2500' "$LOGDIR/mock-record.jsonl" || fail+="no handshake record for /slow "
 	grep -q '"event":"handshake".*"rejected":403' "$LOGDIR/mock-record.jsonl" || fail+="no handshake record for /reject "
 	cp "$LOGDIR/mock-record.jsonl" "$rec" 2>/dev/null
-	if [ -z "$fail" ]; then row PASS mock_paths - "$(( $(now_ms) - t0 ))" - "$n client runs (all paths, control file, abort->1006, phone/country) + protocol_test on every record"
+	# /eof_human answers the exit eof of a client that never asked for finalisation: recorded, harmless
+	grep -q '"vid":"mc_eof_human".*"eof_replied":"HUMAN"' "$LOGDIR/mock-record.jsonl" || fail+="/eof_human did not answer the eof "
+	if [ -z "$fail" ]; then row PASS mock_paths - "$(( $(now_ms) - t0 ))" - "$n client runs (all paths incl. /eof_human, control file, abort->1006, phone/country) + protocol_test on every record"
 	else row FAIL mock_paths - "$(( $(now_ms) - t0 ))" - "$fail"
 	fi
+}
+
+check_classify_parity() { # test/classify_test.py: the module's rule vs amd.py's rule, copied verbatim
+	local out rc; out=$("$PYTHON" "$TESTDIR/classify_test.py" 2>&1); rc=$?
+	printf '%s\n' "$out" >"$LOGDIR/classify_test.log"
+	if [ $rc = 0 ]; then row PASS classify_parity - - - "$(printf '%s\n' "$out" | tail -1 | sed 's/^classify_test: //')"
+	else row FAIL classify_parity - - - "$(printf '%s\n' "$out" | grep '^FAIL' | head -1)"; fi
 }
 
 check_cli_application() {
@@ -1010,12 +1058,17 @@ check_cli_settings() {
 		row FAIL cli_show_settings - - - "'amd_ws show settings' is not a CLI command"
 	elif ! has "$out" 'host' || ! has "$out" 'timeout_ms' || ! has "$out" 'connects in flight' || ! has "$out" 'parked connects' || ! has "$out" 'max_pending_connects'; then
 		row FAIL cli_show_settings - - - "output lacks host/timeout_ms/connects in flight/parked connects/max_pending_connects: $(echo "$out" | head -2 | tr '\n' ' ')"
+	elif ! has "$out" '^ *fallback_interval_ms: ' || ! has "$out" '^ *eof_no_audio_streak *: ' || ! has "$out" '^ *eof_wait_ms *: ' || ! has "$out" '^ *send_caller_id *: '; then
+		row FAIL cli_show_settings - - - "output lacks the amd.py Jul-2026 keys fallback_interval_ms/eof_no_audio_streak/eof_wait_ms/send_caller_id"
+	elif ! has "$out" '^ *connection_error *: ' || ! has "$out" '^ *processing_error *: ' || ! has "$out" '^ *fatal_error *: ' \
+	     || ! has "$out" '^ *server_timeout *: ' || ! has "$out" '^ *noaudiodata *: ' || ! has "$out" '^ *eof_inconclusive *: ' || ! has "$out" '^ *eof_error *: '; then
+		row FAIL cli_show_settings - - - "counters must be named after the vocabulary (connection_error/processing_error/fatal_error/server_timeout/noaudiodata/eof_inconclusive/eof_error)"
 	elif ! has "$out" "$want"; then
 		row FAIL cli_show_settings - - - "db line '$dbline' does not match the build (DB_BUILD=$DB_BUILD, want /$want/)"
 	elif ! has "$out" '^ *astguiclient_conf *: .* (read)'; then
 		row FAIL cli_show_settings - - - "astguiclient.conf not reported as read: $(printf '%s\n' "$out" | grep astguiclient | tr -s ' ')"
 	else
-		row PASS cli_show_settings - - - "$(printf '%s\n' "$out" | wc -l) lines; $dbline; astguiclient read; connects in flight / parked connects / max_pending_connects shown"
+		row PASS cli_show_settings - - - "$(printf '%s\n' "$out" | wc -l) lines; $dbline; astguiclient read; Jul-2026 keys, vocabulary counters, connects in flight / parked connects / max_pending_connects shown"
 	fi
 }
 
@@ -1036,7 +1089,7 @@ check_unload_cycle() {
 	if line=$(wait_result "$vid" 12); then
 		parse_result "$line"
 		printf '%s\n' "$line" >>"$LOGDIR/scenario-$vid.log"
-		[ "$R_CAUSE" = AUDIO_TIMEOUT ] && [ "$R_STATUS" = NOTSURE ] || row FAIL unload_probe_result "$R_STATUS/$R_CAUSE" "$R_WALL" "$R_ELAPSED" "probe call did not finish with NOTSURE/AUDIO_TIMEOUT after the refused unload"
+		[ "$R_CAUSE" = SERVER_TIMEOUT ] && [ "$R_STATUS" = NOTSURE ] || row FAIL unload_probe_result "$R_STATUS/$R_CAUSE" "$R_WALL" "$R_ELAPSED" "probe call did not finish with NOTSURE/SERVER_TIMEOUT after the refused unload"
 	else
 		row FAIL unload_probe_result - - - "probe call $vid produced no result"
 	fi
@@ -1069,10 +1122,13 @@ check_unload_cycle() {
 		row FAIL load_again - - - "expected 'Loaded app_amd_ws.so', got '$(echo "$out" | head -1)'"
 	fi
 	# 4. reload re-reads the config: change several keys, reload, read them back from the CLI,
-	#    prove the new extra_statuses token classifies (probe row reload_effect), then restore
+	#    prove them in calls (probe rows reload_effect: send_caller_id=no + 500 ms schedule;
+	#    reload_fallback: the 1000 ms fallback interval after a 1-mark schedule), then restore
 	local ri
 	render_amd_conf -e 's/^timeout_ms *=.*/timeout_ms = 7777/' -e 's/^send_schedule *=.*/send_schedule = 500/' \
-		-e 's/^result_grace_ms *=.*/result_grace_ms = 0/' -e 's/^extra_statuses *=.*/extra_statuses = HONEYPOT,FAS,GOOGLE_VOICE/' \
+		-e 's/^result_grace_ms *=.*/result_grace_ms = 250/' -e 's/^send_caller_id *=.*/send_caller_id = no/' \
+		-e 's/^eof_wait_ms *=.*/eof_wait_ms = 2500/' -e 's/^eof_no_audio_streak *=.*/eof_no_audio_streak = 0/' \
+		-e 's/^fallback_interval_ms *=.*/fallback_interval_ms = 1000/' \
 		-e 's/^db *=.*/db = no/' -e 's/^max_pending_connects *=.*/max_pending_connects = 9/'
 	out=$(ast_cli 'module reload app_amd_ws.so')
 	if hasi "$out" 'error\|No such'; then
@@ -1082,22 +1138,30 @@ check_unload_cycle() {
 		local bad=""
 		has "$st" '^ *timeout_ms *: 7777$' || bad+="timeout_ms "
 		has "$st" '^ *send_schedule *: 500$' || bad+="send_schedule "
-		has "$st" '^ *result_grace_ms *: 0$' || bad+="result_grace_ms "
-		has "$st" '^ *extra_statuses *: HONEYPOT,FAS,GOOGLE_VOICE$' || bad+="extra_statuses "
+		has "$st" '^ *result_grace_ms *: 250$' || bad+="result_grace_ms "
+		has "$st" '^ *send_caller_id *: No' || bad+="send_caller_id "
+		has "$st" '^ *eof_wait_ms *: 2500$' || bad+="eof_wait_ms "
+		has "$st" '^ *eof_no_audio_streak *: 0 (EOF finalisation disabled)$' || bad+="eof_no_audio_streak "
+		has "$st" '^ *fallback_interval_ms: 1000$' || bad+="fallback_interval_ms "
 		has "$st" '^ *db *: No' || bad+="db "
 		has "$st" '^ *max_pending_connects: 9 ' || bad+="max_pending_connects "
-		if [ -z "$bad" ]; then row PASS module_reload - - - "'$(echo "$out" | head -1 | tr -s ' ')'; timeout_ms/send_schedule/result_grace_ms/extra_statuses/db/max_pending_connects re-read"
+		if [ -z "$bad" ]; then row PASS module_reload - - - "'$(echo "$out" | head -1 | tr -s ' ')'; timeout_ms/send_schedule/result_grace_ms/send_caller_id/eof_wait_ms/eof_no_audio_streak/fallback_interval_ms/db/max_pending_connects re-read"
 		else row FAIL module_reload - - - "after reload the CLI still shows the old value(s) of: $bad"; fi
 		if ri=$(scenario_index reload_effect); then
-			log "scenario reload_effect (after module reload: send_schedule=500, extra_statuses=+GOOGLE_VOICE)"
+			log "scenario reload_effect (after module reload: send_schedule=500, send_caller_id=no)"
+			run_call_scenario "$ri"
+		fi
+		if ri=$(scenario_index reload_fallback); then
+			log "scenario reload_fallback (after module reload: send_schedule=500 then the 1000 ms fallback interval)"
 			run_call_scenario "$ri"
 		fi
 	fi
 	render_amd_conf
 	out=$(ast_cli 'module reload app_amd_ws.so')
 	st=$(ast_cli 'amd_ws show settings')
-	has "$st" '^ *timeout_ms *: 10000$' && has "$st" '^ *send_schedule *: 500,1000,1500,2000,3000,4000$' \
-		|| row FAIL module_reload_restore - - - "config not restored after the second reload: $(printf '%s\n' "$st" | grep -E 'timeout_ms|send_schedule' | tr -s ' ' | tr '\n' ';')"
+	has "$st" '^ *timeout_ms *: 10000$' && has "$st" '^ *send_schedule *: 500,1000,1500,2000,3000,4000,5000,6000,7000,8000,9000$' \
+		&& has "$st" '^ *send_caller_id *: Yes' && has "$st" '^ *eof_no_audio_streak *: 2$' \
+		|| row FAIL module_reload_restore - - - "config not restored after the second reload: $(printf '%s\n' "$st" | grep -E 'timeout_ms|send_schedule|send_caller_id|eof_no_audio' | tr -s ' ' | tr '\n' ';')"
 }
 
 # WARNING/ERROR lines the suite provokes on purpose; anything else in the full log is a failure
@@ -1180,7 +1244,8 @@ check_log_lines() { # the two mandatory ast_verb lines exist for EVERY AMD call 
 	# the AMD_WS channel is the Local ;1 leg, except for the not-answered scenario (Dial()ed ;2 leg)
 	local ch='AMD_WS: Local/[0-9]{4}@(farside|amdside)-[a-z0-9_]+-[0-9a-f]+;[12]'
 	n1=$(lgrep -cE "$ch vid=.* host=127\.0\.0\.1:[0-9]+ play=" "$FULL_LOG" 2>/dev/null || true)
-	n2=$(lgrep -cE "$ch status=[A-Z_]+ cause=[A-Z_]+ elapsed=[0-9]+ sent=[0-9]+ chunks=[0-9]+" "$FULL_LOG" 2>/dev/null || true)
+	# cause is a word, NOAUDIODATA-<ms>, or the server's raw reply for MACHINE (may contain spaces/quotes)
+	n2=$(lgrep -cE "$ch status=(HUMAN|MACHINE|NOTSURE|HANGUP) cause=.+ elapsed=[0-9]+ sent=[0-9]+ chunks=[0-9]+" "$FULL_LOG" 2>/dev/null || true)
 	# every channel has exactly one start and one end line
 	nvid=$(lgrep -oE "$ch (vid=|status=)" "$FULL_LOG" 2>/dev/null | sed 's/ vid=$/ S/; s/ status=$/ E/' | sort | uniq -c | awk '$1!=1' | wc -l)
 	if [ "${n1:-0}" = "$AMD_CALLS" ] && [ "${n2:-0}" = "$AMD_CALLS" ] && [ "${nvid:-1}" = 0 ]; then
@@ -1198,9 +1263,9 @@ main() {
 	if [ "$LIST" = 1 ]; then
 		printf '%-20s %-6s %-5s %-18s %-24s %s\n' NAME TAGS COUNT FARSIDE MOCK AMDSIDE
 		local i; for i in "${!S_NAME[@]}"; do printf '%-20s %-6s %-5s %-18s %-24s %s\n' "${S_NAME[$i]}" "${S_TAGS[$i]}" "${S_COUNT[$i]}" "${S_FAR[$i]}" "${S_MOCK[$i]}" "${S_AMD[$i]}"; done
-		echo "checks (also accepted by --only): sounds no_listeners mock_paths log_noise (self, run in both modes);"
+		echo "checks (also accepted by --only): sounds no_listeners classify_parity mock_paths log_noise (self, run in both modes);"
 		echo "  cli_show_application cli_show_settings soak_fd_rss log_lines blackhole_release (amd);"
-		echo "  unload_busy = the unload/reload cycle: rows unload_busy_refused unload_idle load_again module_reload + probe reload_effect (amd)"
+		echo "  unload_busy = the unload/reload cycle: rows unload_busy_refused unload_idle load_again module_reload + probes reload_effect, reload_fallback (amd)"
 		echo "always: build_nomysql build_mysql (full mode), shutdown_clean"
 		exit 0
 	fi
@@ -1234,6 +1299,7 @@ main() {
 	local o
 	selected sounds && check_sounds
 	selected no_listeners && check_no_listeners
+	selected classify_parity && check_classify_parity
 	if [ "$MODE" = full ] && [ "$MODULE_AVAILABLE" = 1 ]; then
 		o=$(ast_cli 'module show like app_amd_ws'); has "$o" '1 modules loaded' || { row FAIL module_loaded - - - "app_amd_ws.so not loaded: $(grep -i 'app_amd_ws' "$FULL_LOG" | grep -iE 'error|undefined|refus|decline' | head -2 | tr '\n' ' ')"; }
 		selected cli_show_application && check_cli_application

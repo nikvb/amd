@@ -8,7 +8,7 @@ gives the handshake read no timeout, so the module's connect helper thread
 stays parked until this process exits (the kernel then sends FIN).  The
 harness uses it to prove:
 
-  * AMD_WS() itself returns NETERR at connect_timeout_ms (the PBX thread never
+  * AMD_WS() itself returns HUMAN/CONNECTION_ERROR at connect_timeout_ms (the PBX thread never
     waits for the helper),
   * 'amd_ws show settings' counts the parked helper under "connects in flight",
   * max_pending_connects makes further calls to that host fail fast,

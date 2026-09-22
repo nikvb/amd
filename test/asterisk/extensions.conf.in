@@ -14,11 +14,13 @@
 ;   scenario name must never be part of a pattern).
 ;
 ; Results line (one per call, appended to ${RESULTS}):
-;   VID|AMDSTATUS|AMDCAUSE|AMDELAPSED|T0|T1|TA|base64("x"+AMDRESPONSE)|CHANNEL
+;   VID|AMDSTATUS|base64("x"+AMDCAUSE)|AMDELAPSED|T0|T1|TA|base64("x"+AMDRESPONSE)|CHANNEL|AMDSTATS
 ;   T0 = ms epoch just before the application, T1 = just after it returned
 ;   (or at hangup), TA = ms epoch when the farside started sending audio.
-;   AMDRESPONSE is base64 encoded because it may contain quotes/JSON; the
-;   leading "x" keeps BASE64_ENCODE happy when the variable is empty.
+;   AMDCAUSE (for MACHINE it is the server's raw reply, e.g. JSON with quotes)
+;   and AMDRESPONSE are base64 encoded so that quotes/JSON cannot break the
+;   System(echo ...); the leading "x" keeps BASE64_ENCODE happy when the
+;   variable is empty.  AMDSTATS is <elapsed>-<audio_ms>-<chunks>-<bytes>.
 
 [globals]
 RESULTS = @RESULTS@
@@ -56,6 +58,54 @@ exten => s,1,Answer()
  same => n,StopMixMonitor()
  same => n,Return()
 
+; 12 s of speech: outlasts the 11-mark schedule (500..9000 ms) so the
+; post-schedule fallback sends (8000 B / 1000 ms rule) can be observed
+[fs-speech12]
+exten => s,1,Answer()
+ same => n,Set(GLOBAL(TA_${ARG1})=${STRFTIME(,,%s%3q)})
+ same => n,Playback(amd-speech12)
+ same => n,Wait(2)
+ same => n,Return()
+
+; 1.2 s of speech, then stays up WITHOUT sending a frame (no generator on the
+; leg, transmit_silence=no): the EOF finalisation case of amd.py - two schedule
+; marks pass with nothing to send after audio was sent
+[fs-speech1200-hold]
+exten => s,1,Answer()
+ same => n,Set(GLOBAL(TA_${ARG1})=${STRFTIME(,,%s%3q)})
+ same => n,Playback(amd-speech1200)
+ same => n,Wait(12)
+ same => n,Return()
+
+; 1.2 s of speech, silent for 3.3 s, then hangs up: a hangup INSIDE the EOF
+; finalisation wait (which starts at the 3000 ms mark)
+[fs-speech1200-hangup]
+exten => s,1,Answer()
+ same => n,Set(GLOBAL(TA_${ARG1})=${STRFTIME(,,%s%3q)})
+ same => n,Playback(amd-speech1200)
+ same => n,Wait(3.3)
+ same => n,Return()
+
+; sparse audio: 0.3 s beeps 0.5 s apart (4800 B per beep, less than
+; chunk_bytes): after the schedule the module must send on the
+; fallback_interval_ms clock, not on the chunk_bytes one
+[fs-beeps]
+exten => s,1,Answer()
+ same => n,Set(GLOBAL(TA_${ARG1})=${STRFTIME(,,%s%3q)})
+ same => n,Playback(amd-beep300)
+ same => n,Wait(0.5)
+ same => n,Playback(amd-beep300)
+ same => n,Wait(0.5)
+ same => n,Playback(amd-beep300)
+ same => n,Wait(0.5)
+ same => n,Playback(amd-beep300)
+ same => n,Wait(0.5)
+ same => n,Playback(amd-beep300)
+ same => n,Wait(0.5)
+ same => n,Playback(amd-beep300)
+ same => n,Wait(2)
+ same => n,Return()
+
 ; 1.5 s of speech then hang up: the callee hangs up mid-detection
 [fs-speech1500-hangup]
 exten => s,1,Answer()
@@ -84,7 +134,7 @@ exten => s,1,Answer()
  same => n,Return()
 
 ; does NOT answer; dials the amdside as a fresh, un-answered Local leg
-; (for option A: AMD_WS must refuse with INTERR instead of answering)
+; (for option A: AMD_WS must refuse with HUMAN/FATAL_ERROR instead of answering)
 [fs-dial-noanswer]
 exten => s,1,Dial(Local/${ARG3}@amdside-${ARG2}/n,20)
  same => n,Return()
@@ -96,8 +146,9 @@ exten => s,1,Dial(Local/${ARG3}@amdside-${ARG2}/n,20)
 exten => s,1,NoOp(write-result ${VID} status=${AMDSTATUS} cause=${AMDCAUSE})
  same => n,Set(T1=${IF($[${LEN(${T1})} = 0]?${STRFTIME(,,%s%3q)}:${T1})})
  same => n,Set(TA=${GLOBAL(TA_${VID})})
+ same => n,Set(C64=${BASE64_ENCODE(x${AMDCAUSE})})
  same => n,Set(R64=${BASE64_ENCODE(x${AMDRESPONSE})})
- same => n,System(echo "${VID}|${AMDSTATUS}|${AMDCAUSE}|${AMDELAPSED}|${T0}|${T1}|${TA}|${R64}|${CHANNEL}" >> ${RESULTS})
+ same => n,System(echo "${VID}|${AMDSTATUS}|${C64}|${AMDELAPSED}|${T0}|${T1}|${TA}|${R64}|${CHANNEL}|${AMDSTATS}" >> ${RESULTS})
  same => n,Return()
 
 ; ---------------------------------------------------------------------------
