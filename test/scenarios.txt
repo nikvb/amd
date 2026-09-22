@@ -15,6 +15,7 @@
 #  amdside  what the amdside runs between the T0/T1 timestamps:
 #           ws:<timeout_ms>,<playfile>,<options>   -> AMD_WS(127.0.0.1,${MOCK_PORT},${VID},<...>)
 #           wsdead:<timeout_ms>,<playfile>,<options> -> same but ${DEAD_PORT} (nothing listens)
+#           wstls:<timeout_ms>,<playfile>,<options>  -> same but ${TLS_PORT} (wss mock; put 's' in the options; SKIP without openssl)
 #           wsraw:<full argument string>            -> AMD_WS(<full argument string>)
 #           app:App1(args) && App2(args) ...        -> those dialplan applications verbatim
 #  post     dialplan apps to run after amdside returned, before Hangup ('-' = none)
@@ -80,6 +81,8 @@ opt_p_k            | amd   | 1     | speech8            | /human?after=1        
 opt_a_unanswered   | amd   | 1     | dial-noanswer      | /human?after=1           | ws:8000,,A                                | -         | NOTSURE  | INTERR           | 0      | 1000   | noconn
 bad_port_default   | amd   | 1     | speech8            | /human?after=1           | wsraw:127.0.0.1,notaport,${VID},8000      | -         | HUMAN    | HUMAN            | 800    | 2200   | proto,log~AMD_WS.*port
 default_vid        | amd   | 1     | speech8            | /human?after=1           | app:Set(CALLERID(name)=${VID}) && AMD_WS(127.0.0.1,${MOCK_PORT},,8000) | - | HUMAN | HUMAN | 800 | 2200 | proto
+tls_human          | amd   | 1     | speech8            | /human?after=2           | wstls:8000,,s                             | -         | HUMAN    | HUMAN            | 1300   | 2700   | proto,chunks=3,log~AMD_WS: .*vid=%VID% host=127\.0\.0\.1:
+tls_to_plain       | amd   | 1     | speech8            | /human?after=1           | ws:8000,,s                                | -         | NOTSURE  | NETERR           | 0      | 2500   | noconn
 concurrent         | amd   | 25    | speech8            | /human?after=3           | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 1800   | 6000   | alive
 # ---------------- probe used by the unload/reload checks (not run on its own) -------------------------------------------------------------------------------------------------------
 unload_probe       | probe | 1     | speech8            | /silent                  | ws:5000,,                                 | -         | *        | *                | 0      | 99999  |

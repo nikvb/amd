@@ -50,6 +50,7 @@ import asyncio
 import json
 import os
 import signal
+import ssl
 import sys
 import time
 from http import HTTPStatus
@@ -198,9 +199,9 @@ async def handler(ws):
     nchunks = 0
     log("connection %s -> %s beh=%s" % (rec["remote"], effective, beh))
 
-    async def reply(text):
-        if reply_delay:
-            await asyncio.sleep(reply_delay / 1000.0)
+    pending = []   # delayed replies run as tasks so the receive loop keeps consuming eof/close
+
+    async def send_reply(text):
         if do_ping:
             try:
                 await ws.ping()
@@ -213,6 +214,21 @@ async def handler(ws):
         else:
             await ws.send(text)
         rec["replies"].append({"t": ms(), "text": text if len(text) <= 300 else text[:60] + "...(%d bytes)" % len(text)})
+
+    async def delayed_reply(text):
+        await asyncio.sleep(reply_delay / 1000.0)
+        try:
+            await send_reply(text)
+        except websockets.exceptions.ConnectionClosed:
+            log("delayed reply dropped: client already closed")
+
+    async def reply(text):
+        # /delay: the reply is late but the server must keep READING meanwhile (a real server
+        # does); sleeping inline would miss the client's eof/close and mis-record the session
+        if reply_delay:
+            pending.append(asyncio.ensure_future(delayed_reply(text)))
+        else:
+            await send_reply(text)
 
     try:
         async for msg in ws:
@@ -263,6 +279,11 @@ async def handler(ws):
     except Exception as exc:  # noqa: BLE001
         rec["error"] = "%s: %s" % (type(exc).__name__, exc)
     finally:
+        for t in pending:
+            try:
+                await t
+            except Exception:  # noqa: BLE001
+                pass
         try:
             await ws.wait_closed()
         except Exception:  # noqa: BLE001
@@ -288,6 +309,10 @@ async def main_async():
         max_size=4 * 1024 * 1024,
         close_timeout=2,
     )
+    if ARGS.tls_cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(ARGS.tls_cert, ARGS.tls_key or ARGS.tls_cert)
+        kwargs["ssl"] = ctx
     async with websockets.serve(handler, ARGS.host, ARGS.port, **kwargs) as server:
         port = server.sockets[0].getsockname()[1]
         if ARGS.port_file:
@@ -296,8 +321,8 @@ async def main_async():
             os.replace(ARGS.port_file + ".tmp", ARGS.port_file)
         sys.stdout.write("MOCK_PORT=%d\n" % port)
         sys.stdout.flush()
-        log("listening on %s:%d record=%s control=%s default=%s"
-            % (ARGS.host, port, ARGS.record, ARGS.control, ARGS.default))
+        log("listening on %s:%d (%s) record=%s control=%s default=%s"
+            % (ARGS.host, port, "wss" if ARGS.tls_cert else "ws", ARGS.record, ARGS.control, ARGS.default))
         await stop
     if RECORD_FH:
         RECORD_FH.close()
@@ -312,6 +337,8 @@ def main():
     ap.add_argument("--control", help="file whose first line is the effective path for requests to '/'")
     ap.add_argument("--default", default=DEFAULT_PATH, help="effective path when no control file/line")
     ap.add_argument("--port-file", help="also write the bound port to this file")
+    ap.add_argument("--tls-cert", help="serve wss:// with this PEM certificate (chain)")
+    ap.add_argument("--tls-key", help="PEM private key for --tls-cert (default: in the cert file)")
     ap.add_argument("--ping-interval", type=float, default=None,
                     help="server keepalive ping interval in s (default: none)")
     ap.add_argument("-v", "--verbose", action="store_true")

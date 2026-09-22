@@ -12,7 +12,7 @@ scenario is [`test/README.md`](../test/README.md); this page is the overview.
 |---|---|
 | `test/run.sh` | The harness: builds the module twice (`make MYSQL=0`, then `make MYSQL=1 ...`; the DB build is the one under test), starts the mock server and a private Asterisk instance, originates one `Local/<NNNN>@farside-<scenario>` → `<NNNN>@amdside-<scenario>` call per scenario row, waits for the result line, asserts, prints a PASS/FAIL table and exits `0` (all pass), `1` (a failure) or `2` (harness problem). |
 | `test/scenarios.txt` | Data-driven scenario table: one `\|`-separated line per call (far-side behaviour, mock behaviour, `AMD_WS()` arguments, expected `AMDSTATUS`/`AMDCAUSE`, wall-clock bounds, assertions). Adding a test is adding a line. |
-| `test/mock_amd_server.py` | Python 3 `asyncio` WebSocket server (`websockets` 12) speaking the `amd.py` protocol. Behaviour is selected by URL path or, because the module always connects to `/`, by a control file that `run.sh` rewrites before every call. Records, per connection, the config JSON, every chunk's size and arrival time, total bytes, replies, `{"eof":1}` and the close code as JSON lines. |
+| `test/mock_amd_server.py` | Python 3 `asyncio` WebSocket server (`websockets` 12) speaking the `amd.py` protocol; `--tls-cert/--tls-key` make it serve `wss://` (`run.sh` starts a second, TLS instance). Behaviour is selected by URL path or, because the module always connects to `/`, by a control file that `run.sh` rewrites before every call. Records, per connection, the config JSON, every chunk's size and arrival time, total bytes, replies, `{"eof":1}` and the close code as JSON lines. |
 | `test/protocol_test.py` | Assertions over those recordings: config JSON shape (with/without `phone`/`country_code`), chunk schedule (anchored on the first captured frame, ± 150 ms), bytes per chunk and total (16 000 B/s ± 10 %), `eof`, close code. |
 | `test/mock_client.py` | An `amd.py`-like client used to test the mock itself (`mock_paths` check). |
 | `test/asterisk/` | Configuration templates for the private Asterisk: `asterisk.conf` (all directories under `test/run/`), `modules.conf` (`autoload=no` + explicit loads), `logger.conf` (full log, verbose 3, debug 1), `extensions.conf.in` (far-side behaviours and the result writer), `amd_ws.conf.in`, `astguiclient.conf.in` (deliberately messy syntax, dead DB port). The module directory is a directory of symlinks to the system modules plus the freshly built `app_amd_ws.so`. |
@@ -93,10 +93,12 @@ Names are the rows of `test/scenarios.txt` and the checks of `run.sh`
 | `opt_p_k` | `HUMAN` | `p()`/`k()` appear as `phone`/`country_code` in the config JSON. |
 | `opt_a_unanswered` | `NOTSURE` / `INTERR` in 0 ms | Option `A` on a not-Up channel refuses instead of answering. |
 | `bad_port_default`, `default_vid` | `HUMAN` | Invalid port → warning + configured default; VID defaults to `CALLERID(name)`. |
+| `tls_human` | `HUMAN` | Option `s`: `wss://` to a second mock instance with a self-signed certificate, verified through `tls_cafile` (chain verification on). Skipped without `openssl`. |
+| `tls_to_plain` | `NOTSURE` / `NETERR` in ~20 ms | Option `s` against the plaintext port fails fast instead of hanging. |
 | `concurrent` | 25 × `HUMAN` | 25 simultaneous calls, all results, Asterisk alive. |
 | `soak_fd_rss` | — | 100 warm-up + 200 measured calls in bursts of 25: the daemon's fd count does not grow, RSS grows less than 1 MB (the test daemon runs with `MALLOC_ARENA_MAX=1` so RSS reflects live allocations rather than per-thread arena high-water marks). |
 | `log_lines` | — | The two mandatory verbose lines exist for every call. |
-| `log_noise` | — | Every `WARNING`/`ERROR` in the Asterisk log matches an allow-list of intentionally provoked lines (unload busy, bad port, option `A`, connect refused/timeout, 403, dead DB). |
+| `log_noise` | — | Every `WARNING`/`ERROR` in the Asterisk log matches an allow-list of intentionally provoked lines (unload busy, bad port, option `A`, connect refused/timeout, 403, TLS to the plain port, dead DB). |
 | `cli_show_application`, `cli_show_settings` | — | `core show application AMD_WS` and `amd_ws show settings` are useful. |
 | `unload_busy_refused`, `unload_idle`, `load_again`, `module_reload` | — | Unload refused while a call is inside `AMD_WS()`, succeeds when idle, module works after load, `module reload` succeeds. |
 | `build_nomysql`, `build_mysql` | — | `make MYSQL=0` and `make MYSQL=1 ...` both build and pass the Makefile gates. |

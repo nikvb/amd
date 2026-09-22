@@ -176,10 +176,12 @@ AMD_WS (need the built module):
 | `opt_a_unanswered` | NOTSURE/INTERR | option `A` on a not-Up channel refuses instead of answering |
 | `bad_port_default` | HUMAN | invalid port -> warning + conf default |
 | `default_vid` | HUMAN | vid defaults to CALLERID(name) |
+| `tls_human` | HUMAN | option `s` -> `wss://` to a second mock instance with a self-signed certificate; `tls_verify=yes` with `tls_cafile=<that cert>` (chain verification on, hostname check off as on Asterisk 16). SKIP when `openssl` is missing |
+| `tls_to_plain` | NOTSURE/NETERR fast | option `s` against the plaintext mock port: the TLS handshake fails, no hang, no connection record |
 | `concurrent` | 25 x HUMAN | 25 simultaneous calls, all results, Asterisk alive |
 | `soak_fd_rss` | - | 100 warm-up + 200 measured calls (bursts of 25 through the `soak` probe row): the daemon's fd count must not grow, RSS must grow < `SOAK_RSS_LIMIT_KB` (1024). The test daemon runs with `MALLOC_ARENA_MAX=1` so RSS tracks live allocations instead of per-thread malloc arena high-water marks (measured here: default malloc +3 MB/200 calls and still creeping, one arena +136 kB and flat) |
 | `log_lines` | - | the SPEC section 6 start/end verbose lines exist |
-| `log_noise` | - | every WARNING/ERROR line in the Asterisk log matches `LOG_NOISE_ALLOW` in run.sh (intentionally provoked: unload busy, bad port, option A, connect refused/timeout, HTTP 403, dead DB); anything else fails, listed in `log-noise-unexpected.txt` |
+| `log_noise` | - | every WARNING/ERROR line in the Asterisk log matches `LOG_NOISE_ALLOW` in run.sh (intentionally provoked: unload busy, bad port, option A, connect refused/timeout, HTTP 403, TLS to the plain port, dead DB); anything else fails, listed in `log-noise-unexpected.txt` |
 | `cli_show_application`, `cli_show_settings` | - | `core show application AMD_WS` and `amd_ws show settings` are useful |
 | `unload_busy_refused`, `unload_idle`, `load_again`, `module_reload` | - | unload refused while a call is inside AMD_WS, succeeds when idle, module works after reload |
 | `build_nomysql`, `build_mysql` | - | `make MYSQL=0` and `make MYSQL=1 ...` both build; no undefined non-Asterisk symbols |
@@ -191,7 +193,10 @@ AMD_WS (need the built module):
   files. `LD_LIBRARY_PATH` for the test Asterisk then includes the staged
   `libmariadb.so.3` directory. The final `.so` under test is the MySQL build.
 * The test `amd_ws.conf` (rendered from `asterisk/amd_ws.conf.in`) uses
-  `connect_timeout_ms=2000`, `result_grace_ms=1000`, the default schedule and
+  `connect_timeout_ms=2000`, `result_grace_ms=1000`, the default schedule,
+  `tls_cafile=<run>/etc/tls.crt` (the wss mock's self-signed certificate,
+  generated per run with `openssl req -x509`; a second mock instance serves
+  `wss://` on `TLS_PORT`) and
   `astguiclient_conf=<run>/etc/astguiclient.conf`, which points VARDB_* at
   `127.0.0.1:<dead port>` with deliberately messy syntax (tabs, comments,
   `=>` in a value). Never the real DB credentials.

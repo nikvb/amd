@@ -123,6 +123,8 @@ fi
 AST_PID=""
 MOCK_PID=""
 MOCK_PORT=""
+MOCK_TLS_PID=""
+TLS_PORT=""        # wss:// mock (empty when openssl is missing -> TLS scenarios SKIP)
 DEAD_PORT=""
 DB_PORT=""
 FULL_LOG=""
@@ -232,6 +234,7 @@ gen_dialplan() { # appends per-scenario [farside-<name>] / [amdside-<name>] cont
 			case "$amd" in
 			ws:*)     echo " same => n,AMD_WS(127.0.0.1,\${MOCK_PORT},\${VID},${amd#ws:})" ;;
 			wsdead:*) echo " same => n,AMD_WS(127.0.0.1,\${DEAD_PORT},\${VID},${amd#wsdead:})" ;;
+			wstls:*)  echo " same => n,AMD_WS(127.0.0.1,\${TLS_PORT},\${VID},${amd#wstls:})" ;;
 			wsraw:*)  echo " same => n,AMD_WS(${amd#wsraw:})" ;;
 			app:*)    emit_apps "${amd#app:}" ;;
 			*) die "scenario $name: bad amdside spec '$amd'" ;;
@@ -399,7 +402,7 @@ prepare_rundir() {
 
 render_dialplan() { # needs MOCK_PORT
 	sed -e "s|@RESULTS@|$RESULTS|g" -e "s|@REC@|$REC|g" -e "s|@MOCK_PORT@|$MOCK_PORT|g" -e "s|@DEAD_PORT@|$DEAD_PORT|g" \
-		"$TESTDIR/asterisk/extensions.conf.in" >"$AST_RUN/etc/extensions.conf"
+		-e "s|@TLS_PORT@|${TLS_PORT:-$DEAD_PORT}|g" "$TESTDIR/asterisk/extensions.conf.in" >"$AST_RUN/etc/extensions.conf"
 	gen_dialplan "$AST_RUN/etc/extensions.conf"
 	sed -e "s|@RUN@|$AST_RUN|g" -e "s|@MOCK_PORT@|$MOCK_PORT|g" -e "s|@DBPORT@|$DB_PORT|g" "$TESTDIR/asterisk/amd_ws.conf.in" >"$AST_RUN/etc/amd_ws.conf"
 }
@@ -414,6 +417,20 @@ start_mock() {
 	[ -s "$RUN/mock.port" ] || die "mock server did not start (see $LOGDIR/mock.log)"
 	MOCK_PORT=$(cat "$RUN/mock.port")
 	log "mock server pid=$MOCK_PID port=$MOCK_PORT dead_port=$DEAD_PORT db_port=$DB_PORT"
+	# second instance speaking wss:// with a self-signed certificate the module verifies via tls_cafile
+	if command -v openssl >/dev/null 2>&1 && openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj '/CN=127.0.0.1' \
+	     -addext 'subjectAltName=IP:127.0.0.1' -keyout "$AST_RUN/etc/tls.key" -out "$AST_RUN/etc/tls.crt" >/dev/null 2>&1; then
+		rm -f "$RUN/mock-tls.port"
+		"$PYTHON" "$TESTDIR/mock_amd_server.py" --port 0 --record "$LOGDIR/mock-record.jsonl" --control "$CONTROL" \
+			--tls-cert "$AST_RUN/etc/tls.crt" --tls-key "$AST_RUN/etc/tls.key" \
+			--port-file "$RUN/mock-tls.port" -v >"$LOGDIR/mock-tls.out" 2>"$LOGDIR/mock-tls.log" &
+		MOCK_TLS_PID=$!
+		for i in $(seq 1 100); do [ -s "$RUN/mock-tls.port" ] && break; sleep 0.1; done
+		if [ -s "$RUN/mock-tls.port" ]; then TLS_PORT=$(cat "$RUN/mock-tls.port"); log "wss mock pid=$MOCK_TLS_PID port=$TLS_PORT cert=$AST_RUN/etc/tls.crt"
+		else log "wss mock did not start (see $LOGDIR/mock-tls.log); TLS scenarios will be skipped"; kill "$MOCK_TLS_PID" 2>/dev/null || true; MOCK_TLS_PID=""; fi
+	else
+		log "openssl not available: TLS scenarios will be skipped"
+	fi
 }
 
 stop_stale_asterisk() {
@@ -477,19 +494,22 @@ stop_asterisk() {
 }
 
 stop_mock() {
-	[ -n "$MOCK_PID" ] || return 0
-	kill "$MOCK_PID" 2>/dev/null || true
-	wait "$MOCK_PID" 2>/dev/null || true
-	MOCK_PID=""
+	local p
+	for p in "$MOCK_PID" "$MOCK_TLS_PID"; do
+		[ -n "$p" ] || continue
+		kill "$p" 2>/dev/null || true
+		wait "$p" 2>/dev/null || true
+	done
+	MOCK_PID=""; MOCK_TLS_PID=""
 }
 
 cleanup() {
 	local rc=$?
 	trap - EXIT
 	if [ "$KEEP" = 1 ] && [ -n "$AST_PID" ]; then
-		log "--keep: asterisk pid $AST_PID and mock pid $MOCK_PID left running"
+		log "--keep: asterisk pid $AST_PID and mock pid(s) $MOCK_PID $MOCK_TLS_PID left running"
 		log "  console: LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH $ASTERISK_BIN -C $AST_CONF -r"
-		log "  stop:    LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH $ASTERISK_BIN -C $AST_CONF -rx 'core stop now'; kill $MOCK_PID"
+		log "  stop:    LD_LIBRARY_PATH=$AST_LD_LIBRARY_PATH $ASTERISK_BIN -C $AST_CONF -rx 'core stop now'; kill $MOCK_PID $MOCK_TLS_PID"
 		log "  mock control file: $CONTROL (write e.g. /human?after=2), results: $RESULTS"
 	else
 		stop_asterisk
@@ -823,8 +843,10 @@ check_mock_paths() {
 		[ "$got" = "$exp" ] || fail+="$name:client=$got(want $exp) "
 		if [ "$checks" != "-" ]; then
 			local v rc
+			# 19 python clients start at once: their own send timing gets a wider tolerance than the
+			# module's (+/- 300 ms); this checks the mock and the checker, not the module
 			# shellcheck disable=SC2086
-			v=$("$PYTHON" "$TESTDIR/protocol_test.py" --record "$LOGDIR/mock-record.jsonl" --vid "$name" --checks "$checks" $popts 2>&1); rc=$?
+			v=$("$PYTHON" "$TESTDIR/protocol_test.py" --record "$LOGDIR/mock-record.jsonl" --vid "$name" --checks "$checks" --tol-ms 300 $popts 2>&1); rc=$?
 			printf '== %s\n%s\n' "$name" "$v" >>"$LOGDIR/mock-selftest.protocol.log"
 			[ $rc = 0 ] || fail+="$name:proto[$(printf '%s' "$v" | grep '^FAIL' | cut -d: -f1 | sed 's/FAIL //' | tr '\n' ' ')] "
 		fi
@@ -922,7 +944,9 @@ LOG_NOISE_ALLOW=(
 	'app_amd_ws.c: AMD_WS: .* invalid port .notaport.'                     # bad_port_default
 	'app_amd_ws.c: AMD_WS: .* channel not answered and option A given'     # opt_a_unanswered
 	'tcptls.c: Unable to connect websocket client to 127.0.0.1:[0-9]+: Connection refused'   # server_down
-	'app_amd_ws.c: AMD_WS: connect to ws://127.0.0.1:[0-9]+ (failed|timed out)'              # server_down / slow_handshake
+	'app_amd_ws.c: AMD_WS: connect to wss?://127.0.0.1:[0-9]+ (failed|timed out)'            # server_down / slow_handshake / tls_to_plain
+	'iostream.c: (Problem setting up ssl connection|SSL_shutdown\(\) failed)'              # tls_to_plain: TLS handshake against the plain ws port
+	"tcptls.c: Unable to set up ssl connection with peer '127.0.0.1:"                        # tls_to_plain (the core's other wording of the same failure)
 	'res_http_websocket.c: Invalid HTTP response code 403 from 127.0.0.1'  # reject_upgrade
 	'app_amd_ws.c: AMD_WS: DB .*(connect|unavailable|failed|refused)'      # db_unreachable (dead VARDB port)
 	'app_amd_ws.c: AMD_WS: .*(Web socket|websocket|WebSocket) (closed|error)' # close_midstream
@@ -937,7 +961,7 @@ check_log_noise() { # no WARNING/ERROR in the Asterisk log other than the intent
 	n_left=$(printf '%s' "$left" | grep -c . || true)
 	printf '%s\n' "$left" >"$LOGDIR/log-noise-unexpected.txt"
 	if [ "${n_left:-0}" = 0 ]; then
-		row PASS log_noise - - - "$n_all WARNING/ERROR lines, all intentionally provoked (unload busy, bad port, option A, connect refused/timeout, 403, dead DB)"
+		row PASS log_noise - - - "$n_all WARNING/ERROR lines, all intentionally provoked (unload busy, bad port, option A, connect refused/timeout, 403, TLS to plain port, dead DB)"
 	else
 		row FAIL log_noise - - - "$n_left unexpected WARNING/ERROR line(s), e.g. $(printf '%s\n' "$left" | head -1 | sed -E 's/^\[[^]]*\] //' | cut -c1-110) (see log-noise-unexpected.txt)"
 	fi
@@ -1045,6 +1069,7 @@ main() {
 		if has_tag "$tags" amd; then
 			if [ "$MODE" = selftest ]; then continue; fi
 			if [ "$MODULE_AVAILABLE" != 1 ]; then row SKIP "${S_NAME[$i]}" - - - "needs app_amd_ws.so"; continue; fi
+			if [ -z "$TLS_PORT" ] && [[ ${S_AMD[$i]} == wstls:* ]]; then row SKIP "${S_NAME[$i]}" - - - "no wss mock (openssl missing?)"; continue; fi
 		fi
 		[ "$(($(date +%s) - SUITE_T0))" -gt "$SUITE_BUDGET_S" ] && { row FAIL suite_budget - - - "suite exceeded ${SUITE_BUDGET_S}s before ${S_NAME[$i]}"; break; }
 		log "scenario ${S_NAME[$i]} (${S_FAR[$i]} -> ${S_AMD[$i]}; mock ${S_MOCK[$i]})"
