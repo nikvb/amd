@@ -197,3 +197,20 @@ db_timeout_ms=1000
 ; or "NO VARDB_ LINES"); no connection is attempted with built-in defaults,
 ; exactly as amd.py's "DB ERROR: no config".
 astguiclient_conf=/etc/astguiclient.conf
+
+; Extra keys for the server, spliced verbatim into the "config" JSON frame (must
+; be a JSON object).  Empty = the exact amd.py frame.  amd_server understands,
+; for example:
+;   {"short_no_greeting":true}       finalise at the 32k AMD stage instead of
+;                                    waiting for 36 000 stripped samples (4.5 s
+;                                    of speech) and the greeting model: ~0.5 s
+;                                    faster, but the verdict no longer says
+;                                    WHICH machine (plain AMD instead of
+;                                    NUMBERSAMD/OTHERAMD/...).
+;   {"detection_mode":"aggressive"}  threshold profile: aggressive | balanced
+;                                    (default) | conservative - latency vs leak.
+;   {"max_detection_time":8.0}       server wall-clock deadline in seconds.
+;   {"stage_results":true}           per-stage progress frames (STAGE-...); the
+;                                    module treats them as acks.
+; Several keys: {"short_no_greeting":true,"detection_mode":"aggressive"}
+extra_config=

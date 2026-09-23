@@ -359,7 +359,7 @@ static const char description[] =
 
 #define SAMPLE_RATE            8000
 #define BYTES_PER_MS           16          /* 8 kHz * 16 bit mono */
-#define MAX_SCHEDULE           16          /* entries in send_schedule */
+#define MAX_SCHEDULE           64          /* entries in send_schedule (a 0.5 s cadence to 30 s is 60) */
 #define STATUS_TOKEN_LEN       32          /* AMDSTATUS */
 #define LOOP_BUDGET_MS         20          /* max ast_waitfor_nandfds budget */
 /*
@@ -411,6 +411,7 @@ struct amd_ws_conf {
 	int db;
 	int db_timeout_ms;
 	char astguiclient_conf[256];
+	char extra_config[512];        /* raw JSON object merged into the config frame, e.g. {"short_no_greeting":true} */
 	int max_pending_connects;
 };
 
@@ -485,6 +486,7 @@ static void conf_set_defaults(struct amd_ws_conf *c)
 #endif
 	c->db_timeout_ms = 1000;
 	ast_copy_string(c->astguiclient_conf, "/etc/astguiclient.conf", sizeof(c->astguiclient_conf));
+	c->extra_config[0] = '\0';
 	c->max_pending_connects = DEF_MAX_PENDING;
 }
 
@@ -513,23 +515,30 @@ static int parse_schedule(const char *val, int *sched, int *n)
 {
 	char *copy = ast_strdupa(S_OR(val, ""));
 	char *tok;
+	int tmp[MAX_SCHEDULE];
 	int count = 0, prev = 0;
 
+	/* parse into a scratch array: on any error the caller's schedule stays untouched */
 	while ((tok = strsep(&copy, ", "))) {
 		int v;
 
 		if (ast_strlen_zero(tok)) {
 			continue;
 		}
-		if (count >= MAX_SCHEDULE || !parse_int(tok, 1, 600000, &v) || v <= prev) {
+		if (count >= MAX_SCHEDULE) {
+			ast_log(LOG_WARNING, "AMD_WS: send_schedule has more than %d entries\n", MAX_SCHEDULE);
 			return 0;
 		}
-		sched[count++] = v;
+		if (!parse_int(tok, 1, 600000, &v) || v <= prev) {
+			return 0;
+		}
+		tmp[count++] = v;
 		prev = v;
 	}
 	if (!count) {
 		return 0;
 	}
+	memcpy(sched, tmp, count * sizeof(*sched));
 	*n = count;
 	return 1;
 }
@@ -609,6 +618,21 @@ static int load_config(int reload)
 		} else if (!strcasecmp(name, "astguiclient_conf")) {
 			if (!ast_strlen_zero(val)) {
 				ast_copy_string(c.astguiclient_conf, val, sizeof(c.astguiclient_conf));
+			}
+		} else if (!strcasecmp(name, "extra_config")) {
+			/* must be a JSON object: {"key":value,...}; spliced verbatim into "config" */
+			const char *v0 = ast_skip_blanks(S_OR(val, ""));
+			size_t vl = strlen(v0);
+
+			while (vl > 0 && isspace((unsigned char) v0[vl - 1])) {
+				vl--;
+			}
+			if (vl == 0) {
+				c.extra_config[0] = '\0';
+			} else if (vl >= 2 && v0[0] == '{' && v0[vl - 1] == '}' && vl < sizeof(c.extra_config)) {
+				ast_copy_string(c.extra_config, v0, vl + 1);
+			} else {
+				ok = 0;
 			}
 		} else if (!strcasecmp(name, "max_pending_connects")) {
 			ok = parse_int(val, 8, 1024, &c.max_pending_connects);
@@ -1166,6 +1190,10 @@ static enum classification classify_text(const char *text, size_t len)
 {
 	const char *p = text, *end = text + len;
 
+	/* amd_server "stage_results" progress frames (STAGE-<stage>-<CLS>-<dur>-<conf>) are interim */
+	if (len >= 6 && !strncmp(text, "STAGE-", 6)) {
+		return CLASS_ACK;
+	}
 	if (find_sub(text, len, "HUMAN")) {
 		return CLASS_HUMAN;
 	}
@@ -1871,6 +1899,24 @@ static int build_config_json(struct amd_call *c, char *out, size_t out_sz)
 		|| (n = json_append_kv(out, out_sz, n, "caller_id", c->caller_id)) < 0) {
 		return -1;
 	}
+	if (!ast_strlen_zero(c->conf.extra_config)) {
+		/* {"a":1} -> ,"a":1  (the object braces are stripped, the rest is the operator's JSON) */
+		size_t el = strlen(c->conf.extra_config);
+		const char *inner = c->conf.extra_config + 1;
+		size_t il = el - 2;
+
+		while (il > 0 && isspace((unsigned char) inner[il - 1])) {
+			il--;
+		}
+		if (il > 0) {
+			if ((size_t) n + il + 4 > out_sz) {
+				return -1;
+			}
+			out[n++] = ',';
+			memcpy(out + n, inner, il);
+			n += il;
+		}
+	}
 	if ((size_t) n + 3 > out_sz) {
 		return -1;
 	}
@@ -2404,6 +2450,13 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 			}
 			if (st == JOB_DONE) {
 				job_take_db(&c);
+				if (c.job->do_db) {
+					if (!ast_strlen_zero(c.job->phone) || !ast_strlen_zero(c.job->country)) {
+						amd_trace(&c, "DB FOUND: phone=%s, code=%s", S_OR(c.job->phone, ""), S_OR(c.job->country, ""));
+					} else {
+						amd_trace(&c, "DB lookup: no row for vid=%s", c.vid);
+					}
+				}
 				job_unref(c.job);
 				c.job = NULL;
 				if (!ws) {
@@ -2429,10 +2482,10 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 				c.phase = PHASE_STREAM;
 				/* amd.py:310,476 - from here on a lost socket is a PROCESSING_ERROR */
 				set_outcome(&c, "HUMAN", "PROCESSING_ERROR");
-				amd_trace(&c, "connected to %s:%d after %" PRId64 " ms, config sent%s%s",
-					c.host, c.port, ast_tvdiff_ms(now, c.t_connect),
-					ast_strlen_zero(c.phone) ? " (no phone)" : " (phone from DB/option)",
-					ast_strlen_zero(c.country) ? "" : ", country set");
+				amd_trace(&c, "connected to %s:%d after %" PRId64 " ms; config sent: sample_rate=%d, VID=%s, phone=%s, country=%s, caller_id=%s%s%s",
+					c.host, c.port, ast_tvdiff_ms(now, c.t_connect), SAMPLE_RATE, c.vid,
+					S_OR(c.phone, "N/A"), S_OR(c.country, "N/A"), S_OR(c.caller_id, "N/A"),
+					ast_strlen_zero(c.conf.extra_config) ? "" : ", extra=", S_OR(c.conf.extra_config, ""));
 			}
 		}
 
@@ -2638,6 +2691,7 @@ finish:
 	pbx_builtin_setvar_helper(chan, "AMDSTATS", stats_str);
 	pbx_builtin_setvar_helper(chan, "AMDRESPONSE", c.response);
 	pbx_builtin_setvar_helper(chan, "AMDELAPSED", elapsed_str);
+	amd_trace(&c, "Variables set - Status: %s, Cause: %s, Stats: %s", c.status, c.cause, stats_str);
 
 	count_outcome(&c);
 
@@ -2707,6 +2761,7 @@ static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	ast_cli(a->fd, "  astguiclient_conf   : %s (%s)\n", c.astguiclient_conf,
 		!creds.loaded ? "NOT READ - DB lookup skipped"
 		: !creds.keys ? "read, NO VARDB_ LINES - DB lookup skipped" : "read");
+	ast_cli(a->fd, "  extra_config        : %s\n", S_OR(c.extra_config, "(none - amd.py-exact config frame)"));
 	ast_cli(a->fd, "  db server           : %s:%d/%s user=%s\n", creds.server, creds.port, creds.database, creds.user);
 	ast_cli(a->fd, "  max_pending_connects: %d (per host)\n", c.max_pending_connects);
 	ast_cli(a->fd, "\nCounters (AMDSTATUS/AMDCAUSE)\n");

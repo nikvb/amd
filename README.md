@@ -352,6 +352,7 @@ interval, the 2-mark / 3 s EOF finalisation).
 | `eof_wait_ms` | `3000` | How long the EOF finalisation waits for the server's reply (hangup still detected). No reply in time = `EOF_ERROR`. |
 | `send_caller_id` | `yes` | Send `${CALLERID(num)}` as `caller_id` in the config frame (when non-empty and not `Unknown`). Option `i(cid)` overrides the value. |
 | `trace` | `no` | Log the per-call event timeline at verbose 3 for every call (same as option `v`). |
+| `extra_config` | empty | JSON object spliced into the config frame for server-side options, e.g. `{"short_no_greeting":true,"detection_mode":"aggressive"}` (see `amd_ws.conf.sample`). Empty = the exact `amd.py` frame. |
 | `playdelay_ms` | `0` | Delay from the application start before `playfile` starts. |
 | `db` | `yes` | Enable the ViciDial phone/country lookup (only when compiled with MySQL support). |
 | `db_timeout_ms` | `1000` | Time budget for the lookup: bound for waiting on the shared connection; connect/read/write socket timeouts are this value rounded up to whole seconds (minimum 1). |

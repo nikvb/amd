@@ -24,6 +24,11 @@ vocabulary of their own; see the "was" table in
   (connect, first audio frame, each chunk sent, each server reply, result) with
   the millisecond offset from the start of `AMD_WS()`, to see where the time of
   a call goes (schedule granularity vs server decision time).
+- **`extra_config`** conf key: a JSON object spliced into the config frame for
+  `amd_server` options (`short_no_greeting`, `detection_mode`,
+  `max_detection_time`, `stage_results`); `STAGE-` progress frames are treated
+  as acks. Trace lines now include the DB lookup result, the full config sent
+  and the variables set, like `amd.py`'s log.
 - **`agi/amd.py`** — the production EAGI client (2.2, `gw.724care.com/amdy.tar.gz`,
   2026-07-14) is now in the repository as 2.2.1 with the same alignment for the
   two situations that differ from stock `app_amd`: FD3 EOF → `HANGUP`/`HANGUP`
