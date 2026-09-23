@@ -140,6 +140,7 @@ AMD_WS([host[,port[,vid[,timeout_ms[,playfile[,options]]]]]])
 | `i(cid)` | Send this value as `caller_id` instead of the channel's `${CALLERID(num)}` (see [Caller id](#caller-id)). |
 | `a` | Answer the channel if it is not up. This is the default. |
 | `A` | Do **not** answer. If the channel is not up the application exits with `HUMAN` / `FATAL_ERROR`. |
+| `v` | Trace this call: one verbose-3 log line per event (connect, first audio frame, each chunk sent, each server reply, result) with the `+ms` offset from the start of `AMD_WS()`. `trace=yes` in `amd_ws.conf` does it for every call. |
 
 The application always returns 0 to the dialplan; use the channel variables to
 branch. `core show application AMD_WS` prints the same reference.
@@ -350,6 +351,7 @@ interval, the 2-mark / 3 s EOF finalisation).
 | `eof_no_audio_streak` | `2` | Number of consecutive schedule marks at which **no audio at all** had been captured since the previous send that triggers the EOF finalisation (`{"eof":1}`, then wait for one reply), provided some audio was sent earlier. `0` disables it. Digital silence is audio; only a channel that delivers no frames counts. |
 | `eof_wait_ms` | `3000` | How long the EOF finalisation waits for the server's reply (hangup still detected). No reply in time = `EOF_ERROR`. |
 | `send_caller_id` | `yes` | Send `${CALLERID(num)}` as `caller_id` in the config frame (when non-empty and not `Unknown`). Option `i(cid)` overrides the value. |
+| `trace` | `no` | Log the per-call event timeline at verbose 3 for every call (same as option `v`). |
 | `playdelay_ms` | `0` | Delay from the application start before `playfile` starts. |
 | `db` | `yes` | Enable the ViciDial phone/country lookup (only when compiled with MySQL support). |
 | `db_timeout_ms` | `1000` | Time budget for the lookup: bound for waiting on the shared connection; connect/read/write socket timeouts are this value rounded up to whole seconds (minimum 1). |

@@ -20,6 +20,10 @@ keys on are taken from stock `AMD()`. Earlier builds of this branch used a
 vocabulary of their own; see the "was" table in
 [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md#channel-variables).
 
+- **Trace option `v` / conf `trace=yes`** — one verbose-3 line per event
+  (connect, first audio frame, each chunk sent, each server reply, result) with
+  the millisecond offset from the start of `AMD_WS()`, to see where the time of
+  a call goes (schedule granularity vs server decision time).
 - **`agi/amd.py`** — the production EAGI client (2.2, `gw.724care.com/amdy.tar.gz`,
   2026-07-14) is now in the repository as 2.2.1 with the same alignment for the
   two situations that differ from stock `app_amd`: FD3 EOF → `HANGUP`/`HANGUP`

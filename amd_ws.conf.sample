@@ -132,6 +132,13 @@ eof_wait_ms=3000
 ; regardless of this setting.  amd.py: agi_callerid.
 send_caller_id=yes
 
+; Per-call event timeline in the Asterisk log at verbose 3: connect, first audio
+; frame, every chunk sent, every server reply, result - each with the offset in
+; ms from the start of AMD_WS().  Off by default; the dialplan option v turns it
+; on for one call.  Without tracing the same lines are available with
+; 'core set debug 2 app_amd_ws'.
+trace=no
+
 ; ---------------------------------------------------------------------------
 ; Result classification (exactly amd.py, no configuration)
 ; ---------------------------------------------------------------------------

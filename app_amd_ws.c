@@ -218,6 +218,9 @@
 					<option name="A">
 						<para>Do NOT answer; if the channel is not up, fail with AMDSTATUS=HUMAN, AMDCAUSE=FATAL_ERROR.</para>
 					</option>
+					<option name="v">
+						<para>Trace: log one timeline line per event (connect, first audio, every chunk sent, every server reply, result) at verbose 3, with the millisecond offset from the start of the application. Same as amd_ws.conf <literal>trace=yes</literal> for every call.</para>
+					</option>
 				</optionlist>
 			</parameter>
 		</syntax>
@@ -300,6 +303,9 @@ static const char description[] =
 "                        turns the default off)\n"
 "              a         answer the channel if not up (default)\n"
 "              A         do NOT answer; HUMAN/FATAL_ERROR if the channel is not up\n"
+"              v         trace: one verbose-3 line per event (connect, first audio,\n"
+"                        each chunk sent, each reply, result) with +ms offsets;\n"
+"                        conf trace=yes does it for every call\n"
 "\n"
 "Channel variables set on EVERY exit path (vocabulary of the production amdy.io\n"
 "EAGI client amd.py and of the stock AMD(); errors default to HUMAN for safety):\n"
@@ -400,6 +406,7 @@ struct amd_ws_conf {
 	int eof_no_audio_streak;      /* 0 = EOF finalisation disabled */
 	int eof_wait_ms;
 	int send_caller_id;
+	int trace;                    /* per-call event timeline at verbose 3 (option v) */
 	int playdelay_ms;
 	int db;
 	int db_timeout_ms;
@@ -469,6 +476,7 @@ static void conf_set_defaults(struct amd_ws_conf *c)
 	c->eof_no_audio_streak = 2;
 	c->eof_wait_ms = 3000;
 	c->send_caller_id = 1;
+	c->trace = 0;
 	c->playdelay_ms = 0;
 #ifdef HAVE_MYSQL
 	c->db = 1;
@@ -584,6 +592,8 @@ static int load_config(int reload)
 			ok = parse_int(val, 1, 600000, &c.eof_wait_ms);
 		} else if (!strcasecmp(name, "send_caller_id")) {
 			c.send_caller_id = ast_false(val) ? 0 : 1;
+		} else if (!strcasecmp(name, "trace")) {
+			c.trace = ast_true(val) ? 1 : 0;
 		} else if (!strcasecmp(name, "playdelay_ms")) {
 			ok = parse_int(val, 0, 600000, &c.playdelay_ms);
 		} else if (!strcasecmp(name, "db")) {
@@ -1459,6 +1469,7 @@ enum {
 	OPT_ANSWER    = (1 << 6),
 	OPT_NOANSWER  = (1 << 7),
 	OPT_CALLERID  = (1 << 8),
+	OPT_TRACE     = (1 << 9),
 };
 
 enum {
@@ -1480,6 +1491,7 @@ AST_APP_OPTIONS(amd_ws_options, {
 	AST_APP_OPTION_ARG('i', OPT_CALLERID, OPT_ARG_CALLERID),
 	AST_APP_OPTION('a', OPT_ANSWER),
 	AST_APP_OPTION('A', OPT_NOANSWER),
+	AST_APP_OPTION('v', OPT_TRACE),
 });
 
 enum call_phase {
@@ -1556,7 +1568,23 @@ struct amd_call {
 
 	/* playback */
 	enum play_state play;
+
+	int trace;                        /* option v / conf trace: timeline lines at verbose 3 */
 };
+
+/*!
+ * \brief One timeline line per event: "AMD_WS: <chan> +<ms> <event>" at verbose 3 when
+ * tracing is on (option v or conf trace=yes), otherwise at debug 2. The offset is
+ * measured from the start of the application, so a call reads as a timeline.
+ */
+#define amd_trace(c, fmt, ...) do { \
+	if ((c)->trace) { \
+		ast_verb(3, "AMD_WS: %s +%" PRId64 "ms " fmt "\n", ast_channel_name((c)->chan), \
+			ast_tvdiff_ms(ast_tvnow(), (c)->t_app), ##__VA_ARGS__); \
+	} else { \
+		ast_debug(2, "AMD_WS: %s " fmt "\n", ast_channel_name((c)->chan), ##__VA_ARGS__); \
+	} \
+} while (0)
 
 /* ------------------------------------------------------------------------
  * Audio accumulator
@@ -1621,8 +1649,8 @@ static int acc_flush(struct amd_call *c, struct timeval now)
 		c->chunks++;
 		off += n;
 	}
-	ast_debug(3, "AMD_WS: %s sent %zu bytes (total %ld in %d chunks)\n",
-		ast_channel_name(c->chan), c->acc_len, c->bytes_sent, c->chunks);
+	amd_trace(c, "sent chunk #%d: %zu bytes (audio %ld ms total, %ld bytes)",
+		c->chunks, c->acc_len, c->bytes_sent / 16, c->bytes_sent);
 	c->acc_len = 0;
 	c->t_last_send = now;
 	return 0;
@@ -1937,8 +1965,8 @@ static int ws_service_read(struct amd_call *c)
 	c->rx[c->rx_len] = '\0';
 
 	sanitize_response(c->rx, c->rx_len, c->response, sizeof(c->response));
-	ast_debug(2, "AMD_WS: %s server text: %s\n", ast_channel_name(c->chan), c->response);
 	c->replies++;
+	amd_trace(c, "reply #%d: \"%s\"", c->replies, c->response);
 
 	switch (classify_text(c->rx, c->rx_len)) {
 	case CLASS_HUMAN:
@@ -2240,6 +2268,7 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 			ast_channel_name(chan), S_OR(opt_args[OPT_ARG_PLAYDELAY], ""), c.conf.playdelay_ms);
 	}
 	c.use_tls = ast_test_flag(&opts, OPT_TLS) ? 1 : c.conf.tls;
+	c.trace = ast_test_flag(&opts, OPT_TRACE) ? 1 : c.conf.trace;
 	if (ast_test_flag(&opts, OPT_PHONE) && !ast_strlen_zero(opt_args[OPT_ARG_PHONE])) {
 		ast_copy_string(c.phone, opt_args[OPT_ARG_PHONE], sizeof(c.phone));
 	}
@@ -2323,6 +2352,8 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 	/* conf db=no, option n, or explicit p()/k() values skip the query (spec 5) */
 	v = c.conf.db && !ast_test_flag(&opts, OPT_NODB | OPT_PHONE | OPT_CODE);
 	c.t_connect = ast_tvnow();
+	amd_trace(&c, "connecting to %s://%s:%d (connect timeout %d ms, window %d ms)",
+		c.use_tls ? "wss" : "ws", c.host, c.port, c.connect_timeout_ms, c.timeout_ms);
 	v = start_connect(&c, v);
 	if (v) {
 		if (v > 0) {
@@ -2398,7 +2429,10 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 				c.phase = PHASE_STREAM;
 				/* amd.py:310,476 - from here on a lost socket is a PROCESSING_ERROR */
 				set_outcome(&c, "HUMAN", "PROCESSING_ERROR");
-				ast_debug(1, "AMD_WS: %s connected after %" PRId64 " ms\n", ast_channel_name(chan), ast_tvdiff_ms(now, c.t_connect));
+				amd_trace(&c, "connected to %s:%d after %" PRId64 " ms, config sent%s%s",
+					c.host, c.port, ast_tvdiff_ms(now, c.t_connect),
+					ast_strlen_zero(c.phone) ? " (no phone)" : " (phone from DB/option)",
+					ast_strlen_zero(c.country) ? "" : ", country set");
 			}
 		}
 
@@ -2545,6 +2579,7 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 					c.have_audio = 1;
 					c.t_first = ast_tvnow();
 					c.t_last_send = c.t_first;   /* amd.py last_send_time = 0 */
+					amd_trace(&c, "first audio frame (%d bytes); schedule and detection window start here", f->datalen);
 				}
 				c.bytes_captured += f->datalen;
 				/* in GRACE / EOF_WAIT nothing is sent any more: count, do not accumulate */
@@ -2564,7 +2599,7 @@ static int amd_ws_exec(struct ast_channel *chan, const char *data)
 	}
 
 	if (c.got_result) {
-		ast_debug(1, "AMD_WS: %s result %s after %d acks\n", ast_channel_name(chan), c.status, c.acks);
+		amd_trace(&c, "result %s after %d acks", c.status, c.acks);
 	}
 
 finish:
@@ -2665,6 +2700,7 @@ static char *cli_show_settings(struct ast_cli_entry *e, int cmd, struct ast_cli_
 	ast_cli(a->fd, "  eof_no_audio_streak : %d%s\n", c.eof_no_audio_streak, c.eof_no_audio_streak ? "" : " (EOF finalisation disabled)");
 	ast_cli(a->fd, "  eof_wait_ms         : %d\n", c.eof_wait_ms);
 	ast_cli(a->fd, "  send_caller_id      : %s\n", AST_CLI_YESNO(c.send_caller_id));
+	ast_cli(a->fd, "  trace               : %s (per-call timeline at verbose 3; option v)\n", AST_CLI_YESNO(c.trace));
 	ast_cli(a->fd, "  playdelay_ms        : %d\n", c.playdelay_ms);
 	ast_cli(a->fd, "  db                  : %s (%s)\n", AST_CLI_YESNO(c.db), db_availability());
 	ast_cli(a->fd, "  db_timeout_ms       : %d\n", c.db_timeout_ms);
