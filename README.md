@@ -457,6 +457,7 @@ Details and the detection algorithm: [docs/build-and-headers.md](docs/build-and-
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | Call flow, threading model, why `res_http_websocket`, v1 failure modes. |
 | [docs/protocol.md](docs/protocol.md) | Wire protocol (`amd.py`, July 2026) with an example of every frame, the EOF finalisation and the classification rule. |
+| [docs/customer-guide.md](docs/customer-guide.md) | Customer-facing guide (install, dialplan for ViciDial and generic Asterisk, results, configuration, timing, troubleshooting) — source for the amdy.io docs page. |
 | [docs/latency.md](docs/latency.md) | Where the seconds go: a traced live call, why the verdict arrives ~5 s after the first audio frame (server greeting stage), what the schedule and the server options change. |
 | [docs/build-and-headers.md](docs/build-and-headers.md) | Why no Asterisk recompile is needed, what must match, header detection, bundles, distro matrix. |
 | [docs/installer.md](docs/installer.md) | `install.sh` flags, exit codes, system changes, upgrade, rollback, uninstall. |
