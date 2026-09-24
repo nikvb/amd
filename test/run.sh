@@ -1245,7 +1245,7 @@ check_log_lines() { # the two mandatory ast_verb lines exist for EVERY AMD call 
 	local ch='AMD_WS: Local/[0-9]{4}@(farside|amdside)-[a-z0-9_]+-[0-9a-f]+;[12]'
 	n1=$(lgrep -cE "$ch vid=.* host=127\.0\.0\.1:[0-9]+ play=" "$FULL_LOG" 2>/dev/null || true)
 	# cause is a word, NOAUDIODATA-<ms>, or the server's raw reply for MACHINE (may contain spaces/quotes)
-	n2=$(lgrep -cE "$ch status=(HUMAN|MACHINE|NOTSURE|HANGUP) cause=.+ elapsed=[0-9]+ sent=[0-9]+ chunks=[0-9]+" "$FULL_LOG" 2>/dev/null || true)
+	n2=$(lgrep -cE "$ch vid=[^ ]+ status=(HUMAN|MACHINE|NOTSURE|HANGUP) cause=.+ elapsed=[0-9]+ sent=[0-9]+ chunks=[0-9]+" "$FULL_LOG" 2>/dev/null || true)
 	# every channel has exactly one start and one end line
 	nvid=$(lgrep -oE "$ch (vid=|status=)" "$FULL_LOG" 2>/dev/null | sed 's/ vid=$/ S/; s/ status=$/ E/' | sort | uniq -c | awk '$1!=1' | wc -l)
 	if [ "${n1:-0}" = "$AMD_CALLS" ] && [ "${n2:-0}" = "$AMD_CALLS" ] && [ "${nvid:-1}" = 0 ]; then

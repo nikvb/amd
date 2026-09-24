@@ -179,7 +179,7 @@ Every call writes two lines to `/var/log/asterisk/messages` (or `full`):
 
 ```text
 AMD_WS: SIP/trunk-0004706c vid=V9231813370204367076 host=api.amdy.io:2700 play=none
-AMD_WS: SIP/trunk-0004706c status=MACHINE cause=OTHERAMD-4.50-0.9280 elapsed=6106 sent=96320 chunks=8
+AMD_WS: SIP/trunk-0004706c vid=V9231813370204367076 status=MACHINE cause=OTHERAMD-4.50-0.9280 elapsed=6106 sent=96320 chunks=8
 ```
 
 | `AMDCAUSE` | What it means | What to check |

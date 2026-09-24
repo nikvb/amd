@@ -22,7 +22,7 @@ every call produces exactly two lines in `/var/log/asterisk/full` (or
 
 ```text
 AMD_WS: Local/8370@default-0000a1b2;1 vid=V9211234560000123 host=api.amdy.io:2700 play=amdy/insert
-AMD_WS: Local/8370@default-0000a1b2;1 status=HUMAN cause=HUMAN elapsed=1830 sent=32000 chunks=4
+AMD_WS: Local/8370@default-0000a1b2;1 vid=V9231813370204367076 status=HUMAN cause=HUMAN elapsed=1830 sent=32000 chunks=4
 ```
 
 | Question | Command |

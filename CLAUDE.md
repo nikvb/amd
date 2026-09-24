@@ -131,7 +131,7 @@ Installer checks without touching the system: `./install.sh --dry-run`,
   not count. No extra-status list, no token parser.
 - Return value 0 always. Two verbose-3 lines per call:
   `AMD_WS: <chan> vid=<vid> host=<h>:<p> play=<file|none>` and
-  `AMD_WS: <chan> status=<S> cause=<C> elapsed=<ms> sent=<bytes> chunks=<n>`.
+  `AMD_WS: <chan> vid=<vid> status=<S> cause=<C> elapsed=<ms> sent=<bytes> chunks=<n>`.
 
 ## Working rules
 

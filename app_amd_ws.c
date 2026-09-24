@@ -1607,10 +1607,10 @@ struct amd_call {
  */
 #define amd_trace(c, fmt, ...) do { \
 	if ((c)->trace) { \
-		ast_verb(3, "AMD_WS: %s +%" PRId64 "ms " fmt "\n", ast_channel_name((c)->chan), \
+		ast_verb(3, "AMD_WS: %s vid=%s +%" PRId64 "ms " fmt "\n", ast_channel_name((c)->chan), (c)->vid, \
 			ast_tvdiff_ms(ast_tvnow(), (c)->t_app), ##__VA_ARGS__); \
 	} else { \
-		ast_debug(2, "AMD_WS: %s " fmt "\n", ast_channel_name((c)->chan), ##__VA_ARGS__); \
+		ast_debug(2, "AMD_WS: %s vid=%s " fmt "\n", ast_channel_name((c)->chan), (c)->vid, ##__VA_ARGS__); \
 	} \
 } while (0)
 
@@ -2695,8 +2695,8 @@ finish:
 
 	count_outcome(&c);
 
-	ast_verb(3, "AMD_WS: %s status=%s cause=%s elapsed=%" PRId64 " sent=%ld chunks=%d\n",
-		ast_channel_name(chan), c.status, c.cause, elapsed_ms, c.bytes_sent, c.chunks);
+	ast_verb(3, "AMD_WS: %s vid=%s status=%s cause=%s elapsed=%" PRId64 " sent=%ld chunks=%d\n",
+		ast_channel_name(chan), c.vid, c.status, c.cause, elapsed_ms, c.bytes_sent, c.chunks);
 	if (c.bytes_dropped) {
 		ast_log(LOG_WARNING, "AMD_WS: %s dropped %ld bytes of audio (backlog)\n", ast_channel_name(chan), c.bytes_dropped);
 	}

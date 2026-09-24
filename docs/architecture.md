@@ -72,7 +72,7 @@ dialplan: AMD_WS(host,port,vid,timeout_ms,playfile,options)
       TEXT {"eof":1} best effort, ast_websocket_close(ws, 1000), unref
       restore the channel read format
       set AMDSTATUS, AMDCAUSE, AMDSTATS (<elapsed>-<audio_ms>-<chunks>-<bytes>), AMDRESPONSE, AMDELAPSED
-      verbose(3): AMD_WS: <chan> status=... cause=... elapsed=... sent=... chunks=...; counters++
+      verbose(3): AMD_WS: <chan> vid=<vid> status=... cause=... elapsed=... sent=... chunks=...; counters++
       return 0
 ```
 
