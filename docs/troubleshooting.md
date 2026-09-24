@@ -239,6 +239,14 @@ Stock `AMD()` sets the same status; `amd.py` reported this as `NOAUDIO`.
 | `Exceptionally long voice queue length queuing to Local/...` around `AMD_WS` | This meant the channel was not read for ~2 s. In 2.x the channel is serviced in every phase and neither DNS nor the DB lookup run on the channel thread; the only remaining ways are a partial server frame (up to 10 s, see [Known limitations](#4-known-limitations)) or a box under extreme load. | Keep server replies small; check `${AMDRESPONSE}` sizes and the box's load. |
 | CPU or memory grows with call volume | `module show like app_amd_ws` use count vs `core show channels count` | 2.x keeps no per-call global state; report with `amd_ws show settings` output and a `core show channels concise` sample. |
 
+### The verdict takes ~5–6 s
+
+Expected: the service's final verdict is its greeting model, which needs 4.5 s
+of *speech* (36 000 silence-stripped samples); the chunk carrying it leaves at
+the next schedule mark. Trace one call with option `v` and compare with
+[latency.md](latency.md). Only escalate when acks come late (> 500 ms) or the
+verdict arrives long after the first chunk that held ≥ 4.5 s of speech.
+
 ## 4. Known limitations
 
 Things the module cannot fix from its side; each is bounded and documented so
