@@ -8,12 +8,16 @@ Reusable from test/run.sh and by hand:
 
 Checks (comma list, default: config,schedule,bytes,eof,close):
   config    exactly one connection for the VID; config JSON is the first text
-            frame and has the shape {"config":{"sample_rate":8000,"VID":vid[,"phone"][,"country_code"]}}
-            with no other keys; --phone/--country assert their presence/value,
-            --no-phone asserts absence.
+            frame and has the shape {"config":{"sample_rate":8000,"VID":vid
+            [,"phone"][,"country_code"][,"caller_id"]}} with the keys in exactly
+            that order and no other keys (amd.py Jul 2026); --phone/--country/
+            --callerid assert their presence/value, --no-phone / --no-callerid
+            assert absence.
   schedule  chunk k arrives at anchor + schedule[k] +/- tol (default schedule
-            500,1000,1500,2000,3000,4000, tol 150 ms); chunks after the last mark
-            are >= chunk-bytes (8000) and spaced by about chunk-bytes/16 ms.
+            500,1000,...,9000 = amd.py SEND_TIMES, tol 150 ms); chunks after the
+            last mark follow amd.py's fallback rule: a chunk >= chunk-bytes (8000)
+            comes about chunk-bytes/16 ms after the previous send (size-driven),
+            a smaller one about --fallback-ms (1000) after it (time-driven).
             The module's schedule clock starts at its FIRST CAPTURED FRAME, so the
             anchor is --audio-start (epoch ms when the far side began sending
             audio, i.e. TA from the results line) relative to the connection;
@@ -22,6 +26,9 @@ Checks (comma list, default: config,schedule,bytes,eof,close):
   bytes     every chunk carries ~16 B/ms of audio for its interval (+/- max(10 %,
             2 frames)) and the total is ~16000 B/s * covered duration (+/- 10 %).
   eof       the client sent {"eof":1} as its last text frame.
+  eofmarks  EOF finalisation: the FIRST {"eof":1} arrived at the schedule mark
+            --empty-marks (2) marks after the mark of the last chunk, i.e. exactly
+            that many marks passed with nothing to send before the eof.
   close     close code == --close-code (default 1000) and the record has no error.
   chunks    exactly --expect-chunks binary chunks (or --min-chunks / --max-chunks).
   result    the mock did send a result (result_sent non-empty).
@@ -35,7 +42,9 @@ import argparse
 import json
 import sys
 
-DEFAULT_SCHEDULE = [500, 1000, 1500, 2000, 3000, 4000]
+DEFAULT_SCHEDULE = [500, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000]   # amd.py SEND_TIMES
+DEFAULT_FALLBACK_MS = 1000  # amd.py: fallback send every 1 s (or when >= 8000 B are pending)
+CONFIG_KEY_ORDER = ["sample_rate", "VID", "phone", "country_code", "caller_id"]        # amd.py:185-200
 BYTES_PER_MS = 16          # 8000 Hz * 2 bytes / 1000
 FRAME_BYTES = 320          # 20 ms frame
 
@@ -63,7 +72,7 @@ def _first_text(rec):
     return texts[0]["text"] if texts else None
 
 
-def check_config(rec, vid, phone=None, country=None, no_phone=False):
+def check_config(rec, vid, phone=None, country=None, no_phone=False, callerid=None, no_callerid=False):
     cfg = rec.get("config")
     if not isinstance(cfg, dict) or set(cfg.keys()) != {"config"}:
         return False, "top-level keys %r, expected exactly {'config'} (raw=%r)" % (
@@ -71,10 +80,13 @@ def check_config(rec, vid, phone=None, country=None, no_phone=False):
     inner = cfg["config"]
     if not isinstance(inner, dict):
         return False, "config is not an object: %r" % (inner,)
-    allowed = {"sample_rate", "VID", "phone", "country_code"}
-    extra = set(inner.keys()) - allowed
+    extra = set(inner.keys()) - set(CONFIG_KEY_ORDER)
     if extra:
         return False, "unexpected keys %s" % sorted(extra)
+    # keys in amd.py's order (json.loads keeps the document order)
+    expected_order = [k for k in CONFIG_KEY_ORDER if k in inner]
+    if list(inner.keys()) != expected_order:
+        return False, "key order %r, expected %r" % (list(inner.keys()), expected_order)
     if inner.get("sample_rate") != 8000:
         return False, "sample_rate=%r, expected 8000 (int)" % (inner.get("sample_rate"),)
     if inner.get("VID") != vid:
@@ -85,6 +97,10 @@ def check_config(rec, vid, phone=None, country=None, no_phone=False):
         return False, "phone=%r, expected %r" % (inner.get("phone"), phone)
     if country is not None and str(inner.get("country_code")) != str(country):
         return False, "country_code=%r, expected %r" % (inner.get("country_code"), country)
+    if no_callerid and "caller_id" in inner:
+        return False, "caller_id present but not expected: %r" % (inner,)
+    if callerid is not None and str(inner.get("caller_id")) != str(callerid):
+        return False, "caller_id=%r, expected %r" % (inner.get("caller_id"), callerid)
     first = _first_text(rec)
     if first != rec.get("config_raw"):
         return False, "config JSON was not the first text frame (first=%r)" % (first,)
@@ -93,8 +109,8 @@ def check_config(rec, vid, phone=None, country=None, no_phone=False):
     return True, "shape ok: %s" % rec.get("config_raw")
 
 
-def check_schedule(rec, schedule, tol_ms, chunk_bytes, audio_start=None):
-    chunks = rec.get("chunks") or []
+def _anchor(rec, audio_start):
+    """(t0 relative to the connection, description) of the module's schedule clock."""
     t0 = rec.get("t_config")
     anchor = "config"
     if audio_start is not None and rec.get("t_connect") is not None:
@@ -102,6 +118,12 @@ def check_schedule(rec, schedule, tol_ms, chunk_bytes, audio_start=None):
         # audio began before the WebSocket was up (the module holds and flushes it)
         t0 = audio_start - rec["t_connect"]
         anchor = "first audio (%+d ms vs connect)" % t0
+    return t0, anchor
+
+
+def check_schedule(rec, schedule, tol_ms, chunk_bytes, audio_start=None, fallback_ms=DEFAULT_FALLBACK_MS):
+    chunks = rec.get("chunks") or []
+    t0, anchor = _anchor(rec, audio_start)
     if t0 is None:
         return False, "no config frame, cannot anchor schedule"
     if not chunks:
@@ -116,16 +138,46 @@ def check_schedule(rec, schedule, tol_ms, chunk_bytes, audio_start=None):
             if abs(rel - exp) > tol_ms:
                 problems.append("chunk %d at %d ms, expected %d +/- %d" % (k + 1, rel, exp, tol_ms))
         else:
+            # amd.py:439-440 fallback: send when >= FALLBACK_CHUNK_SIZE is pending (with continuous
+            # audio that is every chunk_bytes/16 ms) OR 1 s after the last send with anything pending
             gap = ch["t"] - chunks[k - 1]["t"]
-            exp_gap = chunk_bytes / BYTES_PER_MS
-            details.append("#%d@%d(gap %d)" % (k + 1, rel, gap))
-            if ch["bytes"] < chunk_bytes:
-                problems.append("post-schedule chunk %d has %d B < chunk_bytes %d" % (k + 1, ch["bytes"], chunk_bytes))
+            if ch["bytes"] >= chunk_bytes:
+                exp_gap, rule = chunk_bytes / BYTES_PER_MS, "size"
+            else:
+                exp_gap, rule = fallback_ms, "interval"
+            details.append("#%d@%d(%s gap %d)" % (k + 1, rel, rule, gap))
             if abs(gap - exp_gap) > tol_ms + 40:
-                problems.append("post-schedule chunk %d gap %d ms, expected ~%d" % (k + 1, gap, exp_gap))
+                problems.append("post-schedule chunk %d (%d B, %s-driven) gap %d ms, expected ~%d" % (
+                    k + 1, ch["bytes"], rule, gap, exp_gap))
     if problems:
         return False, "; ".join(problems) + " [" + " ".join(details) + "]"
     return True, "chunks at " + " ".join(details) + " ms after " + anchor
+
+
+def check_eofmarks(rec, schedule, tol_ms, audio_start=None, empty_marks=2):
+    """The first {"eof":1} came exactly `empty_marks` schedule marks after the last chunk's mark."""
+    chunks = rec.get("chunks") or []
+    eofs = rec.get("eofs") or ([rec["t_eof"]] if rec.get("t_eof") is not None else [])
+    t0, anchor = _anchor(rec, audio_start)
+    if t0 is None:
+        return False, "no config frame, cannot anchor schedule"
+    if not chunks:
+        return False, "no chunks: nothing was sent, so no EOF finalisation is possible"
+    if not eofs:
+        return False, "no {\"eof\":1} seen"
+    last_rel = chunks[-1]["t"] - t0
+    k = min(range(len(schedule)), key=lambda i: abs(schedule[i] - last_rel))
+    if abs(schedule[k] - last_rel) > tol_ms:
+        return False, "last chunk at %d ms is not on a schedule mark (nearest %d)" % (last_rel, schedule[k])
+    if k + empty_marks >= len(schedule):
+        return False, "last chunk on mark %d: fewer than %d marks left in the schedule" % (schedule[k], empty_marks)
+    exp = schedule[k + empty_marks]
+    eof_rel = eofs[0] - t0
+    if abs(eof_rel - exp) > tol_ms:
+        return False, "first eof at %d ms, expected the mark %d ms (%d empty marks after the last chunk's mark %d) +/- %d; eofs=%r" % (
+            eof_rel, exp, empty_marks, schedule[k], tol_ms, [e - t0 for e in eofs])
+    return True, "last chunk on mark %d, first eof at %d ms = mark %d after %d empty marks (%d eof frames) after %s" % (
+        schedule[k], eof_rel, exp, empty_marks, len(eofs), anchor)
 
 
 def check_bytes(rec, schedule, tol_frac, chunk_bytes):
@@ -196,7 +248,8 @@ def check_chunks(rec, expect=None, min_chunks=None, max_chunks=None):
 
 def run_checks(recs, vid, checks, *, schedule=DEFAULT_SCHEDULE, tol_ms=150, bytes_tol=0.10,
                chunk_bytes=8000, close_code=1000, phone=None, country=None, no_phone=False,
-               expect_chunks=None, min_chunks=None, max_chunks=None, audio_start=None):
+               callerid=None, no_callerid=False, expect_chunks=None, min_chunks=None, max_chunks=None,
+               audio_start=None, fallback_ms=DEFAULT_FALLBACK_MS, empty_marks=2):
     results = []
     mine = find_vid(recs, vid)
     if len(mine) != 1:
@@ -205,13 +258,16 @@ def run_checks(recs, vid, checks, *, schedule=DEFAULT_SCHEDULE, tol_ms=150, byte
     rec = mine[0]
     for c in checks:
         if c == "config":
-            ok, d = check_config(rec, vid, phone=phone, country=country, no_phone=no_phone)
+            ok, d = check_config(rec, vid, phone=phone, country=country, no_phone=no_phone,
+                                 callerid=callerid, no_callerid=no_callerid)
         elif c == "schedule":
-            ok, d = check_schedule(rec, schedule, tol_ms, chunk_bytes, audio_start)
+            ok, d = check_schedule(rec, schedule, tol_ms, chunk_bytes, audio_start, fallback_ms)
         elif c == "bytes":
             ok, d = check_bytes(rec, schedule, bytes_tol, chunk_bytes)
         elif c == "eof":
             ok, d = check_eof(rec)
+        elif c == "eofmarks":
+            ok, d = check_eofmarks(rec, schedule, tol_ms, audio_start, empty_marks)
         elif c == "close":
             ok, d = check_close(rec, close_code)
         elif c == "chunks":
@@ -239,10 +295,14 @@ def main():
     ap.add_argument("--phone")
     ap.add_argument("--country")
     ap.add_argument("--no-phone", action="store_true")
+    ap.add_argument("--callerid")
+    ap.add_argument("--no-callerid", action="store_true")
     ap.add_argument("--expect-chunks", type=int)
     ap.add_argument("--min-chunks", type=int)
     ap.add_argument("--max-chunks", type=int)
     ap.add_argument("--audio-start", type=int, help="epoch ms when the far side started sending audio (schedule anchor)")
+    ap.add_argument("--fallback-ms", type=int, default=DEFAULT_FALLBACK_MS, help="post-schedule time-driven send interval")
+    ap.add_argument("--empty-marks", type=int, default=2, help="eofmarks: marks without audio before the eof")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
     schedule = [int(x) for x in a.schedule.split(",") if x]
@@ -250,8 +310,9 @@ def main():
     recs = load_records(a.record)
     results = run_checks(recs, a.vid, checks, schedule=schedule, tol_ms=a.tol_ms, bytes_tol=a.bytes_tol,
                          chunk_bytes=a.chunk_bytes, close_code=a.close_code, phone=a.phone,
-                         country=a.country, no_phone=a.no_phone, expect_chunks=a.expect_chunks,
-                         min_chunks=a.min_chunks, max_chunks=a.max_chunks, audio_start=a.audio_start)
+                         country=a.country, no_phone=a.no_phone, callerid=a.callerid, no_callerid=a.no_callerid,
+                         expect_chunks=a.expect_chunks, min_chunks=a.min_chunks, max_chunks=a.max_chunks,
+                         audio_start=a.audio_start, fallback_ms=a.fallback_ms, empty_marks=a.empty_marks)
     ok_all = all(ok for _, ok, _ in results)
     if a.json:
         print(json.dumps({"vid": a.vid, "ok": ok_all,

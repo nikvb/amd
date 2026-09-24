@@ -8,44 +8,30 @@ and handy for debugging the mock by hand:
 
 Behaviour (as amd.py): connect, send the config JSON, generate 16000 B/s of
 fake slin audio in --frame-ms frames, send everything accumulated at each
-schedule mark (--schedule, default 500,1000,1500,2000,3000,4000 ms) and every
+schedule mark (--schedule, default amd.py's 500,1000,...,9000 ms) and every
 --chunk-bytes afterwards, wait (non-blocking) for one text reply per send,
-classify with the token rule of the spec, and on exit send {"eof":1} and
-close(1000).  --abort-after N drops the TCP connection after N chunks with no
+classify exactly like amd.py ('HUMAN' in text -> HUMAN, else 'AMD'/'MACHINE'
+in text -> MACHINE, else ack; the module adds the "AMDY" guard, see
+classify_test.py), and on exit send {"eof":1} and close(1000).  Statuses and
+causes use the amd.py vocabulary (HUMAN/CONNECTION_ERROR, NOTSURE/
+SERVER_TIMEOUT, ...).  --abort-after N drops the TCP connection after N chunks with no
 close frame (the mock must record close_code 1006).  Prints one JSON summary.
 """
 import argparse
 import asyncio
 import json
-import re
+import os
 import sys
 import time
 
 import websockets
 
-TERMINAL = {"HUMAN": "HUMAN", "MACHINE": "MACHINE", "AMD": "MACHINE"}
-
-
-def classify(text, extra):
-    """Token rule from SPEC section 3.5."""
-    body = text
-    m = re.search(r'"(?:status|result|classification)"\s*:\s*"([^"]*)"', text)
-    if m:
-        body = m.group(1)
-    for tok in re.split(r"[^A-Za-z0-9_]+", body):
-        up = tok.upper()
-        if not up:
-            continue
-        if up in TERMINAL:
-            return TERMINAL[up]
-        if up in extra:
-            return up
-    return None
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from classify_test import module_classify as classify  # noqa: E402  (amd.py rule + AMDY guard)
 
 
 async def run(a):
     schedule = [int(x) for x in a.schedule.split(",") if x]
-    extra = set(x.upper() for x in a.extra.split(",") if x)
     out = {"vid": a.vid, "url": a.url, "status": None, "cause": None, "chunks": 0,
            "bytes": 0, "replies": [], "elapsed_ms": None, "error": None}
     t_start = time.monotonic()
@@ -55,7 +41,7 @@ async def run(a):
                                ping_interval=None, max_size=4 * 1024 * 1024),
             timeout=a.connect_timeout / 1000.0 + 0.5)
     except Exception as exc:  # noqa: BLE001
-        out.update(status="NOTSURE", cause="NETERR", error="connect: %s" % exc,
+        out.update(status="HUMAN", cause="CONNECTION_ERROR", error="connect: %s" % exc,
                    elapsed_ms=int((time.monotonic() - t_start) * 1000))
         print(json.dumps(out))
         return 0
@@ -88,7 +74,7 @@ async def run(a):
         if isinstance(msg, bytes):
             return
         out["replies"].append({"t": elapsed_ms(), "text": msg if len(msg) < 200 else msg[:40] + "...(%d)" % len(msg)})
-        c = classify(msg, extra)
+        c = classify(msg)
         if c:
             result = c
 
@@ -122,7 +108,9 @@ async def run(a):
             await poll_reply(0.02)
             if a.duration and elapsed_ms() >= a.duration * 1000:
                 break
-        if result is None and not aborted and sent_total and not a.no_grace:
+        # a flush + grace wait after the window is the module's optional result_grace_ms (v2 extra);
+        # amd.py (and --grace 0, the default) returns at once with SERVER_TIMEOUT
+        if result is None and not aborted and sent_total and not a.no_grace and a.grace > 0:
             if acc:
                 await ws.send(bytes(acc))
                 out["chunks"] += 1
@@ -134,20 +122,25 @@ async def run(a):
     except websockets.exceptions.ConnectionClosed as exc:
         out["error"] = "closed: %s" % exc
         result = None
-        out.update(status="NOTSURE", cause="NETERR")
+        out.update(status="HUMAN", cause="PROCESSING_ERROR")
     out["bytes"] = sent_total
     out["elapsed_ms"] = elapsed_ms()
     if result:
         out.update(status=result, cause=result)
     elif out["status"] is None:
         if sent_total:
-            out.update(status="NOTSURE", cause="AUDIO_TIMEOUT")
+            out.update(status="NOTSURE", cause="SERVER_TIMEOUT")
         else:
-            out.update(status="NOTSURE", cause="NO_AUDIO_TIMEOUT")
+            out.update(status="NOTSURE", cause="NOAUDIODATA-%d" % elapsed_ms())
     if not aborted:
         try:
             if not a.no_eof:
                 await ws.send('{"eof":1}')
+                if a.eof_wait:
+                    # amd.py's EOF finalisation: one reply to the eof decides (the mock's /eof_* paths)
+                    await poll_reply(a.eof_wait / 1000.0)
+                    if result:
+                        out.update(status=result, cause=result)
             await ws.close(code=1000)
         except Exception as exc:  # noqa: BLE001
             out["error"] = out["error"] or ("close: %s" % exc)
@@ -162,15 +155,15 @@ def main():
     ap.add_argument("--phone")
     ap.add_argument("--country")
     ap.add_argument("--timeout", type=int, default=10000, help="detection window ms")
-    ap.add_argument("--grace", type=int, default=1000, help="result grace ms after timeout")
+    ap.add_argument("--grace", type=int, default=0, help="result grace ms after timeout (amd.py has none)")
     ap.add_argument("--connect-timeout", type=int, default=2000)
-    ap.add_argument("--schedule", default="500,1000,1500,2000,3000,4000")
+    ap.add_argument("--schedule", default="500,1000,1500,2000,3000,4000,5000,6000,7000,8000,9000")
     ap.add_argument("--chunk-bytes", type=int, default=8000)
     ap.add_argument("--frame-ms", type=int, default=20)
     ap.add_argument("--duration", type=float, default=0, help="stop producing after N s (0 = until timeout)")
-    ap.add_argument("--extra", default="HONEYPOT,FAS,FASAMD,AUDIO,NOTSURE")
     ap.add_argument("--no-audio", action="store_true")
     ap.add_argument("--no-eof", action="store_true")
+    ap.add_argument("--eof-wait", type=int, default=0, help="after the eof wait this long for one reply (EOF finalisation)")
     ap.add_argument("--no-grace", action="store_true")
     ap.add_argument("--abort-after", type=int, default=0, help="drop TCP after N chunks (no close frame)")
     a = ap.parse_args()
