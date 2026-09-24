@@ -15,7 +15,7 @@ Key Features:
 - All original functionality preserved
 
 Author: Optimized for high-performance production use
-Version: 2.2.1 - DB Query for Phone Lookup; stock-Asterisk AMD vocabulary for no-audio/hangup and numeric AMDSTATS
+Version: 2.2.1 - DB Query for Phone Lookup; stock-Asterisk HANGUP/NOAUDIODATA vocabulary, numeric AMDSTATS, AMDRESPONSE
 Compatibility: Python 3.4, 3.5, 3.6, 3.7, 3.8, 3.9, 3.10+
 """
 
@@ -39,11 +39,80 @@ AUDIO_READ_SIZE = 9500         # Audio chunk read size (bytes)
 
 # WebSocket Configuration
 WS_ENDPOINT = "ws://api.amdy.io:2700"
+
+
+def classify_reply(response):
+    """Classify one server text frame. Returns one of:
+         'continue'  empty or STAGE- progress frame - keep streaming
+         'human'     final HUMAN verdict
+         'machine'   final machine verdict (class ends in AMD, or MACHINE)
+         'other'     any other final (unknown class) - caller decides
+
+    2026-09-23: replaces the old substring test ("'AMD' in response"), which
+    (a) finalised MACHINE on a STAGE- progress frame whenever a client enabled
+    stage_results, and (b) matched 'AMD' anywhere in the payload. The server
+    contract: finals are "<CLASS>-<duration>-<confidence>", every machine
+    class ENDS in "AMD" (suffix, not substring), progress frames start with
+    "STAGE-", keep-alives are "".
+    """
+    if not response:
+        return 'continue'
+    if response.startswith('STAGE-'):
+        return 'continue'
+    cls = response.split('-', 1)[0].upper()
+    if cls == 'HUMAN':
+        return 'human'
+    if cls == 'MACHINE' or cls.endswith('AMD'):
+        return 'machine'
+    return 'other'
+
 SAMPLE_RATE = 8000             # Audio sample rate for AMD service
 
 # Time-Based Chunking Configuration (Core Feature)
-SEND_TIMES = [0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]  # Send audio when elapsed >= these times
+SEND_TIMES = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0, 9.5]  # Send audio when elapsed >= these times
+# 2026-09-24: 0.5 s cadence throughout (was 1 s after 2.0 s). A machine verdict needs
+# 36000 speech samples for the greeting stage; with 1 s marks the audio that completes
+# it waited up to 1 s in this buffer (traced: V9231813370204367076, verdict due at
+# 5.15 s, sent at the 6.0 s mark). Server work per extra send is negligible.
 MAX_WAIT_TIME = 10             # Global timeout before giving up (seconds)
+# Server-side cascade wall-clock deadline, seconds (amd_server `max_detection_time`,
+# ClientConfig default 8.0). When the deadline fires with >= 28000 real stripped
+# samples and audio still flowing, amd_server extends it ONCE by 2.0s, hard-capped
+# at 10.0s total (greeting_grace). Keep this <= MAX_WAIT_TIME or we hang up before
+# the server answers. amd_server does NOT range-check this value, so we validate here.
+#
+# Customers tune this WITHOUT editing this file: installers overwrite amd.py on every
+# re-install, so a value edited here would be silently reverted on the next upgrade.
+# Put it in /etc/amdy.conf instead (created once by the installer, never clobbered):
+#     MAX_DETECTION_TIME=4.0
+MAX_DETECTION_TIME = 8.0
+AGI_SETTINGS_FILE = '/etc/amdy.conf'
+
+
+def load_agi_settings(path=AGI_SETTINGS_FILE):
+    """Read optional KEY=VALUE overrides. Absent/unreadable file is normal — the
+    built-in defaults then apply. Never raises: a bad settings file must not stop
+    call processing."""
+    settings = {}
+    try:
+        with open(path, 'r') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                key, val = line.split('=', 1)
+                settings[key.strip().upper()] = val.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return settings
+
+
+_agi_settings = load_agi_settings()
+if 'MAX_DETECTION_TIME' in _agi_settings:
+    try:
+        MAX_DETECTION_TIME = float(_agi_settings['MAX_DETECTION_TIME'])
+    except (TypeError, ValueError):
+        pass   # keep the built-in default; the send-site logs the rejection
 SELECT_TIMEOUT = 0.05          # Select() timeout for timing precision (seconds)
 FALLBACK_CHUNK_SIZE = 8000     # Fallback size-based threshold after time-based sends
 
@@ -205,6 +274,18 @@ def create_websocket_connection(agi, caller_name, phone=None, phone_code=None, v
                 "VID": caller_name or "Unknown"
             }
         }
+        # Cascade wall-clock deadline. Clamped locally because amd_server assigns
+        # this straight to wall_limit_secs_ with no validation, so a bad value
+        # (0, negative, huge) would be honoured verbatim.
+        try:
+            mdt = float(MAX_DETECTION_TIME)
+            if 0.5 <= mdt <= MAX_WAIT_TIME:
+                config_data["config"]["max_detection_time"] = mdt
+            else:
+                log_verbose(agi, "MAX_DETECTION_TIME {0} out of range (0.5..{1}) - "
+                                 "using server default".format(mdt, MAX_WAIT_TIME), vid)
+        except (TypeError, ValueError):
+            log_verbose(agi, "MAX_DETECTION_TIME not numeric - using server default", vid)
         # Add phone number if available
         if phone:
             config_data["config"]["phone"] = phone
@@ -304,13 +385,16 @@ def process_audio_chunk(agi, ws, audio_buffer, vid=None):
         response = ws.recv()
         log_verbose(agi, "AMD response: {}".format(response), vid)
 
-        # Parse detection results
-        if 'HUMAN' in response:
+        # Parse detection results (suffix classifier - see classify_reply)
+        verdict = classify_reply(response)
+        if verdict == 'continue':
+            return False
+        if verdict == 'human':
             log_verbose(agi, "*** HUMAN DETECTED ***", vid)
             set_amd_variables(agi, "HUMAN", "HUMAN", vid=vid, response=response)
             return True
 
-        elif 'AMD' in response or 'MACHINE' in response:
+        elif verdict == 'machine':
             log_verbose(agi, "*** MACHINE DETECTED ***", vid)
             set_amd_variables(agi, "MACHINE", response, vid=vid, response=response)
             # Original behavior: wait for machine to finish speaking
@@ -318,8 +402,12 @@ def process_audio_chunk(agi, ws, audio_buffer, vid=None):
             time.sleep(MACHINE_DELAY)
             return True
 
-        # Continue processing for inconclusive responses
-        return False
+        # Unknown FINAL class: the server closes its side after any final, so
+        # continuing to stream would spin until the client deadline. Resolve
+        # to NOTSURE (dialplan routes onward) instead. 2026-09-23.
+        log_verbose(agi, "Unknown final classification {!r} - NOTSURE".format(response), vid)
+        set_amd_variables(agi, "NOTSURE", "UNKNOWN_CLASS", vid=vid, response=response)
+        return True
 
     except Exception as err:
         log_verbose(agi, "Audio processing error: {}".format(err), vid)
@@ -402,10 +490,14 @@ def process_audio_stream(agi, ws, channel, vid=None):
                 log_verbose(agi, "Channel [{}] TIMEOUT".format(channel), vid)
 
                 if total_data_received < 1:
-                    # Stock app_amd vocabulary: NOTSURE / NOAUDIODATA-<ms>. VD_amd.agi strips
-                    # the "-<ms>" and, with NOAUDIODATA-Hangup-ENABLED in the campaign's AMD
-                    # container, dispositions the lead ADAIR (dead air) and hangs up.
-                    set_amd_variables(agi, 'NOTSURE', 'NOAUDIODATA-{}'.format(int(elapsed_time * 1000)), vid=vid)
+                    # Match ViciDial's native AMD() exactly: NOTSURE +
+                    # NOAUDIODATA-<ms>. VD_amd.agi keys on /^NOAUDIODATA/ (with the
+                    # NOAUDIODATA-Hangup-ENABLED settings-container flag) to dispo
+                    # ADAIR and hang up; the old NO_AUDIO_TIMEOUT never matched, so
+                    # dead-air calls went to agents. 2026-09-23.
+                    set_amd_variables(agi, 'NOTSURE',
+                                      'NOAUDIODATA-{}'.format(int(elapsed_time * 1000)),
+                                      vid=vid)
                     #save_debug_wav(all_audio_raw, vid, "NO_AUDIO_TIMEOUT")
                 else:
                     set_amd_variables(agi, "NOTSURE", "SERVER_TIMEOUT", vid=vid)
@@ -430,8 +522,10 @@ def process_audio_stream(agi, ws, channel, vid=None):
                     log_verbose(agi, "Time-based send #{}: threshold={}s, NO AUDIO DATA (streak={}), elapsed={:.3f}s".format(
                         send_index + 1, send_time, no_audio_streak, elapsed_time), vid)
 
-                    # After 2 consecutive NO AUDIO DATA sends, force server finalization via EOF
-                    if no_audio_streak >= 2 and total_data_received > 0:
+                    # After ~2 s of consecutive NO AUDIO DATA marks, force server finalization
+                    # via EOF. 4 marks at the 0.5 s cadence = the same ~2 s tolerance the old
+                    # 2-marks-at-1 s rule gave (don't cut off carriers that pause RTP in silence).
+                    if no_audio_streak >= 4 and total_data_received > 0:
                         log_verbose(agi, "No audio for {}+ sends - sending EOF to force server finalization".format(no_audio_streak), vid)
                         try:
                             ws.send(json.dumps({"eof": 1}))
@@ -440,11 +534,11 @@ def process_audio_stream(agi, ws, channel, vid=None):
                             response = ws.recv()
                             ws.settimeout(old_timeout)
                             log_verbose(agi, "EOF finalization response: {}".format(response), vid)
-                            if response and 'HUMAN' in response:
+                            if classify_reply(response) == 'human':
                                 log_verbose(agi, "*** HUMAN DETECTED (EOF finalization) ***", vid)
                                 set_amd_variables(agi, "HUMAN", "HUMAN", vid=vid, response=response)
                                 return
-                            elif response and ('AMD' in response or 'MACHINE' in response):
+                            elif classify_reply(response) == 'machine':
                                 log_verbose(agi, "*** MACHINE DETECTED (EOF finalization) ***", vid)
                                 set_amd_variables(agi, "MACHINE", response, vid=vid, response=response)
                                 return
@@ -482,11 +576,11 @@ def process_audio_stream(agi, ws, channel, vid=None):
                     ws.settimeout(old_timeout)
                     if response:
                         log_verbose(agi, "Server response (poll): {}".format(response), vid)
-                        if 'HUMAN' in response:
+                        if classify_reply(response) == 'human':
                             log_verbose(agi, "*** HUMAN DETECTED (poll) ***", vid)
                             set_amd_variables(agi, "HUMAN", "HUMAN", vid=vid, response=response)
                             return
-                        elif 'AMD' in response or 'MACHINE' in response:
+                        elif classify_reply(response) == 'machine':
                             log_verbose(agi, "*** MACHINE DETECTED (poll) ***", vid)
                             set_amd_variables(agi, "MACHINE", response, vid=vid, response=response)
                             time.sleep(MACHINE_DELAY)

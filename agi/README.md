@@ -2,8 +2,9 @@
 
 This is the production EAGI script that ViciDial servers run from extension
 8370 (`EAGI(/var/lib/asterisk/agi-bin/amd.py)`), as served from
-`https://gw.724care.com/amdy.tar.gz` (version 2.2, 2026-07-14), with one
-change: the **no-audio and hangup results use stock Asterisk `app_amd`
+`https://download.amdy.io/amdy.tar.gz` (version 2.2 as served on 2026-09-24:
+0.5 s send schedule, suffix classifier `classify_reply`, `max_detection_time`,
+`NOAUDIODATA-<ms>`), with one change: the **no-audio and hangup results use stock Asterisk `app_amd`
 vocabulary**, so `VD_amd.agi` treats them exactly as it treats the built-in
 `AMD()` application.
 
@@ -11,7 +12,7 @@ Both integrations — this script and the `AMD_WS()` module in the repository
 root — set the same variables for the same situations (see the README's
 status table).
 
-## What changed in 2.2.1 (vs the tarball on gw)
+## What changed in 2.2.1 (vs the served 2.2)
 
 | Situation | 2.2 (tarball) | 2.2.1 (this file) | Why |
 |---|---|---|---|

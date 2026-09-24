@@ -178,10 +178,10 @@ class AmdPyStockVocabulary(unittest.TestCase):
                 time.sleep(0.05)
             time.sleep(0.5)
             fd3.close_write()
-        v = self.run_stream(FakeWS(result="AMD detected", after=1), feeder)
+        v = self.run_stream(FakeWS(result="OTHERAMD-4.50-0.93", after=1), feeder)
         self.assertEqual(v["AMDSTATUS"], "MACHINE")
-        self.assertEqual(v["AMDCAUSE"], "AMD detected")
-        self.assertEqual(v["AMDRESPONSE"], "AMD detected")
+        self.assertEqual(v["AMDCAUSE"], "OTHERAMD-4.50-0.93")
+        self.assertEqual(v["AMDRESPONSE"], "OTHERAMD-4.50-0.93")
         self.assertRegex(v["AMDSTATS"], STATS_RE)
 
     def test_config_json_shape_unchanged(self):
