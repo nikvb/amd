@@ -156,6 +156,7 @@ Set on every exit path:
 | `AMDSTATS` | `<elapsed_ms>-<audio_ms_sent>-<chunks_sent>-<bytes_sent>`, four integers, on every exit. `VD_amd.agi` stores the part before the first `-` as `run_time` in `vicidial_amd_log`, exactly as it does for stock `AMD()`. |
 | `AMDRESPONSE` | Raw last text the server sent, sanitised to printable ASCII, at most 255 characters. New in 2.0.0. Note that `VD_amd.agi` has its **own** `$AMDRESPONSE` (it is `AMDCAUSE` cut at the first `-`, see the next section) and never reads this variable. |
 | `AMDELAPSED` | Milliseconds from the first captured audio frame to exit (from the application start when no audio was ever captured). New in 2.0.0. |
+| `AMDPHONE`, `AMDCOUNTRYCODE` | The phone number and country code that were sent to the service (from the `vicidial_auto_calls` lookup or from `p()`/`k()`); set only when known. Lets the dialplan redial the lead, e.g. after a call-screening verdict (see [docs/vicidial-call-screening.md](docs/vicidial-call-screening.md)). New in 2.0.0. |
 
 Status/cause matrix (frozen; each row names where the value comes from):
 
@@ -458,6 +459,7 @@ Details and the detection algorithm: [docs/build-and-headers.md](docs/build-and-
 | [docs/architecture.md](docs/architecture.md) | Call flow, threading model, why `res_http_websocket`, v1 failure modes. |
 | [docs/protocol.md](docs/protocol.md) | Wire protocol (`amd.py`, July 2026) with an example of every frame, the EOF finalisation and the classification rule. |
 | [docs/customer-guide.md](docs/customer-guide.md) | Customer-facing guide (install, dialplan for ViciDial and generic Asterisk, results, configuration, timing, troubleshooting) — source for the amdy.io docs page. |
+| [docs/vicidial-call-screening.md](docs/vicidial-call-screening.md) | iPhone / Google Voice call screening: hold the screened leg and redial once so the person is reached via call waiting; dialplan for extension 8370. |
 | [docs/latency.md](docs/latency.md) | Where the seconds go: a traced live call, why the verdict arrives ~5 s after the first audio frame (server greeting stage), what the schedule and the server options change. |
 | [docs/build-and-headers.md](docs/build-and-headers.md) | Why no Asterisk recompile is needed, what must match, header detection, bundles, distro matrix. |
 | [docs/installer.md](docs/installer.md) | `install.sh` flags, exit codes, system changes, upgrade, rollback, uninstall. |

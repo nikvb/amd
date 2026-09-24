@@ -97,6 +97,17 @@ Plays `custom/hello` (from `/var/lib/asterisk/sounds`) starting 500 ms in, while
 callee's audio is analysed; playback stops as soon as the verdict is known. The file
 must be 8 kHz mono (`sox in.wav -r 8000 -c 1 -b 16 hello.wav`).
 
+
+### Call screening (iPhone, Samsung, Google Voice)
+
+When the service reports `MACHINE` with `AMDCAUSE` starting with `CALLASSISTSCRNAMD`,
+`GVOICEAMD` or `SCREENINGAMD`, a screening robot answered. The module exports
+`AMDPHONE` / `AMDCOUNTRYCODE`, so the dialplan can hold the screened leg and
+redial the number once: the second call arrives as call waiting, rings the
+person, lands on 8370 for a fresh detection and is routed to an agent as usual.
+The full, tested 8370 block is in
+[docs/vicidial-call-screening.md](vicidial-call-screening.md).
+
 ### Options
 
 | Option | Meaning |
@@ -119,6 +130,7 @@ must be 8 kHz mono (`sox in.wav -r 8000 -c 1 -b 16 hello.wav`).
 | `AMDSTATS` | `<elapsed_ms>-<audio_ms_sent>-<chunks>-<bytes>` (ViciDial logs the first number as `run_time`) |
 | `AMDRESPONSE` | The last raw text the service sent |
 | `AMDELAPSED` | Milliseconds from the first audio frame to the result |
+| `AMDPHONE`, `AMDCOUNTRYCODE` | The number / country code sent to the service (ViciDial lookup or `p()`/`k()`), when known — used to redial after a call-screening verdict |
 
 | Situation | `AMDSTATUS` | `AMDCAUSE` |
 |---|---|---|

@@ -29,6 +29,10 @@ vocabulary of their own; see the "was" table in
   `max_detection_time`, `stage_results`); `STAGE-` progress frames are treated
   as acks. Trace lines now include the DB lookup result, the full config sent
   and the variables set, like `amd.py`'s log.
+- **`AMDPHONE` / `AMDCOUNTRYCODE`** channel variables (the number and country code
+  sent to the service) and a tested ViciDial recipe for iPhone / Google Voice call
+  screening: hold the screened leg, redial once via `Originate()`, second call lands
+  on 8370 (`docs/vicidial-call-screening.md`). Every log line now carries `vid=`.
 - **`agi/amd.py`** — the production EAGI client (2.2, `gw.724care.com/amdy.tar.gz`,
   2026-07-14) is now in the repository as 2.2.1 with the same alignment for the
   two situations that differ from stock `app_amd`: FD3 EOF → `HANGUP`/`HANGUP`

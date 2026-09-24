@@ -2691,6 +2691,14 @@ finish:
 	pbx_builtin_setvar_helper(chan, "AMDSTATS", stats_str);
 	pbx_builtin_setvar_helper(chan, "AMDRESPONSE", c.response);
 	pbx_builtin_setvar_helper(chan, "AMDELAPSED", elapsed_str);
+	/* the number/country that were sent to the service (DB lookup or p()/k()): lets the
+	 * dialplan redial the lead, e.g. after a call-screening verdict */
+	if (!ast_strlen_zero(c.phone)) {
+		pbx_builtin_setvar_helper(chan, "AMDPHONE", c.phone);
+	}
+	if (!ast_strlen_zero(c.country)) {
+		pbx_builtin_setvar_helper(chan, "AMDCOUNTRYCODE", c.country);
+	}
 	amd_trace(&c, "Variables set - Status: %s, Cause: %s, Stats: %s", c.status, c.cause, stats_str);
 
 	count_outcome(&c);
