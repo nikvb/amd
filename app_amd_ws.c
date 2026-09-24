@@ -333,6 +333,8 @@ static const char description[] =
 "               (ViciDial's VD_amd.agi reads the first field as run_time)\n"
 "  AMDRESPONSE  raw last server text (printable ASCII, max 255 chars)\n"
 "  AMDELAPSED   ms from the first captured audio frame to exit (from start if none)\n"
+"  AMDPHONE / AMDCOUNTRYCODE  number and country code sent to the service (DB lookup or\n"
+"                        p()/k()); set only when known - lets the dialplan redial the lead\n"
 "\n"
 "Wire protocol (amd.py, Jul 2026): on connect a TEXT frame\n"
 "  {\"config\":{\"sample_rate\":8000,\"VID\":\"<vid>\"[,\"phone\":\"..\"][,\"country_code\":\"..\"]\n"
