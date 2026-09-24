@@ -20,7 +20,7 @@ Asterisk build.
 ## 2. Install (one command, as root)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- -y
 ```
 
 What it does: detects the running Asterisk and its headers, installs the build tools,
@@ -31,7 +31,7 @@ prints the dialplan snippet. Everything is logged to `/var/log/app_amd_ws-instal
 Preview without changing anything:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- --dry-run
 ```
 
 Verify:
