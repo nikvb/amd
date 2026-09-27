@@ -17,14 +17,14 @@ Asterisk build.
 | Network | Outbound TCP to `api.amdy.io` port **2700** from the telephony server. |
 | Optional | MariaDB/MySQL client development files, only for the ViciDial phone/country lookup. Without them the module works with the lookup disabled. |
 
-## 2. Install (one command, as root)
+## 2. Install (one command)
+
+Log in as **root** on the telephony server, then:
+
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y
 ```
-
-> Run as **root**. On systems without `sudo` (most ViciDial servers and containers give you a root shell) drop the `sudo`:
-> `curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | bash -s -- -y`
 
 What it does: detects the running Asterisk and its headers, installs the build tools,
 compiles the module for exactly that Asterisk, checks the result, backs up any previous
@@ -34,7 +34,13 @@ prints the dialplan snippet. Everything is logged to `/var/log/app_amd_ws-instal
 Preview without changing anything:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- --dry-run
+```
+
+Install the detection prompt too (`insert.wav`, 0.6 s, from AMDY) and get the 8370 line with `amdy/insert`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y --playfile
 ```
 
 Verify:

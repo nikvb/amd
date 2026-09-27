@@ -46,6 +46,9 @@ upgrading from 1.x.
 
 ## Install (one command)
 
+Log in as **root** on the telephony server, then:
+
+
 > **Which URL.** Use the `v2.0.0` tag URL below (immutable). `raw.githubusercontent.com/nikvb/amd/main/install.sh`
 > tracks the latest merged code and is also 2.0.0 today; older 1.x installers are no longer served from `main`.
 > The sha256 of the released `install.sh` is published in the GitHub release notes.
@@ -53,11 +56,8 @@ upgrading from 1.x.
 As root on the ViciDial telephony server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y
 ```
-
-> Run as **root**. On systems without `sudo` (most ViciDial servers and containers give you a root shell) drop the `sudo`:
-> `curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | bash -s -- -y`
 
 The installer detects the running Asterisk, obtains matching headers, installs
 the build dependencies (never touching Asterisk itself or your package
@@ -69,13 +69,16 @@ Common variants:
 
 ```bash
 # see what would happen, change nothing
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- --dry-run
+
+# also install the AMDY prompt (insert.wav) and use it as the playback argument
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y --playfile
 
 # no MySQL dependency, no DB lookup
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y --no-db
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y --no-db
 
 # remove the module again
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- --uninstall
 ```
 
 All flags, exit codes and the header-resolution order are in
@@ -89,9 +92,9 @@ make show-config     # what Asterisk, version, headers and MySQL client were det
 make                 # builds app_amd_ws.so against the detected headers; the gates run here:
                      #   no unresolved symbols Asterisk cannot provide, correct build-option sum
 make check           # the build plus a compile-only matrix against header bundles under ./bundles
-sudo make install    # backs up the old .so, installs into the module directory, and puts
+make install    # backs up the old .so, installs into the module directory, and puts
                      #   amd_ws.conf.sample into /etc/asterisk (an existing amd_ws.conf is never touched)
-sudo make load       # or: make reload (unload + load, refused by Asterisk while a call is inside AMD_WS)
+make load       # or: make reload (unload + load, refused by Asterisk while a call is inside AMD_WS)
 ```
 
 Useful overrides (all optional):
