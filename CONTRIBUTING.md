@@ -80,9 +80,16 @@ These come from the review of 1.x and are each covered by a test:
   wherever the API allows; `ast_read() == NULL` or `ast_check_hangup()` means
   `HANGUP` immediately.
 - Audio is never dropped or truncated; the accumulator carries over.
-- Classification is token-based; never `strstr()`.
-- The `AMDSTATUS` / `AMDCAUSE` vocabulary is frozen (README, "Channel
-  variables"); the ViciDial fallback on `NETERR`/`INTERR` must keep working.
+- Classification is `amd.py`'s rule (substring, `HUMAN` first, then
+  `AMD`/`MACHINE`, case-sensitive) with the single `AMDY` guard; no token
+  parser, no configurable status list. `test/classify_test.py` proves parity
+  with the verbatim `amd.py` rule.
+- The `AMDSTATUS` / `AMDCAUSE` / `AMDSTATS` vocabulary is frozen (README,
+  "Channel variables"): `amd.py` July 2026 plus stock `AMD()`'s `HANGUP` and
+  `NOAUDIODATA-<ms>`; the ViciDial fallback on `CONNECTION_ERROR` /
+  `PROCESSING_ERROR` / `FATAL_ERROR` must keep working. The words of earlier
+  branch builds may appear only in the "was" columns of
+  `docs/migration-v1-to-v2.md`.
 - `AMD_WS()` returns 0 always. `load_module` returns `AST_MODULE_LOAD_DECLINE`
   on failure. Module mutexes are `AST_MUTEX_DEFINE_STATIC`. Unload relies on
   the core's use count.

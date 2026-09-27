@@ -2,6 +2,13 @@
 ; amd_ws.conf -- configuration for the AMD_WS() dialplan application
 ; (Answering Machine Detection over WebSocket, app_amd_ws.so v2)
 ;
+; Vocabulary (AMDSTATUS / AMDCAUSE) is that of the production amdy.io EAGI
+; client amd.py (July 2026) and of the stock AMD(): HUMAN/HUMAN,
+; MACHINE/<reply>, HUMAN/CONNECTION_ERROR, HUMAN/PROCESSING_ERROR,
+; HUMAN/FATAL_ERROR, NOTSURE/SERVER_TIMEOUT, NOTSURE/NOAUDIODATA-<ms>,
+; HANGUP/HANGUP, NOTSURE/EOF_INCONCLUSIVE, NOTSURE/EOF_ERROR; AMDSTATS is
+; <elapsed_ms>-<audio_ms_sent>-<chunks_sent>-<bytes_sent>.
+;
 ; Install as /etc/asterisk/amd_ws.conf.  The file and every key are OPTIONAL;
 ; the values shown are the built-in defaults, except host= which defaults to
 ; 127.0.0.1 when no file is present.  Dialplan arguments override this file
@@ -46,62 +53,106 @@ tls_check_hostname=no
 ; Timing (milliseconds)
 ; ---------------------------------------------------------------------------
 ; Overall detection window, measured from the first captured audio frame
-; (from application start while no audio has arrived).  When it expires
-; without a result: AMDSTATUS=NOTSURE, AMDCAUSE=AUDIO_TIMEOUT (or
-; NO_AUDIO_TIMEOUT if no audio was ever captured).  Dialplan argument 4
-; overrides it; <= 0 there means "use this default".  amd.py: MAX_WAIT_TIME.
+; (from application start while no audio has arrived; amd.py measures from
+; its stream start, the same instant on a leg that delivers audio at once).
+; When it expires without a result: AMDSTATUS=NOTSURE, AMDCAUSE=SERVER_TIMEOUT
+; (or NOAUDIODATA-<ms> if no audio was ever captured, like the stock AMD()).
+; Dialplan argument 4 overrides it; <= 0 there means "use this default".
+; amd.py: MAX_WAIT_TIME = 10 s.
 timeout_ms=10000
 
 ; How long the WebSocket connect (DNS + TCP + HTTP upgrade) may take.  The
 ; connect runs on a helper thread while audio is already being captured;
-; when this expires AMDCAUSE=NETERR is returned immediately.  Option c(ms)
-; overrides it per call.  The connect deadline is never later than the
+; when this expires AMDSTATUS=HUMAN, AMDCAUSE=CONNECTION_ERROR is returned
+; immediately ("defaulting to HUMAN for safety", as amd.py does).  Option
+; c(ms) overrides it per call.  The connect deadline is never later than the
 ; detection deadline.  The optional DB lookup (below) runs on the same helper
-; right before the connect, inside this window.
-connect_timeout_ms=2000
+; right before the connect, inside this window.  amd.py: CONNECTION_TIMEOUT
+; = 10 s.  Trade-off: a lower value (e.g. 2000) sends an unreachable service
+; to the agent/fallback sooner but gives up on a slow DNS or a far-away
+; server; audio captured meanwhile is never lost, it is sent at once when the
+; connect completes.
+connect_timeout_ms=10000
 
 ; PARKED connect helpers allowed PER HOST.  A server that accepts the TCP
 ; connection but never answers the HTTP upgrade (hung process, black-holing
 ; middlebox) keeps its helper thread parked in the core's handshake read
 ; until the peer closes or Asterisk restarts: the call itself still returns
-; NETERR at connect_timeout_ms, but the thread stays.  Only helpers whose
-; call has already given up count (a burst of healthy connects never does).
-; Beyond this many parked helpers new calls to THAT host fail fast with
-; NETERR (one WARNING per minute); other hosts are unaffected.
+; CONNECTION_ERROR at connect_timeout_ms, but the thread stays.  Only helpers
+; whose call has already given up count (a burst of healthy connects never
+; does).  Beyond this many parked helpers new calls to THAT host fail fast
+; with CONNECTION_ERROR (one WARNING per minute); other hosts are unaffected.
 ; 'amd_ws show settings' prints "connects in flight" (all helpers) and
 ; "parked connects" per host.  Range 8..1024.
 max_pending_connects=64
 
 ; After timeout_ms the remaining audio is flushed and the server gets this
-; long to answer before AUDIO_TIMEOUT is returned.  The channel is still
-; serviced (a hangup is seen immediately).  0 disables the grace period.
-result_grace_ms=1000
+; long to answer before SERVER_TIMEOUT is returned.  The channel is still
+; serviced (a hangup is seen immediately).  0 = return at once, exactly as
+; amd.py does at MAX_WAIT_TIME (the default).
+result_grace_ms=0
 
 ; ---------------------------------------------------------------------------
-; Audio transport (matches the amdy.io EAGI client amd.py)
+; Audio transport (matches the amdy.io EAGI client amd.py, July 2026)
 ; ---------------------------------------------------------------------------
 ; Time marks, measured from the first captured frame, at which everything
 ; accumulated so far is sent as one BINARY frame (8 kHz 16-bit mono slin,
-; 16000 bytes per second).  Strictly increasing, max 16 entries.  After the
-; last mark a send happens whenever chunk_bytes are pending.  A single value
-; "500" gives plain 500 ms chunks.  Audio is never dropped or truncated:
-; frames of any size (10/20/30/60 ms) are accumulated whole.
-send_schedule=500,1000,1500,2000,3000,4000
+; 16000 bytes per second).  Strictly increasing, max 16 entries.  A single
+; value "500" gives plain 500 ms chunks.  Audio is never dropped or
+; truncated: frames of any size (10/20/30/60 ms) are accumulated whole.
+; amd.py: SEND_TIMES.
+send_schedule=500,1000,1500,2000,3000,4000,5000,6000,7000,8000,9000
+
+; After the last mark a send happens whenever chunk_bytes are pending (with
+; continuous audio: 8000 bytes = every 500 ms) OR fallback_interval_ms passed
+; since the last send with anything pending (sparse audio).  amd.py:
+; FALLBACK_CHUNK_SIZE and its 1 s fallback rule.
 chunk_bytes=8000
+fallback_interval_ms=1000
+
+; EOF finalisation.  A schedule mark at which nothing was captured since the
+; previous send is a "no audio data" mark; any captured audio resets the
+; streak.  When eof_no_audio_streak such marks pass in a row AND audio was
+; sent before (the callee said something, then went quiet), {"eof":1} is
+; sent so the server finalises with what it has, and ONE reply is awaited for
+; eof_wait_ms while the channel is still serviced (a hangup is seen at once):
+;   HUMAN in the reply          -> AMDSTATUS=HUMAN,   AMDCAUSE=HUMAN
+;   AMD or MACHINE in the reply -> AMDSTATUS=MACHINE, AMDCAUSE=<the reply>
+;   any other reply             -> AMDSTATUS=NOTSURE, AMDCAUSE=EOF_INCONCLUSIVE
+;   no reply in time / error    -> AMDSTATUS=NOTSURE, AMDCAUSE=EOF_ERROR
+; Marks only exist inside the schedule, so this can trigger no later than the
+; last mark (9000 ms by default); afterwards only timeout_ms ends the call.
+; eof_no_audio_streak=0 disables it.  amd.py: 2 sends, 3 s.
+eof_no_audio_streak=2
+eof_wait_ms=3000
+
+; Send the channel's CALLERID(num) as "caller_id" in the config frame (the
+; outbound CID ViciDial presents; amd_server logs it).  Empty and "Unknown"
+; are never sent.  The per-call option i(cid) supplies a value explicitly
+; regardless of this setting.  amd.py: agi_callerid.
+send_caller_id=yes
+
+; Per-call event timeline in the Asterisk log at verbose 3: connect, first audio
+; frame, every chunk sent, every server reply, result - each with the offset in
+; ms from the start of AMD_WS().  Off by default; the dialplan option v turns it
+; on for one call.  Without tracing the same lines are available with
+; 'core set debug 2 app_amd_ws'.
+trace=no
 
 ; ---------------------------------------------------------------------------
-; Result classification
+; Result classification (exactly amd.py, no configuration)
 ; ---------------------------------------------------------------------------
-; Every server TEXT frame is split into tokens (letters, digits, underscore);
-; tokens are uppercased and the FIRST terminal token decides:
-;   HUMAN            -> AMDSTATUS=HUMAN
-;   MACHINE or AMD   -> AMDSTATUS=MACHINE
-;   any token listed here -> AMDSTATUS=<token> verbatim (AMDCAUSE the same)
-; Anything else (e.g. "{}", "ack", "AMDY ack", "NOT_HUMAN", "OK") is an
-; acknowledgement and detection continues.  If the text is JSON with a
-; "status", "result" or "classification" key only that value is tokenised.
-; An empty list is allowed (only HUMAN/MACHINE terminate).
-extra_statuses=HONEYPOT,FAS,FASAMD,AUDIO,NOTSURE
+; Every server TEXT reply is classified with amd.py's two substring tests,
+; case-sensitive, in this order:
+;   'HUMAN' in the reply                    -> AMDSTATUS=HUMAN, AMDCAUSE=HUMAN
+;   'AMD' or 'MACHINE' in the reply         -> AMDSTATUS=MACHINE, AMDCAUSE=<reply>
+;   anything else ("{}", "ack", "HONEYPOT") -> acknowledgement, detection continues
+; The one addition to amd.py: an "AMD" directly followed by "Y" (the brand in
+; acks such as "AMDY ack") does not count.  Consequences worth knowing, all
+; identical to production: "NOT_HUMAN" is HUMAN, "amd" (lowercase) is an ack,
+; a JSON reply {"status": "MACHINE", ...} is MACHINE with that JSON text as
+; AMDCAUSE.  AMDRESPONSE always carries the raw last reply (printable ASCII,
+; max 255 chars).
 
 ; ---------------------------------------------------------------------------
 ; Parallel playback
@@ -130,7 +181,8 @@ db=yes
 ; this value rounded UP to whole seconds (minimum 1 s), so a DB that accepts
 ; TCP but stalls can hold the lookup for a few seconds.  The lookup runs on
 ; the connect helper thread (never on the channel thread): a stalled DB
-; costs that call its connect window (NETERR -> AMD() fallback), not audio.
+; costs that call its connect window (CONNECTION_ERROR -> AMD() fallback),
+; not audio.
 ; After a failure the DB is skipped for 5 s so a dead DB costs one timeout,
 ; not one per call; failures are logged at WARNING at most once per minute
 ; and the call continues without phone.  A connection the server dropped
@@ -140,7 +192,25 @@ db_timeout_ms=1000
 ; Where to read VARDB_server / VARDB_database / VARDB_user / VARDB_pass /
 ; VARDB_port from.  Parsing tolerates tabs, trailing spaces, inline '#' or
 ; ';' comments and '=>' inside values, like ViciDial itself.  When the file
-; cannot be read the lookup is skipped entirely (one NOTICE at load/reload,
-; 'amd_ws show settings' says "NOT READ"); no connection is attempted with
-; built-in defaults.
+; cannot be read, or has no VARDB_ line at all, the lookup is skipped
+; entirely (one NOTICE at load/reload, 'amd_ws show settings' says "NOT READ"
+; or "NO VARDB_ LINES"); no connection is attempted with built-in defaults,
+; exactly as amd.py's "DB ERROR: no config".
 astguiclient_conf=/etc/astguiclient.conf
+
+; Extra keys for the server, spliced verbatim into the "config" JSON frame (must
+; be a JSON object).  Empty = the exact amd.py frame.  amd_server understands,
+; for example:
+;   {"short_no_greeting":true}       finalise at the 32k AMD stage instead of
+;                                    waiting for 36 000 stripped samples (4.5 s
+;                                    of speech) and the greeting model: ~0.5 s
+;                                    faster, but the verdict no longer says
+;                                    WHICH machine (plain AMD instead of
+;                                    NUMBERSAMD/OTHERAMD/...).
+;   {"detection_mode":"aggressive"}  threshold profile: aggressive | balanced
+;                                    (default) | conservative - latency vs leak.
+;   {"max_detection_time":8.0}       server wall-clock deadline in seconds.
+;   {"stage_results":true}           per-stage progress frames (STAGE-...); the
+;                                    module treats them as acks.
+; Several keys: {"short_no_greeting":true,"detection_mode":"aggressive"}
+extra_config=

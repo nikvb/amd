@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """Mock amdy.io AMD WebSocket server for the app_amd_ws test harness.
 
-Protocol (mirrors /home/na/amd.py, the production EAGI client):
-  client -> TEXT   {"config":{"sample_rate":8000,"VID":"..."[,"phone":..][,"country_code":..]}}
-  client -> BINARY audio chunks (slin 8 kHz), one per schedule mark
+Protocol (mirrors the production EAGI client amd.py, Jul 2026):
+  client -> TEXT   {"config":{"sample_rate":8000,"VID":"..."[,"phone":..][,"country_code":..][,"caller_id":..]}}
+  client -> BINARY audio chunks (slin 8 kHz), one per schedule mark / fallback send
   server -> TEXT   one reply per binary chunk: an ack or a RESULT
-  client -> TEXT   {"eof":1}, then close(1000)
+  client -> TEXT   {"eof":1} when it wants the server to finalise (after two
+                   schedule marks without audio) - the server answers with ONE
+                   text: the result or an ack (eofreply=...)
+  client -> TEXT   {"eof":1} again on exit, then close(1000)
 
 Behaviour is selected by the URL path (+ query string).  The module under test
 always connects to "/", so when the path is "/" the server reads the *control
@@ -15,10 +18,11 @@ how test/run.sh switches behaviour between scenarios.
 Named paths (query parameters override the preset):
   /human?after=N     N acks, then "HUMAN" as the reply to chunk N+1 (default after=2)
   /machine           ... "MACHINE"            /amd        ... "AMD"
-  /honeypot          ... "HONEYPOT"           /status?value=FAS  any token
+  /honeypot          ... "HONEYPOT" (an ACK for amd.py/the module: no HUMAN/AMD/MACHINE in it)
+  /status?value=X    any text as the "result" reply (e.g. AMD_DETECTED)
   /json              result {"status":"HUMAN"} (status=... to change)
   /amdy              acks are "AMDY ack" (must NOT classify), result later
-  /nothuman          ack "NOT_HUMAN", then "MACHINE"
+  /nothuman          ack "NOT_HUMAN" (classifies HUMAN by substring, as in amd.py), then "MACHINE"
   /silent            never replies (records everything)
   /slow?handshake=MS delays the HTTP upgrade by MS milliseconds
   /reject            refuses the upgrade with HTTP 403
@@ -27,17 +31,21 @@ Named paths (query parameters override the preset):
   /fragmented        result sent as several WebSocket fragments
   /ping?after=N      sends a WS ping before every reply, result after N acks
   /delay?reply=MS    every reply is delayed by MS ms (reading must not block audio)
+  /eof_human         acks every chunk; replies "HUMAN" only to a {"eof":1} text
+  /eof_ack           acks every chunk; replies "ack" to {"eof":1} (-> EOF_INCONCLUSIVE)
+  /eof_silent        acks every chunk; never answers {"eof":1} (-> EOF_ERROR after eof_wait_ms)
 
 Generic parameters usable on any path:
   after=N ack=TEXT status=TEXT json=1 pad=BYTES frag=N close=N closecode=C
-  ping=1 handshake=MS reply=MS
+  ping=1 handshake=MS reply=MS eofreply=TEXT
 
 Recording: one JSON object per line in --record FILE.  Connection records have
 "event":"connection" and carry: vid, path, effective, t_connect (epoch ms),
 config (parsed) / config_raw, chunks [{t, bytes}] (t = ms since connect),
-total_bytes, eof, close_code, close_reason, texts (all text frames), replies,
-result_sent, t_result, t_close, error.  Handshake-only events ("event":
-"handshake") are written for delayed/rejected upgrades.
+total_bytes, eof, t_eof (first eof), eofs (every eof time), close_code,
+close_reason, texts (all text frames), replies, result_sent, t_result,
+t_close, error.  Handshake-only events ("event": "handshake") are written for
+delayed/rejected upgrades.
 
 Usage:
   mock_amd_server.py [--host 127.0.0.1] [--port 0] [--record FILE] [--control FILE]
@@ -86,6 +94,10 @@ PRESETS = {
     "/fragmented": {"status": "HUMAN", "json": "1", "frag": "3"},
     "/ping": {"status": "HUMAN", "ping": "1"},
     "/delay": {"status": "HUMAN", "reply": "300"},
+    # EOF finalisation (amd.py Jul 2026): chunks are only acked; the reply to {"eof":1} decides
+    "/eof_human": {"after": "999", "eofreply": "HUMAN"},
+    "/eof_ack": {"after": "999", "eofreply": "ack"},
+    "/eof_silent": {"after": "999"},
 }
 
 ARGS = None
@@ -186,7 +198,9 @@ async def handler(ws):
         "texts": [],
         "replies": [],
         "eof": False,
-        "t_eof": None,
+        "t_eof": None,          # first eof (the finalisation request, or the exit eof)
+        "eofs": [],             # every eof time: the module sends one more on exit, as amd.py does
+        "eof_replied": None,
         "result_sent": None,
         "t_result": None,
         "server_closed": False,
@@ -204,6 +218,7 @@ async def handler(ws):
     frag = int(beh.get("frag", "0") or 0)
     do_ping = bool(beh.get("ping"))
     reply_delay = int(beh.get("reply", "0") or 0)
+    eof_reply = beh.get("eofreply")
     result_text = build_result(beh)
     nchunks = 0
     log("connection %s -> %s beh=%s" % (rec["remote"], effective, beh))
@@ -279,8 +294,18 @@ async def handler(ws):
                     log("config vid=%s raw=%s" % (rec["vid"], text))
                 elif isinstance(parsed, dict) and "eof" in parsed:
                     rec["eof"] = True
-                    rec["t_eof"] = ms()
-                    log("eof")
+                    rec["eofs"].append(ms())
+                    if rec["t_eof"] is None:
+                        rec["t_eof"] = rec["eofs"][0]
+                    log("eof #%d" % len(rec["eofs"]))
+                    if eof_reply is not None:
+                        # the finalisation answer (amd.py:412-415 recv()s exactly one text); the
+                        # client may already be closing after the exit eof, that is not an error
+                        try:
+                            await reply(eof_reply)
+                            rec["eof_replied"] = eof_reply
+                        except websockets.exceptions.ConnectionClosed:
+                            log("eof reply dropped: client already closed")
                 else:
                     log("unexpected text: %r" % text[:80])
     except websockets.exceptions.ConnectionClosed as exc:

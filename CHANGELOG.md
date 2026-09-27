@@ -11,6 +11,96 @@ heading then gets its date). Complete rewrite of the module, build system and
 installer. Operators upgrading from 1.x: read
 [docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md).
 
+### Vocabulary and protocol aligned with production `amd.py` (July 2026) and stock `app_amd` / `VD_amd.agi`
+
+The status/cause vocabulary, the wire protocol and the timing defaults now
+match the production EAGI client `amd.py` as shipped in July 2026
+(`gw.724care.com/amdy.tar.gz`), and the two values ViciDial's own tooling
+keys on are taken from stock `AMD()`. Earlier builds of this branch used a
+vocabulary of their own; see the "was" table in
+[docs/migration-v1-to-v2.md](docs/migration-v1-to-v2.md#channel-variables).
+
+- **Trace option `v` / conf `trace=yes`** — one verbose-3 line per event
+  (connect, first audio frame, each chunk sent, each server reply, result) with
+  the millisecond offset from the start of `AMD_WS()`, to see where the time of
+  a call goes (schedule granularity vs server decision time).
+- **`extra_config`** conf key: a JSON object spliced into the config frame for
+  `amd_server` options (`short_no_greeting`, `detection_mode`,
+  `max_detection_time`, `stage_results`); `STAGE-` progress frames are treated
+  as acks. Trace lines now include the DB lookup result, the full config sent
+  and the variables set, like `amd.py`'s log.
+- **`AMDPHONE` / `AMDCOUNTRYCODE`** channel variables (the number and country code
+  sent to the service) and a tested ViciDial recipe for iPhone / Google Voice call
+  screening: hold the screened leg, redial once via `Originate()`, second call lands
+  on 8370 (`docs/vicidial-call-screening.md`). Every log line now carries `vid=`.
+- **`agi/amd.py`** — the production EAGI client (2.2, `gw.724care.com/amdy.tar.gz`,
+  2026-07-14) is now in the repository as 2.2.1 with the same alignment for the
+  two situations that differ from stock `app_amd`: FD3 EOF → `HANGUP`/`HANGUP`
+  (was `NOAUDIO`/`NOAUDIO`, which `VD_amd.agi` routed down the machine path),
+  no audio → `NOTSURE`/`NOAUDIODATA-<ms>` (was `NO_AUDIO_TIMEOUT`; enables the
+  `NOAUDIODATA-Hangup-ENABLED` → ADAIR handling), `AMDSTATS` always
+  `<elapsed_ms>-<bytes>` (was the word `HUMAN`), raw server text in
+  `AMDRESPONSE`. Unit tests: `python3 agi/test_amd_py.py`. See
+  [agi/README.md](agi/README.md).
+
+- **Causes.** `HUMAN` / `CONNECTION_ERROR` (cannot connect, incl.
+  `res_http_websocket` missing), `HUMAN` / `PROCESSING_ERROR` (WebSocket
+  error after the connect), `HUMAN` / `FATAL_ERROR` (internal failure, option
+  `A` on an unanswered channel), `NOTSURE` / `SERVER_TIMEOUT` (window elapsed
+  with audio sent), `NOTSURE` / `EOF_INCONCLUSIVE` and `NOTSURE` /
+  `EOF_ERROR` (EOF finalisation) — all as `amd.py`; `AMDSTATUS` is `HUMAN`
+  on the three errors ("defaulting to HUMAN for safety"). `NOTSURE` /
+  `NOAUDIODATA-<ms>` when no audio was ever captured and `HANGUP` /
+  `HANGUP` on hangup or end of stream — as stock `AMD()`, so
+  `VD_amd.agi`'s `NOAUDIODATA-Hangup-ENABLED` (`ADAIR`) option and its
+  `HANGUP` handling apply. On a machine result `AMDCAUSE` is the server's
+  reply text (sanitised), as with `amd.py`.
+- **8370 fallback line** is the one used with `amd.py`:
+  `GotoIf($["${AMDCAUSE}" = "CONNECTION_ERROR" | "${AMDCAUSE}" = "PROCESSING_ERROR" | "${AMDCAUSE}" = "FATAL_ERROR"]?amd_fallback:continue)`.
+- **Classification** is `amd.py`'s rule in `amd.py`'s order (`HUMAN` in the
+  text, else `AMD` or `MACHINE` in the text, else ack; substring,
+  case-sensitive), with one guard: `AMDY` does not count as `AMD`. There is
+  no configurable list of extra statuses; words such as `FAS` are
+  acknowledgements, as with `amd.py`. `NOT_HUMAN` classifies `HUMAN`, as with
+  `amd.py`.
+- **`AMDSTATS`** is set on every exit as
+  `<elapsed_ms>-<audio_ms_sent>-<chunks_sent>-<bytes_sent>`; `VD_amd.agi`
+  stores the first field as `run_time` (stock `AMD()` shape).
+- **Config frame** gains `caller_id` (`${CALLERID(num)}`, sent when non-empty
+  and not `Unknown`); new option `i(cid)` and key `send_caller_id=yes|no`.
+  Keys in `amd.py`'s order: `sample_rate`, `VID`, `phone`, `country_code`,
+  `caller_id`. The phone lookup query is unchanged
+  (`SELECT phone_code,phone_number FROM vicidial_auto_calls WHERE callerid=... ORDER BY auto_call_id DESC LIMIT 1`).
+- **Send schedule** default is `amd.py`'s eleven marks
+  `500,1000,1500,2000,3000,4000,5000,6000,7000,8000,9000`; after the last
+  mark a send happens at `chunk_bytes` (8000) **or** after
+  `fallback_interval_ms` (new key, 1000) with a non-empty buffer.
+- **EOF finalisation** (new): after `eof_no_audio_streak` (new key, 2; 0
+  disables) consecutive schedule marks with no captured audio, once some
+  audio was sent, the module sends `{"eof":1}` and waits `eof_wait_ms` (new
+  key, 3000) for one reply, still detecting hangup.
+- **Defaults**: `connect_timeout_ms` 2000 → 10000 (`amd.py`
+  `CONNECTION_TIMEOUT`), `result_grace_ms` 1000 → 0 (`amd.py` has no grace;
+  the key stays). `timeout_ms` stays 10000 (`MAX_WAIT_TIME`), measured from
+  the first captured frame.
+- **Removed**: the configurable extra-status key and the token parser of
+  earlier 2.0 branch builds, together with their four error/timeout causes
+  (mapped in the migration doc).
+- **Parity audit against the July 2026 `amd.py`** (every behaviour of the
+  script traced to the module, table in the pull request): `caller_id` is
+  skipped on exactly `Unknown` (case-sensitive, as `amd.py`); an
+  `astguiclient.conf` without `VARDB_` lines skips the lookup like `amd.py`'s
+  "DB ERROR: no config" instead of trying the built-in defaults;
+  `docs/protocol.md` now also states the two remaining wire-level details
+  (JSON whitespace/escaping, sends over 16000 bytes split into frames) and
+  what a server that never replies produces under each client.
+- Docs: README (status matrix with sources, `VD_amd.agi` routing table,
+  caller id, configuration reference), `docs/protocol.md` rewritten to the
+  July 2026 protocol with the EOF finalisation exchange,
+  `docs/troubleshooting.md` cause reference, `docs/migration-v1-to-v2.md`
+  three-way mapping 1.x → `amd.py` → 2.0 with the reasons for the two stock
+  `AMD()` values.
+
 ### Review round 2 (fixes to the unreleased 2.0.0 code)
 
 - **Connect cap is per host and configurable** (`max_pending_connects=`,
@@ -27,7 +117,7 @@ installer. Operators upgrading from 1.x: read
   the harness reproduces it (`blackhole`, `blackhole_cap`, `blackhole_release`).
 - **DB lookup moved to the connect helper thread**, right before the
   WebSocket connect: a stalled DB can cost that call its connect window
-  (`NETERR`) but never blocks the channel thread. The socket timeouts are
+  (`CONNECTION_ERROR`) but never blocks the channel thread. The socket timeouts are
   whole seconds (`ceil(db_timeout_ms/1000)`), which the documentation now says
   instead of "bounded by `db_timeout_ms`". A connection the server dropped
   while idle (2006/2013) is reconnected once within the same budget instead
@@ -35,7 +125,8 @@ installer. Operators upgrading from 1.x: read
   lookup with one NOTICE at load/reload instead of connecting to
   `localhost` as `cron` every 5 s.
 - Per-write socket bound raised from 100 ms to 500 ms (a multi-frame flush on
-  a fresh connection over a >100 ms RTT could turn into a spurious `NETERR`).
+  a fresh connection over a >100 ms RTT could turn into a spurious
+  `PROCESSING_ERROR`).
 - After a readable socket the module drains frames already buffered
   (`ast_websocket_wait_for_input(ws, 0)`), so a TLS record carrying an ack
   and the result in one piece no longer leaves the result unread over
@@ -44,7 +135,7 @@ installer. Operators upgrading from 1.x: read
   stale descriptor.
 - Out-of-file-descriptors probe before starting a connect: the core's client
   path would dereference NULL when `socket()` fails; the call now exits
-  `INTERR` with a rate-limited WARNING.
+  `FATAL_ERROR` with a rate-limited WARNING.
 - IPv6 literal hosts are bracketed in the URI (`ws://[2001:db8::10]:2700/`).
 - The connect deadline runs from the moment the connect starts (after the
   answer), not from application entry.
@@ -92,8 +183,8 @@ installer. Operators upgrading from 1.x: read
 - Docs: install one-liners point at the branch until `v2.0.0` is tagged
   (`main` still serves the 1.x installer); header bundles are marked as not
   published yet; migration table corrections (1.x `host` default, detection
-  window origin, `NOTSURE`→token for non-HUMAN/MACHINE results, new conf
-  sample file, full flag list); loader message wording; synthesised
+  window origin, new conf sample file, full flag list); loader message
+  wording; synthesised
   `buildopts.h` shape; worst-case time formula.
 
 ### Added
@@ -104,22 +195,24 @@ installer. Operators upgrading from 1.x: read
   hangup and on exit. End of file does not end detection.
 - `options` argument (6th): `n` (no DB lookup), `s` (TLS `wss://`), `d(ms)`
   (playback delay), `c(ms)` (connect timeout), `p(phone)` and `k(code)`
-  (explicit phone / country code), `a` (answer, default) and `A` (do not
-  answer; `INTERR` if the channel is not up).
+  (explicit phone / country code), `i(cid)` (explicit caller id), `a`
+  (answer, default) and `A` (do not answer; `FATAL_ERROR` if the channel is
+  not up).
 - Channel variable `AMDRESPONSE`: raw last server text (printable ASCII, max
   255 chars).
 - Channel variable `AMDELAPSED`: milliseconds from the first captured audio
   frame to exit.
 - `AMDSTATUS=HANGUP` / `AMDCAUSE=HANGUP` when the callee hangs up before a
-  result (1.x documented but never set it).
-- Server classifications other than `HUMAN`/`MACHINE` are passed through
-  verbatim as `AMDSTATUS` and `AMDCAUSE` (`HONEYPOT`, `FAS`, `FASAMD`,
-  `AUDIO`, `NOTSURE`; configurable with `extra_statuses`).
-- JSON results (`{"status":...}`, `{"result":...}`, `{"classification":...}`)
-  are recognised.
+  result (1.x documented but never set it; stock `AMD()` vocabulary).
+- Channel variable `AMDSTATS` (`<elapsed_ms>-<audio_ms_sent>-<chunks_sent>-<bytes_sent>`)
+  on every exit.
+- `caller_id` in the config frame (`${CALLERID(num)}`), as `amd.py` July 2026.
+- EOF finalisation after consecutive schedule marks without audio
+  (`eof_no_audio_streak`, `eof_wait_ms`), as `amd.py` July 2026.
 - Configuration file `/etc/asterisk/amd_ws.conf` with `host`, `port`, `tls`,
   `tls_verify`, `tls_cafile`, `tls_check_hostname`, `timeout_ms`, `connect_timeout_ms`,
-  `result_grace_ms`, `send_schedule`, `chunk_bytes`, `extra_statuses`,
+  `result_grace_ms`, `send_schedule`, `chunk_bytes`, `fallback_interval_ms`,
+  `eof_no_audio_streak`, `eof_wait_ms`, `send_caller_id`,
   `playdelay_ms`, `db`, `db_timeout_ms`, `astguiclient_conf`,
   `max_pending_connects`; all optional; shipped as `amd_ws.conf.sample`
   (installed to `/etc/asterisk/amd_ws.conf.sample` by `make install` and the
@@ -127,21 +220,21 @@ installer. Operators upgrading from 1.x: read
 - `module reload app_amd_ws.so` re-reads `amd_ws.conf` and
   `/etc/astguiclient.conf`.
 - CLI command `amd_ws show settings`: effective configuration, DB
-  availability, counters (calls, human, machine, other, neterr, interr,
-  timeouts, hangups), the number of connects in flight and of parked
-  connects per host.
+  availability, per-outcome counters, the number of connects in flight and
+  of parked connects per host.
 - The blocking WebSocket connect (and the optional DB lookup) runs on a
   helper thread per call so the channel is serviced during the whole
   `connect_timeout_ms`, including a server that accepts TCP but never answers
   the handshake; at most `max_pending_connects` (64) such connects per host
-  are in flight, further calls to that host fail fast with `NETERR`.
+  are in flight, further calls to that host fail fast with `CONNECTION_ERROR`.
 - `core show application AMD_WS` shows a full synopsis and description.
 - Two verbose-3 log lines per call (`AMD_WS: <chan> vid=... host=... play=...`
   and `AMD_WS: <chan> status=... cause=... elapsed=... sent=... chunks=...`).
 - TLS (`wss://`) through Asterisk's own TLS support.
 - Send `{"eof":1}` and a WebSocket CLOSE with code 1000 on every exit path.
-- Result grace period (`result_grace_ms`) after `timeout_ms`: the remaining
-  audio is sent and a reply awaited while still detecting hangup.
+- Result grace period (`result_grace_ms`, default 0 like `amd.py`) after
+  `timeout_ms`: the remaining audio is sent and a reply awaited while still
+  detecting hangup.
 - `Makefile`: detection of the running Asterisk (binary, version, build-option
   sum) and validation of every header candidate via `ast-detect.sh`; every
   build runs four gates (headers only from the chosen tree, embedded
@@ -181,23 +274,25 @@ installer. Operators upgrading from 1.x: read
   `api.amdy.io`).
 - `vid` defaults to the caller id name only if it is valid and non-empty,
   else `Unknown`.
-- `AMDCAUSE` vocabulary is now `INTERR`, `NETERR`, `AUDIO_TIMEOUT`,
-  `NO_AUDIO_TIMEOUT`, `HANGUP`, or the classification token; it no longer
-  carries raw server text (see `AMDRESPONSE`). This makes the ViciDial 8370
-  fallback `GotoIf($["${AMDCAUSE}" = "NETERR" | "${AMDCAUSE}" = "INTERR"]?amd_fallback)`
-  work.
-- Result classification matches whole tokens (split on non `[A-Za-z0-9_]`,
-  uppercased) instead of substrings: `AMDY` no longer yields `MACHINE`,
-  `NOT_HUMAN` no longer yields `HUMAN`; results larger than 255 bytes and
-  fragmented results are handled.
-- Audio send schedule implemented as documented: `500,1000,1500,2000,3000,4000`
-  ms from the first captured frame, then every `chunk_bytes` (8000), matching
-  `amd.py`; every captured byte is sent (carry-over accumulator, no
-  truncation for 30/60 ms frames).
+- `AMDSTATUS` / `AMDCAUSE` vocabulary is `amd.py`'s (`HUMAN` +
+  `CONNECTION_ERROR` / `PROCESSING_ERROR` / `FATAL_ERROR`, `NOTSURE` +
+  `SERVER_TIMEOUT` / `EOF_INCONCLUSIVE` / `EOF_ERROR`, `HUMAN`/`HUMAN`,
+  `MACHINE`/reply text) plus stock `AMD()`'s `HANGUP`/`HANGUP` and
+  `NOTSURE`/`NOAUDIODATA-<ms>`, instead of 1.x's own strings. This makes the
+  ViciDial 8370 fallback on the three error causes work.
+- Result classification follows `amd.py` exactly (substring, `HUMAN` before
+  `AMD`/`MACHINE`, case-sensitive) with the single `AMDY` guard, so an ack
+  carrying the brand name no longer yields `MACHINE`; results larger than
+  255 bytes and fragmented results are handled.
+- Audio send schedule implemented as `amd.py` does it:
+  `500,1000,1500,2000,3000,4000,5000,6000,7000,8000,9000` ms from the first
+  captured frame, then every `chunk_bytes` (8000) or `fallback_interval_ms`
+  (1000); every captured byte is sent (carry-over accumulator, no truncation
+  for 30/60 ms frames).
 - Every wait is bounded by a real deadline; the channel is serviced during
   connect-wait and result-wait; connect uses the API's millisecond timeout
-  (`connect_timeout_ms`, default 2000). Hangup is detected immediately and
-  ends the call without a grace wait.
+  (`connect_timeout_ms`, default 10000 = `amd.py`). Hangup is detected
+  immediately and ends the call without a grace wait.
 - MySQL lookup: optional at compile time (`HAVE_MYSQL`) and at run time
   (`db=no`, option `n`, `p()`/`k()`); one persistent connection under a
   module mutex; connect/read/write timeouts = `db_timeout_ms` (default 1000

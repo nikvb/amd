@@ -13,7 +13,8 @@ test/
   blackhole_server.py  accept-and-never-reply TCP listener (server that never finishes the handshake)
   local.env            OPTIONAL, gitignored: per-box settings such as MYSQL_ROOT=/path
   mock_client.py       amd.py-like client used to test the mock itself
-  protocol_test.py     assertions over the mock's recordings (config JSON, chunk timing, bytes, eof, close)
+  protocol_test.py     assertions over the mock's recordings (config JSON, chunk timing, bytes, eof, eofmarks, close)
+  classify_test.py     pure-python parity table: the module's classification rule vs amd.py's rule (copied verbatim)
   asterisk/            config templates for the test Asterisk instance
   run/                 scratch (gitignored): Asterisk dirs, results.txt, recordings, logs/
 ```
@@ -25,7 +26,7 @@ test/
 #    results file, mock server, sox RMS assertion, timing, clean shutdown (about 25 s)
 test/run.sh --selftest
 
-# 2. full suite - builds ../app_amd_ws.so with make and runs every scenario (about 2-3 min)
+# 2. full suite - builds ../app_amd_ws.so with make and runs every scenario (about 3.5 min)
 test/run.sh
 
 # useful variants
@@ -87,10 +88,12 @@ asterisk -rx 'channel originate Local/0007@farside-human/n extension 0007@amdsid
   correlates results.txt, the mock recording, the recordings and the log.
   The scenario name travels in the *context* name because Asterisk pattern
   matching treats `n`/`x`/`z` (any case) as digit wildcards.
-* Results line: `VID|AMDSTATUS|AMDCAUSE|AMDELAPSED|T0|T1|TA|base64("x"+AMDRESPONSE)|CHANNEL`
+* Results line: `VID|AMDSTATUS|base64("x"+AMDCAUSE)|AMDELAPSED|T0|T1|TA|base64("x"+AMDRESPONSE)|CHANNEL|AMDSTATS`
   (T0/T1 = ms epoch around the application, TA = when the farside started
-  sending audio). AMDRESPONSE is base64 so quotes/JSON cannot break the shell
-  `System(echo ... >> results.txt)`; run.sh decodes it.
+  sending audio). AMDCAUSE (for MACHINE it is the server's raw reply, e.g.
+  JSON) and AMDRESPONSE are base64 so quotes/JSON cannot break the shell
+  `System(echo ... >> results.txt)`; run.sh decodes them
+  (`self_cause_quotes` proves the round trip).
 * Timing note: `Answer()` on a ringing Local leg waits up to 500 ms for media
   from the other side. When the amdside sends no audio (no playfile) the
   farside's audio therefore starts ~500 ms after AMD_WS did, so wall-clock
@@ -98,19 +101,22 @@ asterisk -rx 'channel originate Local/0007@farside-human/n extension 0007@amdsid
 
 ## The mock service (`mock_amd_server.py`)
 
-Speaks the amd.py protocol: config JSON in, binary audio chunks in, one text
-reply per chunk out (ack or result), `{"eof":1}` and close 1000 at the end.
-The module always connects to `/`, so run.sh writes the wanted behaviour into
-`test/run/mock.control` before each call (`--control FILE`); explicit paths
-work too:
+Speaks the amd.py (July 2026) protocol: config JSON in, binary audio chunks
+in, one text reply per chunk out (ack or result), `{"eof":1}` as a
+finalisation request (answered with one text) and again at the end, then
+close 1000. The module always connects to `/`, so run.sh writes the wanted
+behaviour into `test/run/mock.control` before each call (`--control FILE`);
+explicit paths work too:
 
 | path | behaviour |
 |------|-----------|
 | `/human?after=N` | N acks (`{}`), then `HUMAN` as reply to chunk N+1 |
-| `/machine`, `/amd`, `/honeypot`, `/status?value=FAS` | other result tokens |
-| `/json` | result `{"status": "HUMAN", ...}` |
+| `/machine`, `/amd`, `/status?value=AMD_DETECTED` | other result texts (MACHINE by amd.py's substring rule) |
+| `/honeypot` | replies `HONEYPOT`: an ack for amd.py and the module (no HUMAN/AMD/MACHINE in it) |
+| `/json` | result `{"status": "HUMAN", ...}` (`status=MACHINE` for the machine JSON) |
 | `/amdy` | acks are `AMDY ack` (must not classify), result later |
-| `/nothuman` | ack `NOT_HUMAN`, then `MACHINE` |
+| `/nothuman` | ack `NOT_HUMAN` (= HUMAN by substring, as in production), then `MACHINE` |
+| `?ack=TEXT` | any ack text, e.g. `/human?ack=amd&after=3` (lowercase `amd` is an ack) |
 | `/silent` | never replies |
 | `/slow?handshake=MS` | delays the HTTP upgrade |
 | `/reject` | HTTP 403 on upgrade |
@@ -119,11 +125,15 @@ work too:
 | `/fragmented` | result in several WebSocket fragments |
 | `/ping?after=N` | ping before each reply |
 | `/delay?reply=MS` | replies delayed (reading must not stall the audio loop) |
+| `/eof_human`, `/eof_ack`, `/eof_silent` | acks every chunk; answers `{"eof":1}` with `HUMAN`, `ack`, or not at all (`?eofreply=AMD` for a machine answer) |
 
 Every connection is recorded as a JSON line (`mock-record.jsonl`): config
-JSON, chunk sizes and arrival times (ms since connect), total bytes, eof seen,
-close code, replies. `protocol_test.py --record FILE --vid VID --checks ...`
-asserts on it (used by run.sh's `proto` assertions and usable by hand).
+JSON, chunk sizes and arrival times (ms since connect), total bytes, eof seen
+(`t_eof` = first eof, `eofs` = every eof: the module sends one more on exit,
+as amd.py's cleanup does), close code, replies. `protocol_test.py --record
+FILE --vid VID --checks ...` asserts on it (used by run.sh's `proto`
+assertions and usable by hand); `eofmarks` checks that the first eof came
+exactly two schedule marks after the last chunk's mark.
 
 ## Scenario table (`scenarios.txt`)
 
@@ -133,14 +143,18 @@ Columns: name, tags (`self` plumbing / `amd` needs module / `db` needs the MySQL
 (`ws:<timeout>,<playfile>,<opts>` -> `AMD_WS(127.0.0.1,${MOCK_PORT},${VID},...)`;
 `wsdead:` uses a port nothing listens on; `wstls:` the wss mock; `wshole:` the
 accept-and-never-reply listener; `wsraw:` verbatim args; `app:` any
-dialplan apps), post apps, expected AMDSTATUS/AMDCAUSE, min/max wall ms, and
-assertions (`proto`, `chunks=N`, `noconn`, `resp~TEXT`, `elapsed<=N`,
-`heard>THR`, `heard[start:len]<THR`, `heard_dur>S`, `mix>THR`, `log~REGEX`
-anchored with `Local/%NUM%@farside-%NAME%-[0-9a-f]+;1`, `cli~REGEX` on
-`amd_ws show settings`, `mockvid=TEXT`, `alive`). Bursts get `log~`/`cli~`
-plus a one-connection-per-VID check against the mock records. The header of
-the file documents every token. To add a case: add a line; no shell code
-needed.
+dialplan apps), post apps, expected AMDSTATUS/AMDCAUSE (`~REGEX` for
+`NOAUDIODATA-<ms>`; for MACHINE the cause is the raw reply), min/max wall
+ms, and assertions (`proto`, `proto:config;eofmarks;callerid=N;...`,
+`chunks=N`, `noconn`, `resp~TEXT`, `elapsed<=N`, `heard>THR`,
+`heard[start:len]<THR`, `heard_dur>S`, `mix>THR`, `log~REGEX` anchored with
+`Local/%NUM%@farside-%NAME%-[0-9a-f]+;1`, `cli~REGEX` on `amd_ws show
+settings`, `mockvid=TEXT`, `alive`). Every AMD_WS row is also checked for
+`AMDSTATS =~ ^[0-9]+-[0-9]+-[0-9]+-[0-9]+$` with `run_time` (first field)
+within 150 ms of AMDELAPSED and `audio_ms == bytes/16`. Bursts get
+`log~`/`cli~` plus a one-connection-per-VID check against the mock records.
+The header of the file documents every token. To add a case: add a line; no
+shell code needed.
 
 ### What each scenario proves
 
@@ -150,7 +164,8 @@ Self-test (run in both modes, no module needed):
 |----------|--------|
 | `sounds` | sox generated the 8 kHz/16-bit wavs; the RMS assertion distinguishes speech from silence |
 | `no_listeners` | the test Asterisk has no TCP/UDP listeners (only its CLI unix socket) |
-| `mock_paths` | every mock path with the amd.py-like client (19 runs incl. control-file routing, TCP abort -> close 1006, phone/country) + protocol_test on every record |
+| `classify_parity` | `classify_test.py`: 32 server replies through amd.py's rule (copied verbatim) and the module's rule agree, except "AMDY ack"/"AMDY" (the documented guard) |
+| `mock_paths` | every mock path with the amd.py-like client (21 runs incl. control-file routing, TCP abort -> close 1006, phone/country, `/eof_human` answering the eof) + protocol_test on every record |
 | `self_originate` | Local originate farside -> amdside works; results line is written; T0/T1 timing (Wait(1) ~= 1000 ms) |
 | `self_playback_rec` | audio played by the amdside is captured on the farside with Record() (RMS > 0.05, ~3 s) |
 | `self_echo` | Playback + Echo placeholder; farside hangup ends the amdside app |
@@ -158,31 +173,40 @@ Self-test (run in both modes, no module needed):
 | `self_noaudio` | a farside that never sends a frame still yields a result line |
 | `self_hangup` | result is written from `h` when the callee hangs up mid-application |
 | `self_noanswer` | the un-answered Local leg used by the option-A scenario really is not Up |
+| `self_cause_quotes` | an AMDCAUSE with quotes, spaces and commas (a JSON machine reply) survives the results line |
 | `self_burst` | 25 originates within 1 s -> 25 results, Asterisk alive |
 | `shutdown_clean` | `core stop now` ends the daemon; `pgrep` shows nothing left |
 
-AMD_WS (need the built module):
+AMD_WS (need the built module). Statuses and causes are those of the
+production `amd.py` (July 2026) and of the stock `AMD()`:
 
 | scenario | expected | proves |
 |----------|----------|--------|
 | `human` | HUMAN/HUMAN < 3 s | happy path; config JSON shape, chunks at 500/1000/1500/2000 ms (+/-150), 16 kB/s, eof, close 1000; the two `AMD_WS:` verbose lines |
-| `machine`, `amd_token`, `honeypot` | MACHINE, MACHINE, HONEYPOT | token rule: `AMD` -> MACHINE, extra statuses pass through verbatim |
-| `json` | HUMAN | only the `status` value of a JSON reply is tokenised; AMDRESPONSE carries the raw text |
-| `amdy_ack` | HUMAN after 4 chunks | `AMDY ack` must not be read as AMD |
-| `nothuman` | MACHINE | `NOT_HUMAN` must not be read as HUMAN |
-| `server_down` | NOTSURE/NETERR fast | connect refused; no mock connection |
-| `slow_handshake` | NOTSURE/NETERR ~2 s | upgrade slower than connect_timeout_ms |
-| `opt_c_connto` | NOTSURE/NETERR ~300 ms | `c(300)` overrides the connect timeout per call |
+| `machine`, `amd_token`, `amd_detected` | MACHINE/MACHINE, MACHINE/AMD, MACHINE/AMD_DETECTED | amd.py rule: `'AMD' in text or 'MACHINE' in text`; AMDCAUSE is the reply text itself (amd.py:298) |
+| `machine_json` | MACHINE/`{"status": "MACHINE", ...}` | a JSON machine reply: the whole JSON text becomes AMDCAUSE and is printed in the verbose line |
+| `amd_lower`, `honeypot_ack` | HUMAN after 4 chunks | `amd` (lowercase) and `HONEYPOT` are acks, nothing else terminates (no extra-status list any more) |
+| `json` | HUMAN | `{"status": "HUMAN", ...}` is HUMAN by substring; AMDRESPONSE carries the raw text |
+| `amdy_ack` | HUMAN after 4 chunks | `AMDY ack` must not be read as AMD (the one guard on top of amd.py) |
+| `nothuman` | HUMAN after 1 chunk | `NOT_HUMAN` IS HUMAN by substring, exactly as amd.py (documented, tested on purpose) |
+| `server_down` | HUMAN/CONNECTION_ERROR fast | connect refused; no mock connection; "defaulting to HUMAN for safety" |
+| `slow_handshake` | HUMAN/CONNECTION_ERROR ~2 s | upgrade slower than connect_timeout_ms (2000 in the test conf) |
+| `opt_c_connto` | HUMAN/CONNECTION_ERROR ~300 ms | `c(300)` overrides the connect timeout per call |
 | `hangup_in_connect` | HANGUP/HANGUP ~1.5 s | callee hangs up while the handshake is pending: no grace, nothing sent, late socket discarded |
-| `expire_in_connect` | NOTSURE/NETERR at timeout_ms | the detection window ends before a slow handshake: NETERR, not a timeout cause |
-| `reject_upgrade` | NOTSURE/NETERR | HTTP 403 handshake |
-| `silent_server` | NOTSURE/AUDIO_TIMEOUT at timeout+grace | 3000 ms timeout + 1000 ms grace; audio kept flowing (>= 4 chunks), eof + close 1000 still sent |
-| `close_midstream` | NOTSURE/NETERR | server CLOSE before a result |
+| `expire_in_connect` | HUMAN/CONNECTION_ERROR at timeout_ms | the detection window ends before a slow handshake: a connect failure, not a timeout cause |
+| `reject_upgrade` | HUMAN/CONNECTION_ERROR | HTTP 403 handshake |
+| `silent_server` | NOTSURE/SERVER_TIMEOUT at timeout_ms | 3000 ms timeout, result_grace_ms=0 like amd.py: returns at once; audio kept flowing (>= 4 chunks), eof + close 1000 still sent |
+| `close_midstream` | HUMAN/PROCESSING_ERROR | server CLOSE after the connect, before a result (amd.py:310) |
 | `big_result`, `fragmented`, `ping_frames`, `slow_reply` | HUMAN | 5 KB frame, fragment reassembly, PING handling, delayed acks do not stall audio |
 | `hangup` | HANGUP/HANGUP ~1.5 s | callee hangup mid-detection; AMDELAPSED counts from the first audio frame |
-| `no_audio` | NOTSURE/NO_AUDIO_TIMEOUT | not a single frame captured; connection still opened/closed cleanly |
-| `silence_frames` | NOTSURE/AUDIO_TIMEOUT | frames of digital silence are still audio |
-| `schedule_full` | HUMAN after 9 chunks | all six schedule marks (500..4000 ms) then 8000-byte chunks every 500 ms |
+| `no_audio` | NOTSURE/NOAUDIODATA-3000 | not a single frame captured: the stock `AMD()` vocabulary `VD_amd.agi` keys ADAIR on (`^NOAUDIODATA`), `<ms>` = the elapsed window; connection still opened/closed cleanly |
+| `silence_frames` | NOTSURE/SERVER_TIMEOUT | frames of digital silence are still audio |
+| `schedule_full` | HUMAN after 13 chunks (~10 s) | all eleven marks (500..9000 ms) then the size-driven fallback: 8000-byte chunks every 500 ms with continuous audio |
+| `eof_human` | HUMAN/HUMAN at 3000 ms | EOF finalisation: 1.2 s of speech then the callee goes quiet; marks 500/1000/1500 send, 2000 and 3000 are empty -> `{"eof":1}` at 3000 ms, the mock's `HUMAN` answer is honoured. `eofmarks` proves exactly 2 empty marks before the eof; the record shows 2 eof frames (finalisation + exit, as amd.py) |
+| `eof_ack` | NOTSURE/EOF_INCONCLUSIVE | the finalisation answer `ack` is neither HUMAN nor MACHINE |
+| `eof_silent` | NOTSURE/EOF_ERROR at 6000 ms | no finalisation answer within eof_wait_ms (3000) |
+| `eof_machine` | MACHINE/AMD | a machine finalisation answer, AMDCAUSE = the reply |
+| `eof_hangup` | HANGUP/HANGUP at ~4.5 s | the channel is still serviced during the EOF wait: a hangup inside it is reported at once |
 | `playback` | HUMAN | playfile audible on the farside during detection (RMS), *stopped on result* (silence after ~2.7 s although the file is 6 s), mix has both sides |
 | `playback_list` | HUMAN | `a&b` plays sequentially |
 | `playdelay` | HUMAN | `d(1500)`: first 0.8 s heard is silent, audible later |
@@ -190,24 +214,44 @@ AMD_WS (need the built module):
 | `opt_n_nodb` | HUMAN | option `n` skips the DB (no phone in the config frame) |
 | `db_unreachable` (tag `db`) | HUMAN | with db=yes and a refused 127.0.0.1 port the call still completes quickly and the rate-limited `DB connect to 127.0.0.1:<port> failed` warning is in the log; SKIP without the MySQL build |
 | `opt_p_k` | HUMAN | `p()`/`k()` appear as `phone`/`country_code` in the config JSON |
-| `opt_a_unanswered` | NOTSURE/INTERR | option `A` on a not-Up channel refuses instead of answering |
+| `caller_id` | HUMAN | `CALLERID(num)` is sent as `caller_id`, last key of the config JSON (amd.py:197-200) |
+| `caller_id_unknown` | HUMAN | `CALLERID(num)=Unknown` is not sent (nor an empty one: every other `proto` scenario asserts its absence) |
+| `opt_i_callerid` | HUMAN | `i(cid)` overrides the channel's number |
+| `opt_a_unanswered` | HUMAN/FATAL_ERROR | option `A` on a not-Up channel refuses instead of answering (amd.py:537: errors default to HUMAN) |
 | `bad_port_default` | HUMAN | invalid port -> warning + conf default (anchored to the call's channel) |
 | `bad_options` | HUMAN | unbalanced `k(1`: warning with digits masked (`np(XXXXXXXXXX`), the phone never appears through the module, all options ignored |
 | `vid_escape` | HUMAN | caller id name with `"`, `\` and a 0xFF byte round-trips through the config JSON (mock parses `<vid>"q"\z?`) |
 | `default_vid` | HUMAN | vid defaults to CALLERID(name) |
 | `tls_human` | HUMAN | option `s` -> `wss://` to a second mock instance with a self-signed certificate; `tls_verify=yes` with `tls_cafile=<that cert>` (chain verification on, hostname check off as on Asterisk 16). SKIP when `openssl` is missing |
-| `tls_to_plain` | NOTSURE/NETERR fast | option `s` against the plaintext mock port: the TLS handshake fails, no hang, no connection record |
+| `tls_to_plain` | HUMAN/CONNECTION_ERROR fast | option `s` against the plaintext mock port: the TLS handshake fails, no hang, no connection record |
 | `concurrent` | 25 x HUMAN | 25 simultaneous calls, all results, exactly one mock connection per VID, Asterisk alive |
-| `blackhole` | NOTSURE/NETERR at c(700) | peer accepts TCP and never answers: the call returns at the connect timeout, the helper stays parked, `parked connects : 1` |
-| `blackhole_fill` | 7 x NOTSURE/NETERR | a burst of 7 more is not refused (healthy bursts are never capped); afterwards 8 are parked = `max_pending_connects` (test conf) |
-| `blackhole_cap` | NOTSURE/NETERR ~0 ms | a call starting at the cap fails fast with the `8 connects to 127.0.0.1 still pending` warning |
+| `blackhole` | HUMAN/CONNECTION_ERROR at c(700) | peer accepts TCP and never answers: the call returns at the connect timeout, the helper stays parked, `parked connects : 1` |
+| `blackhole_fill` | 7 x HUMAN/CONNECTION_ERROR | a burst of 7 more is not refused (healthy bursts are never capped); afterwards 8 are parked = `max_pending_connects` (test conf) |
+| `blackhole_cap` | HUMAN/CONNECTION_ERROR ~0 ms | a call starting at the cap fails fast with the `8 connects to 127.0.0.1 still pending` warning |
 | `blackhole_release` | - | killing the peer releases the parked helpers: `parked connects` -> 0 within a second |
 | `soak_fd_rss` | - | 100 warm-up + 200 measured calls (bursts of 25 through the `soak` probe row, unique VIDs, 300 result lines asserted): the daemon's fd count must not grow, RSS must grow < `SOAK_RSS_LIMIT_KB` (1024). The test daemon runs with `MALLOC_ARENA_MAX=1` so RSS tracks live allocations instead of per-thread malloc arena high-water marks (measured here: default malloc +3 MB/200 calls and still creeping, one arena +136 kB and flat) |
 | `log_lines` | - | exactly one SPEC section 6 start and one end verbose line per AMD_WS channel; counts equal the number of AMD_WS calls made |
 | `log_noise` | - | every WARNING/ERROR line in the Asterisk log matches `LOG_NOISE_ALLOW` in run.sh (intentionally provoked: unload busy, bad port, option A, connect refused/timeout, HTTP 403, TLS to the plain port, dead DB); anything else fails, listed in `log-noise-unexpected.txt` |
-| `cli_show_application`, `cli_show_settings` | - | `core show application AMD_WS` is useful; `amd_ws show settings` reports the DB support the module was built with, `astguiclient.conf` read, `connects in flight`, `max_pending_connects` |
-| `unload_busy_refused`, `unload_idle`, `load_again`, `module_reload`, `reload_effect` | - | unload refused while a call is inside AMD_WS, succeeds when idle, module works after load; a changed amd_ws.conf (timeout_ms, send_schedule=500, result_grace_ms=0, extra_statuses=+GOOGLE_VOICE, db=no, max_pending_connects) is read back after `module reload` and a call classifies GOOGLE_VOICE on 500 ms chunks; the config is restored afterwards |
+| `cli_show_application`, `cli_show_settings` | - | `core show application AMD_WS` is useful; `amd_ws show settings` reports the DB support the module was built with, `astguiclient.conf` read, the July-2026 keys (`fallback_interval_ms`, `eof_no_audio_streak`, `eof_wait_ms`, `send_caller_id`), counters named after the vocabulary, `connects in flight`, `max_pending_connects` |
+| `unload_busy_refused`, `unload_idle`, `load_again`, `module_reload`, `reload_effect`, `reload_fallback` | - | unload refused while a call is inside AMD_WS, succeeds when idle, module works after load; a changed amd_ws.conf (timeout_ms, send_schedule=500, result_grace_ms, send_caller_id=no, eof_wait_ms, eof_no_audio_streak=0, db=no, max_pending_connects) is read back after `module reload`; `reload_effect` proves a set CALLERID(num) is NOT sent with send_caller_id=no and chunks follow the 500 ms schedule; `reload_fallback` plays 0.3 s beeps 0.5 s apart (4800 B < chunk_bytes) and proves the time-driven fallback: chunks at 500, 1500, 2500 ms (fallback_interval_ms=1000, amd.py's 1 s rule); the config is restored afterwards |
 | `build_nomysql`, `build_mysql` | - | `make MYSQL=0` and `make MYSQL=1 ...` both build; no undefined non-Asterisk symbols |
+
+### Does a Local far side that stops playing really go silent?
+
+Yes, verified on this box (Asterisk 16.30.1-vici, `transmit_silence=no` in the
+test asterisk.conf). `fs-speech1200-hold` does `Answer(); Playback(amd-speech1200);
+Wait(12)`: the mock record of `eof_human` shows three chunks (8320 + 8000 +
+2836 bytes, the 1.2 s file) at the 500/1000/1500 ms marks and then nothing;
+the module's debug log shows `mark 2000 ms: no audio data (streak 1)` and
+`mark 3000 ms: no audio data (streak 2)`, and the first `{"eof":1}` arrives
+at 3001 ms after the first frame. A leg without a running generator delivers
+no voice frames at all, so no silence-frame workaround was needed. Had it
+delivered silence frames, the alternative would have been a farside that does
+not Answer() its media path, or ending the far leg's generator with
+`StopPlayTones`-style means; neither was necessary. With `transmit_silence=yes`
+the core would fabricate silence frames on Wait() and this scenario would
+turn into `silence_frames` (SERVER_TIMEOUT), which is why the test
+asterisk.conf keeps it off.
 
 ## Notes for the integrator
 
@@ -216,7 +260,10 @@ AMD_WS (need the built module):
   files. `LD_LIBRARY_PATH` for the test Asterisk then includes the staged
   `libmariadb.so.3` directory. The final `.so` under test is the MySQL build.
 * The test `amd_ws.conf` (rendered from `asterisk/amd_ws.conf.in`) uses
-  `connect_timeout_ms=2000`, `result_grace_ms=1000`, the default schedule,
+  `connect_timeout_ms=2000` (production default 10000; shorter here to keep the
+  connect-failure scenarios quick), `result_grace_ms=0`, the default eleven-mark
+  schedule, `fallback_interval_ms=1000`, `eof_no_audio_streak=2`,
+  `eof_wait_ms=3000`, `send_caller_id=yes`,
   `tls_cafile=<run>/etc/tls.crt` (the wss mock's self-signed certificate,
   generated per run with `openssl req -x509`; a second mock instance serves
   `wss://` on `TLS_PORT`) and
@@ -228,8 +275,9 @@ AMD_WS (need the built module):
   `scenarios.txt` include the 500 ms Answer wait described above. The chunk
   schedule assertion is anchored on TA (`--audio-start` of protocol_test.py):
   the module clocks the schedule from its first captured frame, not from the
-  WebSocket connect. The whole suite has a 240 s budget (`SUITE_BUDGET_S`);
-  a full run takes about 150 s here.
+  WebSocket connect. The whole suite has a 300 s budget (`SUITE_BUDGET_S`);
+  a full run takes about 215 s here (the 10 s `schedule_full` and the five
+  EOF scenarios were added for the July-2026 protocol).
 * `TEST_MALLOC_ARENA_MAX` (default 1) is exported to the test daemon only;
   `SOAK_RSS_LIMIT_KB` (default 1024) is the allowed RSS growth of the soak.
 * `test/run/` is gitignored; delete it to start clean. A unix socket path is

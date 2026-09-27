@@ -604,11 +604,17 @@ EOF
 print_dialplan() {
     cat <<EOF
 
-Dialplan example (extensions.conf), see README for all options:
-    exten => 8370,1,AMD_WS(api.amdy.io,2700,\${CALLERID(name)},10000)
-     same => n,GotoIf(\$["\${AMDCAUSE}"="NETERR" | "\${AMDCAUSE}"="INTERR"]?amd_fallback)
-     same => n,GotoIf(\$["\${AMDSTATUS}"="HUMAN"]?human)
-     ...
+Dialplan example (extensions.conf, ViciDial extension 8370), see README for all options:
+    exten => 8370,1,AGI(agi://127.0.0.1:4577/call_log)
+    exten => 8370,n,Playback(sip-silence)
+    exten => 8370,n,AMD_WS(api.amdy.io,2700,\${CALLERID(name)},10000)
+    exten => 8370,n,GotoIf(\$["\${AMDCAUSE}" = "CONNECTION_ERROR" | "\${AMDCAUSE}" = "PROCESSING_ERROR" | "\${AMDCAUSE}" = "FATAL_ERROR"]?amd_fallback:continue)
+    exten => 8370,n(amd_fallback),AMD(2000,2000,1000,5000,120,50,4,256)
+    exten => 8370,n(continue),AGI(VD_amd.agi,\${EXTEN})
+    exten => 8370,n,AGI(agi-VDAD_ALL_outbound.agi,NORMAL-----LB-----\${CONNECTEDLINE(name)})
+Results: AMDSTATUS/AMDCAUSE = HUMAN/HUMAN, MACHINE/<reply>, HUMAN/CONNECTION_ERROR, HUMAN/PROCESSING_ERROR,
+         HUMAN/FATAL_ERROR, NOTSURE/SERVER_TIMEOUT, NOTSURE/NOAUDIODATA-<ms>, HANGUP/HANGUP, NOTSURE/EOF_INCONCLUSIVE,
+         NOTSURE/EOF_ERROR; AMDSTATS = <elapsed_ms>-<audio_ms_sent>-<chunks_sent>-<bytes_sent>.
 Settings: /etc/asterisk/amd_ws.conf (see amd_ws.conf.sample).  CLI: asterisk -rx 'amd_ws show settings'
 EOF
 }
