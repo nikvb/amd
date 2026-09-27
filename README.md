@@ -46,16 +46,14 @@ upgrading from 1.x.
 
 ## Install (one command)
 
-> **Which URL.** Until 2.0.0 is merged to `main` and tagged, `raw.githubusercontent.com/nikvb/amd/main/install.sh`
-> still serves the **1.x installer** (libwebsockets build, repository changes, hangs up calls to unload).
-> Use the branch URL below, or `sudo ./install.sh -y` from a checkout of the branch. After the release the
-> URL becomes `https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh` (an immutable tag; its sha256 is
-> published in the release notes).
+> **Which URL.** Use the `v2.0.0` tag URL below (immutable). `raw.githubusercontent.com/nikvb/amd/main/install.sh`
+> tracks the latest merged code and is also 2.0.0 today; older 1.x installers are no longer served from `main`.
+> The sha256 of the released `install.sh` is published in the GitHub release notes.
 
 As root on the ViciDial telephony server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
 ```
 
 The installer detects the running Asterisk, obtains matching headers, installs
@@ -68,13 +66,13 @@ Common variants:
 
 ```bash
 # see what would happen, change nothing
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- --dry-run
 
 # no MySQL dependency, no DB lookup
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- -y --no-db
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y --no-db
 
 # remove the module again
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/feat/v2-res-http-websocket/install.sh | sudo bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- --uninstall
 ```
 
 All flags, exit codes and the header-resolution order are in
@@ -83,7 +81,7 @@ All flags, exit codes and the header-resolution order are in
 ## Manual build
 
 ```bash
-git clone -b feat/v2-res-http-websocket https://github.com/nikvb/amd.git && cd amd   # -b v2.0.0 once tagged
+git clone -b v2.0.0 https://github.com/nikvb/amd.git && cd amd
 make show-config     # what Asterisk, version, headers and MySQL client were detected
 make                 # builds app_amd_ws.so against the detected headers; the gates run here:
                      #   no unresolved symbols Asterisk cannot provide, correct build-option sum
