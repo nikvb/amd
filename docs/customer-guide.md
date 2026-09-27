@@ -23,6 +23,9 @@ Asterisk build.
 curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
 ```
 
+> Run as **root**. On systems without `sudo` (most ViciDial servers and containers give you a root shell) drop the `sudo`:
+> `curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | bash -s -- -y`
+
 What it does: detects the running Asterisk and its headers, installs the build tools,
 compiles the module for exactly that Asterisk, checks the result, backs up any previous
 `app_amd_ws.so`, installs and loads the module **without hanging up any call**, and
