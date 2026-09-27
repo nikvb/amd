@@ -56,6 +56,9 @@ As root on the ViciDial telephony server:
 curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
 ```
 
+> Run as **root**. On systems without `sudo` (most ViciDial servers and containers give you a root shell) drop the `sudo`:
+> `curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | bash -s -- -y`
+
 The installer detects the running Asterisk, obtains matching headers, installs
 the build dependencies (never touching Asterisk itself or your package
 repositories), builds the module, backs up any previous `app_amd_ws.so`, loads
