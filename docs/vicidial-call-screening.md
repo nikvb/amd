@@ -15,7 +15,8 @@ land on extension 8370 for a fresh detection and normal agent routing.
 
 | Class | Meaning |
 |---|---|
-| `CALLASSISTSCRNAMD` | iPhone / Samsung call-assistant screening prompt |
+| `CALLGUARDIPHONEAMD` | iPhone Call Screening (iOS 26 "Call Guard") — the most common today |
+| `CALLASSISTSCRNAMD` | Samsung / other call-assistant screening prompt |
 | `GVOICEAMD` | Google Voice screening |
 | `SCREENINGAMD` | generic / legacy screening class |
 
@@ -39,7 +40,7 @@ exten => 8370,n(amd_fallback),AMD(2000,2000,1000,5000,120,50,4,256)
 exten => 8370,n,Goto(continue)
 ; --- call screening: hold this leg and redial the number once (call waiting rings the person) ---
 exten => 8370,n(screen_check),Set(AMDCLASS=${CUT(AMDCAUSE,-,1)})
-exten => 8370,n,GotoIf($["${AMDSTATUS}" = "MACHINE" & "${SCREEN_REDIAL}" != "1" & "${AMDPHONE}" != "" & ("${AMDCLASS}" = "CALLASSISTSCRNAMD" | "${AMDCLASS}" = "GVOICEAMD" | "${AMDCLASS}" = "SCREENINGAMD")]?amdws-screen-hold,s,1)
+exten => 8370,n,GotoIf($["${AMDSTATUS}" = "MACHINE" & "${SCREEN_REDIAL}" != "1" & "${AMDPHONE}" != "" & ("${AMDCLASS}" = "CALLGUARDIPHONEAMD" | "${AMDCLASS}" = "CALLASSISTSCRNAMD" | "${AMDCLASS}" = "GVOICEAMD" | "${AMDCLASS}" = "SCREENINGAMD")]?amdws-screen-hold,s,1)
 ; --- end of screening block ---
 exten => 8370,n(continue),AGI(VD_amd.agi,${EXTEN})
 exten => 8370,n,AGI(agi-VDAD_ALL_outbound.agi,NORMAL-----LB-----${CONNECTEDLINE(name)})
@@ -62,7 +63,7 @@ exten => h,1,NoOp(AMD_WS: screened leg released (second call owns the lead))
 
 How it behaves:
 
-1. `AMD_WS` says `MACHINE / CALLASSISTSCRNAMD-…`. The leg jumps to `[amdws-screen-hold]`.
+1. `AMD_WS` says `MACHINE / CALLGUARDIPHONEAMD-…`. The leg jumps to `[amdws-screen-hold]`.
 2. `Originate()` places **one** new call to `9<AMDPHONE>` through the normal carrier
    pattern, with the same outbound caller id (`c()`) and the same VID as caller id
    name (`n()`), and waits **up to 55 s** for it to be answered — the screened leg is
@@ -91,7 +92,7 @@ Notes:
 - If you want the screener to hear who is calling while the redial rings, put a
   `Playback(custom/screen-intro)` (8 kHz mono) before the `Originate` line; keep it
   short so the redial starts within a few seconds.
-- Do this only for the three screening classes. `CALLASSISTAMD` (assistant answered,
+- Do this only for the four screening classes (add new ones to the `GotoIf` list as the service introduces them). `CALLASSISTAMD` (assistant answered,
   no screening prompt) and every other machine class go to `continue` unchanged.
 - The `[amdws-screen-hold]` `h` extension is deliberately empty. If your `[default]`
   `h` is customised, do not copy it there.
