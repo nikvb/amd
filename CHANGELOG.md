@@ -8,6 +8,17 @@ All notable changes to `app_amd_ws` are documented here. The format follows
 
 Nothing yet.
 
+## [2.0.1] - 2026-09-27
+
+Installer and documentation only; the module is unchanged (2.0.0).
+
+- Installer: `--playfile [NAME]` downloads AMDY's detection prompt (`insert.wav`,
+  0.6 s; or `ambiguous.wav`, or a local `.wav`, converted with `sox` when needed)
+  to `/var/lib/asterisk/sounds/amdy/insert.wav` and prints the 8370 line with
+  `amdy/insert` as the playback argument.
+- Documentation: the one-liner is run from a root login (no `sudo`); the previous
+  `sudo` form failed on dialers that have no `sudo` binary.
+
 ## [2.0.0] - 2026-09-21
 
 Complete rewrite of the module, build system and
@@ -361,6 +372,7 @@ MySQL lookup of `phone_number`/`phone_code` from `vicidial_auto_calls` using
 (security and robustness fixes merged 2026-04-01; `/usr/src/asterisk/asterisk-*`
 header search and `./configure` fallback added 2026-04-02).
 
-[Unreleased]: https://github.com/nikvb/amd/compare/v2.0.0...main
+[Unreleased]: https://github.com/nikvb/amd/compare/v2.0.1...main
+[2.0.1]: https://github.com/nikvb/amd/compare/v2.0.0...v2.0.1
 [2.0.0]: https://github.com/nikvb/amd/compare/5851696...v2.0.0
 [1.0.0]: https://github.com/nikvb/amd/tree/5851696

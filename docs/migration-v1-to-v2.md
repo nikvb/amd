@@ -200,11 +200,11 @@ never touched).
 3. Run the **2.0** installer. Until 2.0.0 is merged to `main` and tagged,
    the `main` URL still serves the 1.x installer (which builds lws, may add
    repositories and hangs up calls to unload), so take it from the branch (or
-   the `v2.0.0` tag once it exists), or run `sudo ./install.sh -y` from a
+   the `v2.0.0` tag once it exists), or run `./install.sh -y` from a
    checkout of the branch:
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
+   curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y
    ```
 
    It backs up the 1.x module to `app_amd_ws.so.bak.<timestamp>`, builds

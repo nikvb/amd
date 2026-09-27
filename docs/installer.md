@@ -10,16 +10,16 @@ fails if the embedded copies are stale).
 ## Running it
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y
 ```
 
-Or from a checkout: `sudo ./install.sh -y`. Run it as root on the telephony
+Or from a checkout: `./install.sh -y`. Run it as root on the telephony
 server that runs Asterisk. It logs everything it prints to
 `/var/log/app_amd_ws-install.log`.
 
 **Which URL:** until 2.0.0 is merged to `main` and tagged, the `main` URL
 still serves the 1.x installer. After the release use the tag,
-`https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh`, whose sha256
+`https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh`, whose sha256
 is published in the release notes; compare with `sha256sum install.sh` after
 downloading if you do not pipe into `bash`.
 
@@ -34,6 +34,7 @@ downloading if you do not pipe into `bash`.
 | `--output FILE` | With `--build-only`: where to write the built module. |
 | `--no-db` | Do not install the MariaDB/MySQL client dev package and build without the DB lookup (`MYSQL=0`). |
 | `--no-load` | Install the file but do not unload/load the module in the running Asterisk. |
+| `--playfile [NAME]` | Also install the prompt AMD_WS can play during detection as `/var/lib/asterisk/sounds/amdy/insert.wav`. `NAME` is a file on `download.amdy.io` (default `insert.wav`, 0.6 s; `ambiguous.wav`, 2 s) or a local `.wav`; must be 8 kHz mono 16-bit (converted with `sox` when available). The printed 8370 line then uses `amdy/insert`. |
 | `--headers DIR` | Use this header directory (`asterisk.h` inside), skipping detection. |
 | `--asterisk-src DIR` | Use `DIR/include` of this configured and built source tree. |
 | `--version VER` | Override the detected Asterisk version (e.g. `18.21.0-vici`) for header lookup and downloads. |
@@ -194,7 +195,7 @@ recommended (see [migration-v1-to-v2.md](migration-v1-to-v2.md)).
 ## Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.0/install.sh | sudo bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- --uninstall
 ```
 
 Unloads the module (softly; refused while in use, exit code 3 in that case,
