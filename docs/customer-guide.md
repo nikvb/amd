@@ -109,8 +109,8 @@ must be 8 kHz mono (`sox in.wav -r 8000 -c 1 -b 16 hello.wav`).
 
 ### Call screening (iPhone, Samsung, Google Voice)
 
-When the service reports `MACHINE` with `AMDCAUSE` starting with `CALLASSISTSCRNAMD`,
-`GVOICEAMD` or `SCREENINGAMD`, a screening robot answered. The module exports
+When the service reports `MACHINE` with `AMDCAUSE` starting with `CALLGUARDIPHONEAMD`,
+`CALLASSISTSCRNAMD`, `GVOICEAMD` or `SCREENINGAMD`, a screening robot answered. The module exports
 `AMDPHONE` / `AMDCOUNTRYCODE`, so the dialplan can hold the screened leg and
 redial the number once: the second call arrives as call waiting, rings the
 person, lands on 8370 for a fresh detection and is routed to an agent as usual.
