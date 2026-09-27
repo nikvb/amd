@@ -15,9 +15,8 @@ land on extension 8370 for a fresh detection and normal agent routing.
 
 | Class | Meaning |
 |---|---|
-| `CALLGUARDIPHONEAMD` | iPhone Call Screening (iOS 26 "Call Guard") — the most common today |
+| `CALLGUARDIPHONEAMD` | iPhone Call Screening — the most common today. This class was previously named `GVOICEAMD`; keep the old name in the dialplan list only for dialers still on an older service version. |
 | `CALLASSISTSCRNAMD` | Samsung / other call-assistant screening prompt |
-| `GVOICEAMD` | Google Voice screening |
 | `SCREENINGAMD` | generic / legacy screening class |
 
 `AMD_WS` 2.0 also exports **`AMDPHONE`** and **`AMDCOUNTRYCODE`** — the number and
@@ -92,7 +91,7 @@ Notes:
 - If you want the screener to hear who is calling while the redial rings, put a
   `Playback(custom/screen-intro)` (8 kHz mono) before the `Originate` line; keep it
   short so the redial starts within a few seconds.
-- Do this only for the four screening classes (add new ones to the `GotoIf` list as the service introduces them). `CALLASSISTAMD` (assistant answered,
+- Do this only for the screening classes (`GVOICEAMD` in the list is the old name of `CALLGUARDIPHONEAMD`, kept for dialers on an older service version; add new classes to the `GotoIf` list as the service introduces them). `CALLASSISTAMD` (assistant answered,
   no screening prompt) and every other machine class go to `continue` unchanged.
 - The `[amdws-screen-hold]` `h` extension is deliberately empty. If your `[default]`
   `h` is customised, do not copy it there.
