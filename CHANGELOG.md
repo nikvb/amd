@@ -8,6 +8,23 @@ All notable changes to `app_amd_ws` are documented here. The format follows
 
 Nothing yet.
 
+## [2.0.2] - 2026-10-07
+
+Installer and documentation only; the module is unchanged (2.0.0).
+
+- Installer: `--update-8370` switches an existing ViciDial extension 8370 to
+  `AMD_WS()`. It finds `exten => 8370` in `extensions.conf` and the files it
+  `#include`s, replaces only the `EAGI(amd.py)` or `AMD()` step with `AMD_WS()`
+  plus the `AMD()` fallback (a stock `AMD()` keeps its own arguments as the
+  fallback), labels the next line `continue`, backs the file up as
+  `.amdy-bak-<time>`, reloads the dialplan and checks
+  `dialplan show 8370@default`; if `AMD_WS()` is not there it restores the
+  backup. Already on `AMD_WS()`: nothing changes. No 8370: nothing changes.
+  Numeric priorities: left alone with a warning. With `--dry-run` it prints
+  the diff only; with `--uninstall` it puts the original step back before the
+  module is removed. Without the flag the installer says when 8370 still runs
+  `amd.py` / `AMD()`.
+
 ## [2.0.1] - 2026-09-27
 
 Installer and documentation only; the module is unchanged (2.0.0).

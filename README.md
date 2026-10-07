@@ -194,6 +194,9 @@ This is the canonical ViciDial AI-AMD block with the `EAGI(amd.py)` line
 replaced by `AMD_WS()`. Everything else (call logging, the fallback to stock
 `AMD()` on the three error causes, `VD_amd.agi`) stays as it is.
 
+The installer can make this edit for you: `--update-8370` (see
+[docs/installer.md](docs/installer.md)); add `--dry-run` first to see the diff.
+
 If you keep the EAGI script instead of the module, use
 [`agi/amd.py`](agi/README.md): the production `amd.py` (2.2) with the same
 stock-`app_amd` vocabulary for no-audio (`NOAUDIODATA-<ms>`) and hangup
