@@ -35,6 +35,7 @@ downloading if you do not pipe into `bash`.
 | `--no-db` | Do not install the MariaDB/MySQL client dev package and build without the DB lookup (`MYSQL=0`). |
 | `--no-load` | Install the file but do not unload/load the module in the running Asterisk. |
 | `--playfile [NAME]` | Also install the prompt AMD_WS can play during detection as `/var/lib/asterisk/sounds/amdy/insert.wav`. `NAME` is a file on `download.amdy.io` (default `insert.wav`, 0.6 s; `ambiguous.wav`, 2 s) or a local `.wav`; must be 8 kHz mono 16-bit (converted with `sox` when available). The printed 8370 line then uses `amdy/insert`. |
+| `--update-8370` | ViciDial: if extension 8370 exists (in `extensions.conf` or a file it `#include`s), replace only its `EAGI(amd.py)` or `AMD()` step with `AMD_WS()` plus the `AMD()` fallback, label the next line `continue`, back up the file as `.amdy-bak-<time>`, reload the dialplan and check `dialplan show 8370@default` (backup restored if `AMD_WS()` is missing). Already on `AMD_WS()`, no 8370, or numeric priorities: nothing is changed. With `--dry-run`: print the diff only. With `--uninstall`: put the original step back first. |
 | `--headers DIR` | Use this header directory (`asterisk.h` inside), skipping detection. |
 | `--asterisk-src DIR` | Use `DIR/include` of this configured and built source tree. |
 | `--version VER` | Override the detected Asterisk version (e.g. `18.21.0-vici`) for header lookup and downloads. |
@@ -203,7 +204,9 @@ the file is removed anyway), removes `app_amd_ws.so`
 from the module directory and the header cache `/var/cache/app_amd_ws`.
 Backups `app_amd_ws.so.bak.*` stay unless `--remove-backups` is added. It
 restores nothing else: packages, dialplan, `amd_ws.conf`,
-`amd_ws.conf.sample` and the install log stay. Remove the `AMD_WS(...)`
+`amd_ws.conf.sample` and the install log stay. If 8370 was switched with
+`--update-8370`, run `--uninstall --update-8370`: the original 8370 step is
+put back before the module is removed. Otherwise remove the `AMD_WS(...)`
 line from extension 8370 yourself (or point the campaign back to extension
 8369 in ViciDial) before uninstalling, otherwise calls hit an unknown
 application.
