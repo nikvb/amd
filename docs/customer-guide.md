@@ -23,7 +23,7 @@ Log in as **root** on the telephony server, then:
 
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y
 ```
 
 What it does: detects the running Asterisk and its headers, installs the build tools,
@@ -34,13 +34,13 @@ prints the dialplan snippet. Everything is logged to `/var/log/app_amd_ws-instal
 Preview without changing anything:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- --dry-run
 ```
 
 Install the detection prompt too (`insert.wav`, 0.6 s, from AMDY) and get the 8370 line with `amdy/insert`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y --playfile
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y --playfile
 ```
 
 Verify:
