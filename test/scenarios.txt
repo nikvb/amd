@@ -32,8 +32,9 @@
 #           land ~500 ms later than the AMD clock (AMDELAPSED) suggests.
 #  asserts  comma list, evaluated after the status/cause/timing checks:
 #           proto                      protocol_test.py config,schedule,bytes,eof,close (+ no phone / caller_id keys)
-#           proto:c1;c2[;phone=N][;country=C][;callerid=X][;schedule=L]   explicit protocol_test checks (';' separated);
+#           proto:c1;c2[;phone=N][;country=C][;callerid=X][;schedule=L][;extra=KEY:JSON]...   explicit protocol_test checks (';' separated);
 #                                      without phone=/country= the config must have no phone keys, without callerid= no caller_id;
+#                                      each extra=KEY:JSON (in order) expects that member after the amd.py keys, without extra= none;
 #                                      checks: config schedule bytes eof eofmarks close chunks result noresult
 #           chunks=N chunks>=N chunks<=N   number of binary chunks the mock received
 #           noconn                     the mock has NO connection record for this VID
@@ -120,6 +121,13 @@ opt_p_k            | amd   | 1     | speech8            | /human?after=1        
 caller_id          | amd   | 1     | speech8            | /human?after=1           | app:Set(CALLERID(num)=3135550100) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000) | - | HUMAN | HUMAN | 800 | 2200 | proto:config;schedule;bytes;eof;close;callerid=3135550100
 caller_id_unknown  | amd   | 1     | speech8            | /human?after=1           | app:Set(CALLERID(num)=Unknown) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000) | - | HUMAN | HUMAN | 800 | 2200 | proto
 opt_i_callerid     | amd   | 1     | speech8            | /human?after=1           | app:Set(CALLERID(num)=3135550100) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000,,i(18005551212)) | - | HUMAN | HUMAN | 800 | 2200 | proto:config;eof;close;callerid=18005551212
+# AMDWS_EXTRA (2.1.0): a per-call JSON object whose members follow the amd.py keys in the config frame;
+# an inherited __AMDWS_EXTRA works too; anything that is not one JSON object is ignored (rate-limited warning)
+amdws_extra        | amd   | 1     | speech8            | /human?after=1           | app:Set(AMDWS_EXTRA= {"client_ip":"203.0.113.7", "tier":2, "geo":{"cc":"US"}} ) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000) | - | HUMAN | HUMAN | 800 | 2200 | proto:config;schedule;bytes;eof;close;extra=client_ip:"203.0.113.7";extra=tier:2;extra=geo:{"cc":"US"}
+amdws_extra_inh    | amd   | 1     | speech8            | /human?after=1           | app:Set(__AMDWS_EXTRA={"client_ip":"198.51.100.9"}) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000,,v) | - | HUMAN | HUMAN | 800 | 2200 | proto:config;eof;close;extra=client_ip:"198.51.100.9",log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 vid=%VID% \+[0-9]+ms connected .* AMDWS_EXTRA=\{"client_ip":"198\.51\.100\.9"\}
+amdws_extra_bad    | amd   | 1     | speech8            | /human?after=1           | app:Set(AMDWS_EXTRA=client_ip=203.0.113.7) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000) | - | HUMAN | HUMAN | 800 | 2200 | proto,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 vid=%VID% AMDWS_EXTRA is not one JSON object
+amdws_extra_badjs  | amd   | 1     | speech8            | /human?after=1           | app:Set(AMDWS_EXTRA={"client_ip":}) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000) | - | HUMAN | HUMAN | 800 | 2200 | proto
+amdws_extra_empty  | amd   | 1     | speech8            | /human?after=1           | app:Set(AMDWS_EXTRA={ }) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000) | - | HUMAN | HUMAN | 800 | 2200 | proto,nolog~vid=%VID% AMDWS_EXTRA is not
 opt_a_unanswered   | amd   | 1     | dial-noanswer      | /human?after=1           | ws:8000,,A                                | -         | HUMAN    | FATAL_ERROR      | 0      | 1000   | noconn
 bad_port_default   | amd   | 1     | speech8            | /human?after=1           | wsraw:127.0.0.1,notaport,${VID},8000      | -         | HUMAN    | HUMAN            | 800    | 2200   | proto,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 invalid port .notaport.
 bad_options        | amd   | 1     | speech8            | /human?after=1           | wsraw:127.0.0.1,${MOCK_PORT},${VID},8000,,np(3135551212)k(1 | - | HUMAN | HUMAN         | 800    | 2200   | proto,nolog~app_amd_ws\.c: .*3135551212,log~AMD_WS: Local/%NUM%@farside-%NAME%-[0-9a-f]+;1 invalid options .np.XXXXXXXXXX. .digits masked
@@ -141,7 +149,10 @@ unload_probe       | probe | 1     | speech8            | /silent               
 soak               | probe | 1     | speech8            | /human?after=1           | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 0      | 99999  |
 # ---------------- probes run by check_unload_cycle AFTER 'module reload' with send_schedule=500, send_caller_id=no, result_grace_ms=250, db=no
 # reload_effect: CALLERID(num) is set but must NOT be sent (send_caller_id=no); chunks on the 500 ms schedule (500, then 8000 B at 1000)
-reload_effect      | probe | 1     | speech8            | /human?after=1           | app:Set(CALLERID(num)=3135550199) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000) | - | HUMAN | HUMAN | 800 | 2200 | proto:config;schedule;eof;close;schedule=500,chunks=2
+reload_effect      | probe | 1     | speech8            | /human?after=1           | app:Set(CALLERID(num)=3135550199) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000) | - | HUMAN | HUMAN | 800 | 2200 | proto:config;schedule;eof;close;schedule=500;extra=short_no_greeting:true;extra=client_ip:"192.0.2.1",chunks=2
 # reload_fallback: sparse audio (0.3 s beeps 0.5 s apart = 4800 B per beep < chunk_bytes) after the single 500 ms mark: sends must follow
 # the fallback_interval_ms=1000 clock (chunks at 500, 1500, 2500 ms with < 8000 B), amd.py:439-440 time-driven branch
-reload_fallback    | probe | 1     | beeps              | /human?after=2           | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 2700   | 3600   | proto:config;schedule;eof;close;schedule=500,chunks=3,elapsed>=2450,elapsed<=2700
+# after the reload the conf has extra_config={"short_no_greeting":true,"client_ip":"192.0.2.1"}: its members come
+# first, then AMDWS_EXTRA's (trace line); the module merges them: client_ip once, with the per-call value
+reload_extra       | probe | 1     | speech8            | /human?after=1           | app:Set(AMDWS_EXTRA={"client_ip":"203.0.113.7"}) && AMD_WS(127.0.0.1,${MOCK_PORT},${VID},8000,,v) | - | HUMAN | HUMAN | 800 | 2200 | proto:config;eof;close;extra=short_no_greeting:true;extra=client_ip:"203.0.113.7",log~vid=%VID% \+[0-9]+ms connected .* extra=\{"short_no_greeting":true. "client_ip":"192\.0\.2\.1"\}. AMDWS_EXTRA=\{"client_ip":"203\.0\.113\.7"\}$
+reload_fallback    | probe | 1     | beeps              | /human?after=2           | ws:8000,,                                 | -         | HUMAN    | HUMAN            | 2700   | 3600   | proto:config;schedule;eof;close;schedule=500;extra=short_no_greeting:true;extra=client_ip:"192.0.2.1",chunks=3,elapsed>=2450,elapsed<=2700

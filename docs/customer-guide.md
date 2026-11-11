@@ -23,7 +23,7 @@ Log in as **root** on the telephony server, then:
 
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y
 ```
 
 What it does: detects the running Asterisk and its headers, installs the build tools,
@@ -34,20 +34,20 @@ prints the dialplan snippet. Everything is logged to `/var/log/app_amd_ws-instal
 Preview without changing anything:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- --dry-run
 ```
 
 Install and switch the ViciDial extensions 8370 (standard campaigns) and 8371 (Press-1
 campaigns) to `AMD_WS()` in the same run (backup kept, dialplan reloaded):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --update-dialplan
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y --update-dialplan
 ```
 
 Install the detection prompt too (`insert.wav`, 0.6 s, from AMDY) and get the 8370 line with `amdy/insert`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --playfile
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y --playfile
 ```
 
 Verify:
@@ -114,16 +114,16 @@ Examples (log in as root):
 
 ```bash
 # see the change first, write nothing
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --dry-run --update-dialplan
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- --dry-run --update-dialplan
 
 # install the module and switch 8370 and 8371
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --update-dialplan
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y --update-dialplan
 
 # switch only some extensions
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --update-dialplan=8370
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y --update-dialplan=8370
 
 # put the original EAGI(amd.py) lines back and remove the module
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --uninstall --update-dialplan
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- --uninstall --update-dialplan
 ```
 
 An extension that already calls `AMD_WS()` is not changed, so you can run the command
@@ -176,6 +176,22 @@ The full, tested 8370 block is in
 | `A` | Do not answer the channel (default: answer if needed). |
 | `v` | Trace: log one line per event for this call (see section 7). |
 
+### Send per-call data (`AMDWS_EXTRA`)
+
+Set the channel variable `AMDWS_EXTRA` to one JSON object before `AMD_WS()`.
+The module adds its members to the data it sends to the service for this call.
+Example: send the IP address of the client on a gateway.
+
+```text
+same => n,Set(AMDWS_EXTRA={"client_ip":"${CHANNEL(peerip)}"})
+same => n,AMD_WS(api.amdy.io,2700,${CALLERID(name)},10000)
+```
+
+On PJSIP, use `${CUT(CHANNEL(pjsip,remote_addr),:,1)}` for the IPv4 address.
+The value must be valid JSON, at most 511 bytes. If it is not valid, the module
+ignores it, logs a warning and continues the detection. Version 2.1.0 or later
+is necessary.
+
 ## 4. Results — channel variables
 
 | Variable | Values |
@@ -222,7 +238,7 @@ arguments override the file.
 | `send_caller_id` | `yes` | Send `${CALLERID(num)}` as `caller_id`. |
 | `playdelay_ms` | `0` | Default delay before `playfile`. |
 | `trace` | `no` | Per-call event timeline in the log for every call. |
-| `extra_config` | empty | Extra service options as JSON, e.g. `{"short_no_greeting":true}` (verdict ~0.5 s earlier, but without the machine type) or `{"detection_mode":"aggressive"}`. |
+| `extra_config` | empty | Extra service options as JSON, e.g. `{"short_no_greeting":true}` (verdict ~0.5 s earlier, but without the machine type) or `{"detection_mode":"aggressive"}`. For one call only, use `AMDWS_EXTRA` (section 3). |
 
 ## 6. How long does a verdict take?
 

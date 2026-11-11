@@ -72,7 +72,10 @@ def _first_text(rec):
     return texts[0]["text"] if texts else None
 
 
-def check_config(rec, vid, phone=None, country=None, no_phone=False, callerid=None, no_callerid=False):
+def check_config(rec, vid, phone=None, country=None, no_phone=False, callerid=None, no_callerid=False,
+                 extra=None):
+    """extra: ordered dict of the members expected after the amd.py keys (AMDWS_EXTRA /
+    extra_config), in that order and with those values; None or {} = no other keys."""
     cfg = rec.get("config")
     if not isinstance(cfg, dict) or set(cfg.keys()) != {"config"}:
         return False, "top-level keys %r, expected exactly {'config'} (raw=%r)" % (
@@ -80,11 +83,17 @@ def check_config(rec, vid, phone=None, country=None, no_phone=False, callerid=No
     inner = cfg["config"]
     if not isinstance(inner, dict):
         return False, "config is not an object: %r" % (inner,)
-    extra = set(inner.keys()) - set(CONFIG_KEY_ORDER)
-    if extra:
-        return False, "unexpected keys %s" % sorted(extra)
-    # keys in amd.py's order (json.loads keeps the document order)
-    expected_order = [k for k in CONFIG_KEY_ORDER if k in inner]
+    extra = extra or {}
+    unexpected = set(inner.keys()) - set(CONFIG_KEY_ORDER) - set(extra)
+    if unexpected:
+        return False, "unexpected keys %s" % sorted(unexpected)
+    for k, v in extra.items():
+        if k not in inner:
+            return False, "extra key %r missing (raw=%r)" % (k, rec.get("config_raw"))
+        if inner[k] != v:
+            return False, "extra %s=%r, expected %r" % (k, inner[k], v)
+    # keys in amd.py's order (json.loads keeps the document order), then the extra members
+    expected_order = [k for k in CONFIG_KEY_ORDER if k in inner] + list(extra)
     if list(inner.keys()) != expected_order:
         return False, "key order %r, expected %r" % (list(inner.keys()), expected_order)
     if inner.get("sample_rate") != 8000:
@@ -101,6 +110,21 @@ def check_config(rec, vid, phone=None, country=None, no_phone=False, callerid=No
         return False, "caller_id present but not expected: %r" % (inner,)
     if callerid is not None and str(inner.get("caller_id")) != str(callerid):
         return False, "caller_id=%r, expected %r" % (inner.get("caller_id"), callerid)
+    dups = []
+
+    def _pairs(pairs):
+        seen = set()
+        for k, _ in pairs:
+            if k in seen:
+                dups.append(k)
+            seen.add(k)
+        return dict(pairs)
+    try:
+        json.loads(rec.get("config_raw") or "{}", object_pairs_hook=_pairs)
+    except ValueError as e:
+        return False, "config_raw is not JSON: %s" % e
+    if dups:
+        return False, "duplicate key(s) %s in %r" % (sorted(set(dups)), rec.get("config_raw"))
     first = _first_text(rec)
     if first != rec.get("config_raw"):
         return False, "config JSON was not the first text frame (first=%r)" % (first,)
@@ -249,7 +273,7 @@ def check_chunks(rec, expect=None, min_chunks=None, max_chunks=None):
 def run_checks(recs, vid, checks, *, schedule=DEFAULT_SCHEDULE, tol_ms=150, bytes_tol=0.10,
                chunk_bytes=8000, close_code=1000, phone=None, country=None, no_phone=False,
                callerid=None, no_callerid=False, expect_chunks=None, min_chunks=None, max_chunks=None,
-               audio_start=None, fallback_ms=DEFAULT_FALLBACK_MS, empty_marks=2):
+               audio_start=None, fallback_ms=DEFAULT_FALLBACK_MS, empty_marks=2, extra=None):
     results = []
     mine = find_vid(recs, vid)
     if len(mine) != 1:
@@ -259,7 +283,7 @@ def run_checks(recs, vid, checks, *, schedule=DEFAULT_SCHEDULE, tol_ms=150, byte
     for c in checks:
         if c == "config":
             ok, d = check_config(rec, vid, phone=phone, country=country, no_phone=no_phone,
-                                 callerid=callerid, no_callerid=no_callerid)
+                                 callerid=callerid, no_callerid=no_callerid, extra=extra)
         elif c == "schedule":
             ok, d = check_schedule(rec, schedule, tol_ms, chunk_bytes, audio_start, fallback_ms)
         elif c == "bytes":
@@ -303,8 +327,15 @@ def main():
     ap.add_argument("--audio-start", type=int, help="epoch ms when the far side started sending audio (schedule anchor)")
     ap.add_argument("--fallback-ms", type=int, default=DEFAULT_FALLBACK_MS, help="post-schedule time-driven send interval")
     ap.add_argument("--empty-marks", type=int, default=2, help="eofmarks: marks without audio before the eof")
+    ap.add_argument("--extra", action="append", default=[], metavar="KEY:JSONVALUE",
+                    help="config: expect this extra member after the amd.py keys (repeat, in order), "
+                         "e.g. --extra 'client_ip:\"10.1.2.3\"' --extra tier:2")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args()
+    extra = {}
+    for item in a.extra:
+        k, _, v = item.partition(":")
+        extra[k] = json.loads(v)
     schedule = [int(x) for x in a.schedule.split(",") if x]
     checks = [c for c in a.checks.split(",") if c]
     recs = load_records(a.record)
@@ -312,7 +343,8 @@ def main():
                          chunk_bytes=a.chunk_bytes, close_code=a.close_code, phone=a.phone,
                          country=a.country, no_phone=a.no_phone, callerid=a.callerid, no_callerid=a.no_callerid,
                          expect_chunks=a.expect_chunks, min_chunks=a.min_chunks, max_chunks=a.max_chunks,
-                         audio_start=a.audio_start, fallback_ms=a.fallback_ms, empty_marks=a.empty_marks)
+                         audio_start=a.audio_start, fallback_ms=a.fallback_ms, empty_marks=a.empty_marks,
+                         extra=extra)
     ok_all = all(ok for _, ok, _ in results)
     if a.json:
         print(json.dumps({"vid": a.vid, "ok": ok_all,

@@ -8,6 +8,21 @@ All notable changes to `app_amd_ws` are documented here. The format follows
 
 Nothing yet.
 
+## [2.1.0] - 2026-11-10
+
+- New: channel variable `AMDWS_EXTRA`. Set it to one JSON object (at most 511
+  bytes) before `AMD_WS()`; its members go into the config frame of that call,
+  after the `extra_config` members (a key in both is sent once, with the
+  `AMDWS_EXTRA` value). Example for a gateway:
+  `Set(AMDWS_EXTRA={"client_ip":"${CHANNEL(peerip)}"})`. An inherited
+  `__AMDWS_EXTRA` also works. An invalid value is ignored with a warning (at
+  most one in 60 s). Without the variable the config frame is unchanged.
+- Changed: `extra_config` in `amd_ws.conf` is now checked with the Asterisk
+  JSON parser. A value that is not one valid JSON object is ignored with the
+  usual "invalid value" warning. Before, any text in braces was sent.
+- The trace line `connected ... config sent` shows `AMDWS_EXTRA=<value>`.
+- `core show application AMD_WS` reports version 2.1.0.
+
 ## [2.0.4] - 2026-11-10
 
 Installer and documentation; the module is unchanged.
