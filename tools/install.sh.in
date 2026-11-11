@@ -717,7 +717,7 @@ update_dialplan() {
     while IFS= read -r f; do
         if [ "$mode" = apply ]; then
             local hit=0
-            for e in $OPT_UPDATE_EXTS; do grep -E "^[[:space:]]*exten[[:space:]]*=>[[:space:]]*$e[[:space:]]*," "$f" >/dev/null 2>&1 && hit=1; done
+            for e in $OPT_UPDATE_EXTS; do grep -E "^[[:space:]]*exten[[:space:]]*=>[[:space:]]*${e}[[:space:]]*," "$f" >/dev/null 2>&1 && hit=1; done
             [ $hit = 1 ] || continue
         else
             grep -F -e "$UPD_MARK" -e "$UPD_MARK_OLD begin" "$f" >/dev/null 2>&1 || continue
@@ -773,8 +773,8 @@ hint_dialplan() {
     local f e
     while IFS= read -r f; do
         for e in 8370 8371; do
-            if grep -E "^[[:space:]]*exten[[:space:]]*=>[[:space:]]*$e[[:space:]]*,.*(E?AGI\([^)]*amd[^),]*\.py|AMD\()" "$f" >/dev/null 2>&1 \
-               && ! grep -E "^[[:space:]]*exten[[:space:]]*=>[[:space:]]*$e[[:space:]]*,.*AMD_WS\(" "$f" >/dev/null 2>&1; then
+            if grep -E "^[[:space:]]*exten[[:space:]]*=>[[:space:]]*${e}[[:space:]]*,.*(E?AGI\([^)]*amd[^),]*\.py|AMD\()" "$f" >/dev/null 2>&1 \
+               && ! grep -E "^[[:space:]]*exten[[:space:]]*=>[[:space:]]*${e}[[:space:]]*,.*AMD_WS\(" "$f" >/dev/null 2>&1; then
                 log "extension $e in $f still uses amd.py / AMD(). Run the installer again with --update-dialplan to switch 8370 and 8371 to AMD_WS() automatically (backup kept), or edit them by hand as below."
                 return 0
             fi
