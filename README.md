@@ -56,7 +56,7 @@ Log in as **root** on the telephony server, then:
 As root on the ViciDial telephony server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y
 ```
 
 The installer detects the running Asterisk, obtains matching headers, installs
@@ -69,16 +69,16 @@ Common variants:
 
 ```bash
 # see what would happen, change nothing
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --dry-run
 
 # also install the AMDY prompt (insert.wav) and use it as the playback argument
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y --playfile
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --playfile
 
 # no MySQL dependency, no DB lookup
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y --no-db
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --no-db
 
 # remove the module again
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --uninstall
 ```
 
 All flags, exit codes and the header-resolution order are in
@@ -194,8 +194,13 @@ This is the canonical ViciDial AI-AMD block with the `EAGI(amd.py)` line
 replaced by `AMD_WS()`. Everything else (call logging, the fallback to stock
 `AMD()` on the three error causes, `VD_amd.agi`) stays as it is.
 
-The installer can make this edit for you: `--update-8370` (see
-[docs/installer.md](docs/installer.md)); add `--dry-run` first to see the diff.
+The installer can make this edit for you in 8370 and in 8371 (Press-1
+campaigns): `--update-dialplan` (see [docs/installer.md](docs/installer.md));
+add `--dry-run` first to see the diff:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --update-dialplan
+```
 
 If you keep the EAGI script instead of the module, use
 [`agi/amd.py`](agi/README.md): the production `amd.py` (2.2) with the same
