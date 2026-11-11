@@ -23,7 +23,7 @@ Log in as **root** on the telephony server, then:
 
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y
 ```
 
 What it does: detects the running Asterisk and its headers, installs the build tools,
@@ -34,13 +34,20 @@ prints the dialplan snippet. Everything is logged to `/var/log/app_amd_ws-instal
 Preview without changing anything:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --dry-run
+```
+
+Install and switch the ViciDial extensions 8370 (standard campaigns) and 8371 (Press-1
+campaigns) to `AMD_WS()` in the same run (backup kept, dialplan reloaded):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --update-dialplan
 ```
 
 Install the detection prompt too (`insert.wav`, 0.6 s, from AMDY) and get the 8370 line with `amdy/insert`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y --playfile
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --playfile
 ```
 
 Verify:
@@ -66,9 +73,12 @@ AMD_WS([host[,port[,vid[,timeout_ms[,playfile[,options]]]]]])
 | `playfile` | none | Sound to play to the callee **while** detection runs (`Playback()` semantics: no extension, `&` joins several files). Stops the instant a verdict arrives. |
 | `options` | none | Flags, see below. |
 
-### ViciDial / Vicibox (extension 8370)
+### ViciDial / Vicibox (extensions 8370 and 8371)
 
-Replace the `EAGI(...amd.py)` line of your existing 8370 block; everything else stays:
+Run the installer with `--update-dialplan` and it makes this change for you in
+8370 and 8371 (see [Switch the dialplan automatically](#switch-the-dialplan-automatically)).
+To edit by hand, replace the `EAGI(...amd.py)` line of your existing 8370 block;
+everything else stays:
 
 ```text
 exten => 8370,1,AGI(agi://127.0.0.1:4577/call_log)
@@ -83,6 +93,42 @@ exten => 8370,n,AGI(agi-VDAD_ALL_outbound.agi,NORMAL-----LB-----${CONNECTEDLINE(
 Then `asterisk -rx 'dialplan reload'`. Campaign settings (Routing Extension 8370, AMD
 Agent Route Options) are unchanged. The phone number and country code are looked up
 in `vicidial_auto_calls` automatically, as the EAGI client did.
+
+Extension 8371 (Press-1 campaigns) has the same block with `8371` and
+`SURVEYCAMP-----LB-----${CONNECTEDLINE(name)}` in the last AGI line.
+
+### Switch the dialplan automatically
+
+`--update-dialplan` edits the ViciDial AMD extensions for you:
+
+| Step | What the installer does |
+|---|---|
+| 1 | Finds `exten => 8370` and `exten => 8371` in `/etc/asterisk/extensions.conf` and the files it `#include`s. |
+| 2 | Replaces the `EAGI(amd.py)` line with `AMD_WS(api.amdy.io,2700,${CALLERID(name)},10000)`. |
+| 3 | Sets the fallback `GotoIf` to `CONNECTION_ERROR`, `PROCESSING_ERROR` and `FATAL_ERROR` (removes the old `NETERR`/`INTERR`). Keeps the fallback `AMD()` line. |
+| 4 | If the block has no fallback (old installers, or a stock `AMD()` step), adds the `GotoIf` and the `AMD()` fallback lines. |
+| 5 | Keeps every other line. Writes each original line as a comment `; AMDY dialplan orig: ...` above its new line. |
+| 6 | Saves a backup `extensions.conf.amdy-bak-<time>`, reloads the dialplan and checks that `AMD_WS()` is in 8370/8371. If it is not, it restores the backup. |
+
+Examples (log in as root):
+
+```bash
+# see the change first, write nothing
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --dry-run --update-dialplan
+
+# install the module and switch 8370 and 8371
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --update-dialplan
+
+# switch only some extensions
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --update-dialplan=8370
+
+# put the original EAGI(amd.py) lines back and remove the module
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --uninstall --update-dialplan
+```
+
+An extension that already calls `AMD_WS()` is not changed, so you can run the command
+again safely. Blocks with numbered priorities (`exten => 8370,3,...`) are not changed;
+edit them by hand.
 
 ### Generic Asterisk (custom dialer)
 
@@ -220,7 +266,8 @@ every reply and the result with millisecond offsets.
 
 Re-run the install command: it builds the new version, backs up the old module
 (`app_amd_ws.so.bak.<timestamp>`) and swaps it in without dropping calls (if the
-module is busy it waits, never hangs up). `--uninstall` removes the module; your
-dialplan is never modified by the installer.
+module is busy it waits, never hangs up). `--uninstall` removes the module. The installer
+changes the dialplan only with `--update-dialplan`; `--uninstall --update-dialplan` puts the
+original lines back before it removes the module.
 
 Source, changelog and full reference: https://github.com/nikvb/amd

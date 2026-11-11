@@ -8,6 +8,24 @@ All notable changes to `app_amd_ws` are documented here. The format follows
 
 Nothing yet.
 
+## [2.0.4] - 2026-11-10
+
+Installer and documentation; the module is unchanged.
+
+- Installer: `--update-dialplan[=EXTS]` switches the ViciDial AMD extensions 8370
+  and 8371 (Press-1 campaigns) to `AMD_WS()` in one run; `=8370,8371,...` selects
+  the list. `--update-8370` is now `--update-dialplan=8370`.
+- Fixed: on the standard block of the AMDY installers (`EAGI(amd.py)` followed by
+  a `GotoIf` to `amd_fallback` and the fallback `AMD()`), the v2.0.2
+  `--update-8370` inserted `AMD_WS()` two times and made three `amd_fallback`
+  labels, because it also matched the fallback `AMD()` line. Now only the EAGI
+  line is replaced, the existing `GotoIf` gets the three AMD_WS causes
+  (`NETERR`/`INTERR` removed) and the fallback `AMD()` line stays. The fallback
+  lines are added only when the block has none.
+- Each changed line keeps its original as `; AMDY dialplan orig: ...`;
+  `--uninstall --update-dialplan` restores the file byte for byte (the v2.0.2
+  `update-8370` markers are still reverted).
+
 ## [2.0.3] - 2026-11-10
 
 Installer only; the module is unchanged.

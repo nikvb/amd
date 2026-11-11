@@ -10,7 +10,7 @@ fails if the embedded copies are stale).
 ## Running it
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y
 ```
 
 Or from a checkout: `./install.sh -y`. Run it as root on the telephony
@@ -19,7 +19,7 @@ server that runs Asterisk. It logs everything it prints to
 
 **Which URL:** until 2.0.0 is merged to `main` and tagged, the `main` URL
 still serves the 1.x installer. After the release use the tag,
-`https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh`, whose sha256
+`https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh`, whose sha256
 is published in the release notes; compare with `sha256sum install.sh` after
 downloading if you do not pipe into `bash`.
 
@@ -35,7 +35,8 @@ downloading if you do not pipe into `bash`.
 | `--no-db` | Do not install the MariaDB/MySQL client dev package and build without the DB lookup (`MYSQL=0`). |
 | `--no-load` | Install the file but do not unload/load the module in the running Asterisk. |
 | `--playfile [NAME]` | Also install the prompt AMD_WS can play during detection as `/var/lib/asterisk/sounds/amdy/insert.wav`. `NAME` is a file on `download.amdy.io` (default `insert.wav`, 0.6 s; `ambiguous.wav`, 2 s) or a local `.wav`; must be 8 kHz mono 16-bit (converted with `sox` when available). The printed 8370 line then uses `amdy/insert`. |
-| `--update-8370` | ViciDial: if extension 8370 exists (in `extensions.conf` or a file it `#include`s), replace only its `EAGI(amd.py)` or `AMD()` step with `AMD_WS()` plus the `AMD()` fallback, label the next line `continue`, back up the file as `.amdy-bak-<time>`, reload the dialplan and check `dialplan show 8370@default` (backup restored if `AMD_WS()` is missing). Already on `AMD_WS()`, no 8370, or numeric priorities: nothing is changed. With `--dry-run`: print the diff only. With `--uninstall`: put the original step back first. |
+| `--update-dialplan[=EXTS]` | ViciDial: switch the AMD extensions (default `8370` and `8371`; or the comma list `EXTS`, e.g. `--update-dialplan=8370`) to `AMD_WS()`. It looks in `extensions.conf` and the files it `#include`s. An `EAGI(amd.py)` line becomes `AMD_WS()`; an existing `GotoIf` to `amd_fallback` gets the causes `CONNECTION_ERROR`, `PROCESSING_ERROR`, `FATAL_ERROR` (old `NETERR`/`INTERR` removed) and the fallback `AMD()` line stays. A block without a fallback (old installers, or a stock `AMD()` step) gets the `GotoIf` and `AMD()` fallback lines added and the next line labelled `continue`. Each changed line keeps its original as a comment `; AMDY dialplan orig: ...`. The file is backed up as `.amdy-bak-<time>`, the dialplan is reloaded and `dialplan show <exten>@default` is checked (backup restored if `AMD_WS()` is missing). Already on `AMD_WS()`, extension missing, or numeric priorities: nothing is changed. With `--dry-run`: print the diff only. With `--uninstall`: put the original lines back first. |
+| `--update-8370` | Same as `--update-dialplan=8370` (kept for v2.0.2 command lines). |
 | `--headers DIR` | Use this header directory (`asterisk.h` inside), skipping detection. |
 | `--asterisk-src DIR` | Use `DIR/include` of this configured and built source tree. |
 | `--version VER` | Override the detected Asterisk version (e.g. `18.21.0-vici`) for header lookup and downloads. |
@@ -196,7 +197,7 @@ recommended (see [migration-v1-to-v2.md](migration-v1-to-v2.md)).
 ## Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --uninstall
 ```
 
 Unloads the module (softly; refused while in use, exit code 3 in that case,
@@ -205,8 +206,8 @@ from the module directory and the header cache `/var/cache/app_amd_ws`.
 Backups `app_amd_ws.so.bak.*` stay unless `--remove-backups` is added. It
 restores nothing else: packages, dialplan, `amd_ws.conf`,
 `amd_ws.conf.sample` and the install log stay. If 8370 was switched with
-`--update-8370`, run `--uninstall --update-8370`: the original 8370 step is
-put back before the module is removed. Otherwise remove the `AMD_WS(...)`
+`--update-dialplan` (or `--update-8370`), run `--uninstall --update-dialplan`:
+the original lines of 8370 and 8371 are put back before the module is removed. Otherwise remove the `AMD_WS(...)`
 line from extension 8370 yourself (or point the campaign back to extension
 8369 in ViciDial) before uninstalling, otherwise calls hit an unknown
 application.
