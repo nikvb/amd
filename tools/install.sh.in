@@ -496,7 +496,8 @@ module_row() { ast_rx "module show like $MODULE" | awk -v m="$MODULE.so" '$1==m'
 module_loaded()  { [ -n "$(module_row)" ]; }
 module_running() { case "$(module_row)" in *"Not Running"*) return 1;; *Running*) return 0;; *) return 1;; esac; }
 module_usecount() { module_row | awk '{ if ($0 ~ /Not Running/) print $(NF-3); else print $(NF-2) }'; }
-app_registered() { ast_rx "core show application $APP" | grep "Info about application '$APP'" >/dev/null; }
+# Asterisk 16/18 print "Info about application 'X'", 20+ print "Info about Application 'X'": match without case
+app_registered() { ast_rx "core show application $APP" | grep -i "Info about application '$APP'" >/dev/null; }
 
 soft_unload() {   # rc 0 unloaded (or not loaded), rc 3 still in use after --wait seconds
     module_loaded || { log "$MODULE.so is not loaded in the running Asterisk"; return 0; }
@@ -567,7 +568,7 @@ install_module() {
     fi
     if old_code_resident; then warn "the daemon still maps a deleted $MODULE.so - the old code may still be resident; a restart will clear it"; fi
     log "module loaded: $(module_row | sed 's/  */ /g')"
-    log "application $APP registered: $(ast_rx "core show application $APP" | sed -n "s/.*-= Info about application '$APP' =-.*/ok/p" | head -n1)"
+    log "application $APP registered: $(ast_rx "core show application $APP" | sed -n "s/.*-= Info about [Aa]pplication '$APP' =-.*/ok/p" | head -n1)"
     log "module version (amd_ws show settings): $(ast_rx 'amd_ws show settings' | sed -n 's/^AMD_WS \([0-9][0-9.]*\).*/\1/p' | head -n1)"
 }
 

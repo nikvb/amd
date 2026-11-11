@@ -8,6 +8,16 @@ All notable changes to `app_amd_ws` are documented here. The format follows
 
 Nothing yet.
 
+## [2.0.3] - 2026-11-10
+
+Installer only; the module is unchanged.
+
+- Installer: the check that `AMD_WS` is registered after `module load` ignored
+  Asterisk 20+. Asterisk 20 and later print `Info about Application` (capital
+  A) where 16 and 18 print `Info about application`, so on Asterisk 20 the
+  installer reported "application AMD_WS is not registered although the module
+  loaded" and restored the previous module. The check now ignores case.
+
 ## [2.0.2] - 2026-10-07
 
 Installer and documentation only; the module is unchanged (2.0.0).

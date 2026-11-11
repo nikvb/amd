@@ -168,3 +168,8 @@ grep 'AMD_WS:' /var/log/asterisk/full | tail
 ```
 
 Playbook: `docs/troubleshooting.md`.
+
+## PR review (OpenJev)
+
+For PR review: run openjev_ask.py on each changed file's diff with the risk question.
+Review every file rated "high" in detail. Include each file's rating and confidence in the summary.
