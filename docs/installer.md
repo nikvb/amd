@@ -10,7 +10,7 @@ fails if the embedded copies are stale).
 ## Running it
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y
 ```
 
 Or from a checkout: `./install.sh -y`. Run it as root on the telephony
@@ -19,7 +19,7 @@ server that runs Asterisk. It logs everything it prints to
 
 **Which URL:** until 2.0.0 is merged to `main` and tagged, the `main` URL
 still serves the 1.x installer. After the release use the tag,
-`https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh`, whose sha256
+`https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh`, whose sha256
 is published in the release notes; compare with `sha256sum install.sh` after
 downloading if you do not pipe into `bash`.
 
@@ -197,7 +197,7 @@ recommended (see [migration-v1-to-v2.md](migration-v1-to-v2.md)).
 ## Uninstall
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- --uninstall
 ```
 
 Unloads the module (softly; refused while in use, exit code 3 in that case,

@@ -56,7 +56,7 @@ Log in as **root** on the telephony server, then:
 As root on the ViciDial telephony server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y
 ```
 
 The installer detects the running Asterisk, obtains matching headers, installs
@@ -69,16 +69,16 @@ Common variants:
 
 ```bash
 # see what would happen, change nothing
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- --dry-run
 
 # also install the AMDY prompt (insert.wav) and use it as the playback argument
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --playfile
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y --playfile
 
 # no MySQL dependency, no DB lookup
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --no-db
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y --no-db
 
 # remove the module again
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- --uninstall
 ```
 
 All flags, exit codes and the header-resolution order are in
@@ -162,6 +162,12 @@ Set on every exit path:
 | `AMDELAPSED` | Milliseconds from the first captured audio frame to exit (from the application start when no audio was ever captured). New in 2.0.0. |
 | `AMDPHONE`, `AMDCOUNTRYCODE` | The phone number and country code that were sent to the service (from the `vicidial_auto_calls` lookup or from `p()`/`k()`); set only when known. Lets the dialplan redial the lead, e.g. after a call-screening verdict (see [docs/vicidial-call-screening.md](docs/vicidial-call-screening.md)). New in 2.0.0. |
 
+Read at the start (set it before `AMD_WS()`):
+
+| Variable | Use |
+|---|---|
+| `AMDWS_EXTRA` | One JSON object of at most 511 bytes, e.g. `{"client_ip":"203.0.113.7"}`. Its members go into the config frame for this call only. See [Per-call data](#per-call-data-amdws_extra). New in 2.1.0. |
+
 Status/cause matrix (frozen; each row names where the value comes from):
 
 | Situation | `AMDSTATUS` | `AMDCAUSE` | Same as |
@@ -199,7 +205,7 @@ campaigns): `--update-dialplan` (see [docs/installer.md](docs/installer.md));
 add `--dry-run` first to see the diff:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y --update-dialplan
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y --update-dialplan
 ```
 
 If you keep the EAGI script instead of the module, use
@@ -313,6 +319,46 @@ config frame when the row is missing or the column is empty.
 Ways to skip the lookup: `db=no` in `amd_ws.conf`, option `n` per call, or
 supply the values yourself with `p(<phone>)` / `k(<code>)`.
 
+### Per-call data (`AMDWS_EXTRA`)
+
+Set the channel variable `AMDWS_EXTRA` to one JSON object before `AMD_WS()`.
+The module adds its members to the config frame of this call, after the
+`extra_config` members of `amd_ws.conf`. Use it for data that changes per
+call, for example the IP address of the client on a gateway (`client_ip`):
+
+```text
+; chan_sip
+same => n,Set(AMDWS_EXTRA={"client_ip":"${CHANNEL(peerip)}"})
+; PJSIP (remote_addr is IP:port; CUT keeps the IPv4 address)
+same => n,Set(AMDWS_EXTRA={"client_ip":"${CUT(CHANNEL(pjsip,remote_addr),:,1)}"})
+same => n,AMD_WS(api.amdy.io,2700,${CALLERID(name)},10000)
+```
+
+The config frame of that call then is:
+
+```json
+{"config":{"sample_rate":8000,"VID":"V123","caller_id":"8284984137","client_ip":"203.0.113.7"}}
+```
+
+Rules:
+
+- The value must be one JSON object (`{...}`) of at most 511 bytes. The module
+  checks it with the Asterisk JSON parser. If the value is not valid, the
+  module ignores it, sends the normal frame and logs one warning (at most one
+  in 60 s): `AMDWS_EXTRA is not one JSON object of at most 511 bytes, ignored`.
+- An empty value or `{}` adds nothing.
+- If `AMDWS_EXTRA` and `extra_config` have the same key, the module sends the
+  key one time, with the `AMDWS_EXTRA` value. When both are set, the module
+  merges them with the Asterisk JSON library, so their members are sent in
+  compact form (no spaces).
+- Do not put `sample_rate` or `VID` in it. Use `p()`, `k()` and `i()` for
+  `phone`, `country_code` and `caller_id`.
+- `Set(__AMDWS_EXTRA=...)` (inherited) also works, for example when you set it
+  before `Dial()` and `AMD_WS()` runs on the called channel.
+- A dialplan value that contains `"` or `\` makes the JSON invalid. Use
+  values without these characters, such as IP addresses and IDs.
+- Trace (option `v` or `trace=yes`) shows the value in the `connected` line.
+
 ## Configuration reference
 
 `/etc/asterisk/amd_ws.conf` is optional; every key is optional. A commented
@@ -365,7 +411,7 @@ interval, the 2-mark / 3 s EOF finalisation).
 | `eof_wait_ms` | `3000` | How long the EOF finalisation waits for the server's reply (hangup still detected). No reply in time = `EOF_ERROR`. |
 | `send_caller_id` | `yes` | Send `${CALLERID(num)}` as `caller_id` in the config frame (when non-empty and not `Unknown`). Option `i(cid)` overrides the value. |
 | `trace` | `no` | Log the per-call event timeline at verbose 3 for every call (same as option `v`). |
-| `extra_config` | empty | JSON object spliced into the config frame for server-side options, e.g. `{"short_no_greeting":true,"detection_mode":"aggressive"}` (see `amd_ws.conf.sample`). Empty = the exact `amd.py` frame. |
+| `extra_config` | empty | JSON object spliced into the config frame for server-side options, e.g. `{"short_no_greeting":true,"detection_mode":"aggressive"}` (see `amd_ws.conf.sample`). Empty = the exact `amd.py` frame. Since 2.1.0 the value must be valid JSON (an invalid value is ignored with a warning). Per call: [`AMDWS_EXTRA`](#per-call-data-amdws_extra). |
 | `playdelay_ms` | `0` | Delay from the application start before `playfile` starts. |
 | `db` | `yes` | Enable the ViciDial phone/country lookup (only when compiled with MySQL support). |
 | `db_timeout_ms` | `1000` | Time budget for the lookup: bound for waiting on the shared connection; connect/read/write socket timeouts are this value rounded up to whole seconds (minimum 1). |

@@ -98,9 +98,28 @@ spliced verbatim after `caller_id`, e.g. with
 {"config":{"sample_rate":8000,"VID":"V123","phone":"8287356966","country_code":"1","caller_id":"8284984137","short_no_greeting":true,"detection_mode":"aggressive"}}
 ```
 
+Since 2.1.0 the module checks the value with the Asterisk JSON parser when it
+reads `amd_ws.conf`; an invalid value is ignored with a warning.
+
+### Per-call members (`AMDWS_EXTRA`)
+
+The channel variable `AMDWS_EXTRA` (one JSON object, at most 511 bytes) adds
+members for one call. They come after the `extra_config` members, e.g. with
+`Set(AMDWS_EXTRA={"client_ip":"203.0.113.7"})`:
+
+```json
+{"config":{"sample_rate":8000,"VID":"V123","caller_id":"8284984137","short_no_greeting":true,"client_ip":"203.0.113.7"}}
+```
+
+When both `extra_config` and `AMDWS_EXTRA` are set, the module merges the two
+objects (Asterisk JSON library, compact output): a key in both is sent once,
+with the `AMDWS_EXTRA` value, so the frame never has a duplicate key. An
+invalid value is ignored with a rate-limited warning and the frame is sent
+without it.
+
 Keys the service understands: `max_detection_time` (seconds), `short_no_greeting`,
 `detection_mode` (`aggressive` | `balanced` | `conservative`), `greeting_grace`,
-`stage_results`, `immediate_detection`. With `stage_results` the service replaces
+`stage_results`, `immediate_detection`, `client_ip`. With `stage_results` the service replaces
 empty acks by `STAGE-<stage>-<CLS>-<dur>-<conf>` progress frames; the module
 treats any reply starting with `STAGE-` as an acknowledgement.
 

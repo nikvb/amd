@@ -213,4 +213,9 @@ astguiclient_conf=/etc/astguiclient.conf
 ;   {"stage_results":true}           per-stage progress frames (STAGE-...); the
 ;                                    module treats them as acks.
 ; Several keys: {"short_no_greeting":true,"detection_mode":"aggressive"}
+; The value must be valid JSON; an invalid value is ignored with a warning.
+; Per-call members: set the channel variable AMDWS_EXTRA (a JSON object) before
+; AMD_WS(), e.g. Set(AMDWS_EXTRA={"client_ip":"${CHANNEL(peerip)}"}).  They are
+; added after these members; a key in both is sent once, with the AMDWS_EXTRA
+; value.
 extra_config=

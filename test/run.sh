@@ -755,6 +755,7 @@ check_asserts() { # vid asserts -> appends failures to A_FAIL, notes to A_NOTE
 				country=*) extra+=(--country "${v#country=}"); ph_given=1 ;;
 				callerid=*) extra+=(--callerid "${v#callerid=}"); cid_given=1 ;;
 				schedule=*) extra+=(--schedule "${v#schedule=}") ;;
+				extra=*) extra+=(--extra "${v#extra=}") ;;
 				*) checks+="$v," ;;
 				esac
 			done
@@ -1129,7 +1130,8 @@ check_unload_cycle() {
 		-e 's/^result_grace_ms *=.*/result_grace_ms = 250/' -e 's/^send_caller_id *=.*/send_caller_id = no/' \
 		-e 's/^eof_wait_ms *=.*/eof_wait_ms = 2500/' -e 's/^eof_no_audio_streak *=.*/eof_no_audio_streak = 0/' \
 		-e 's/^fallback_interval_ms *=.*/fallback_interval_ms = 1000/' \
-		-e 's/^db *=.*/db = no/' -e 's/^max_pending_connects *=.*/max_pending_connects = 9/'
+		-e 's/^db *=.*/db = no/' -e 's/^max_pending_connects *=.*/max_pending_connects = 9/' \
+		-e '$a extra_config = {"short_no_greeting":true, "client_ip":"192.0.2.1"}'
 	out=$(ast_cli 'module reload app_amd_ws.so')
 	if hasi "$out" 'error\|No such'; then
 		row FAIL module_reload - - - "'$(echo "$out" | head -1)'"
@@ -1145,10 +1147,15 @@ check_unload_cycle() {
 		has "$st" '^ *fallback_interval_ms: 1000$' || bad+="fallback_interval_ms "
 		has "$st" '^ *db *: No' || bad+="db "
 		has "$st" '^ *max_pending_connects: 9 ' || bad+="max_pending_connects "
-		if [ -z "$bad" ]; then row PASS module_reload - - - "'$(echo "$out" | head -1 | tr -s ' ')'; timeout_ms/send_schedule/result_grace_ms/send_caller_id/eof_wait_ms/eof_no_audio_streak/fallback_interval_ms/db/max_pending_connects re-read"
+		has "$st" '^ *extra_config *: {"short_no_greeting":true, "client_ip":"192\.0\.2\.1"}$' || bad+="extra_config "
+		if [ -z "$bad" ]; then row PASS module_reload - - - "'$(echo "$out" | head -1 | tr -s ' ')'; timeout_ms/send_schedule/result_grace_ms/send_caller_id/eof_wait_ms/eof_no_audio_streak/fallback_interval_ms/db/max_pending_connects/extra_config re-read"
 		else row FAIL module_reload - - - "after reload the CLI still shows the old value(s) of: $bad"; fi
 		if ri=$(scenario_index reload_effect); then
 			log "scenario reload_effect (after module reload: send_schedule=500, send_caller_id=no)"
+			run_call_scenario "$ri"
+		fi
+		if ri=$(scenario_index reload_extra); then
+			log "scenario reload_extra (after module reload: extra_config + AMDWS_EXTRA, same key client_ip)"
 			run_call_scenario "$ri"
 		fi
 		if ri=$(scenario_index reload_fallback); then
@@ -1161,6 +1168,7 @@ check_unload_cycle() {
 	st=$(ast_cli 'amd_ws show settings')
 	has "$st" '^ *timeout_ms *: 10000$' && has "$st" '^ *send_schedule *: 500,1000,1500,2000,3000,4000,5000,6000,7000,8000,9000$' \
 		&& has "$st" '^ *send_caller_id *: Yes' && has "$st" '^ *eof_no_audio_streak *: 2$' \
+		&& has "$st" '^ *extra_config *: (none' \
 		|| row FAIL module_reload_restore - - - "config not restored after the second reload: $(printf '%s\n' "$st" | grep -E 'timeout_ms|send_schedule|send_caller_id|eof_no_audio' | tr -s ' ' | tr '\n' ';')"
 }
 
@@ -1180,6 +1188,7 @@ LOG_NOISE_ALLOW=(
 	'res_http_websocket.c: Unable to retrieve HTTP status line\.'            # blackhole_release: parked helpers see FIN
 	'app_amd_ws.c: AMD_WS: .* invalid options .*digits masked'               # bad_options (digits masked in the warning)
 	"app.c: Missing closing parenthesis for argument 'k' in string '1'"       # bad_options: the core's own parser (prints only the unterminated argument)
+	'app_amd_ws.c: AMD_WS: .* AMDWS_EXTRA is not one JSON object'            # amdws_extra_bad / amdws_extra_badjs (rate-limited)
 )
 check_log_noise() { # no WARNING/ERROR in the Asterisk log other than the intentionally provoked ones
 	local all n_all n_left left pat
@@ -1265,7 +1274,7 @@ main() {
 		local i; for i in "${!S_NAME[@]}"; do printf '%-20s %-6s %-5s %-18s %-24s %s\n' "${S_NAME[$i]}" "${S_TAGS[$i]}" "${S_COUNT[$i]}" "${S_FAR[$i]}" "${S_MOCK[$i]}" "${S_AMD[$i]}"; done
 		echo "checks (also accepted by --only): sounds no_listeners classify_parity mock_paths log_noise (self, run in both modes);"
 		echo "  cli_show_application cli_show_settings soak_fd_rss log_lines blackhole_release (amd);"
-		echo "  unload_busy = the unload/reload cycle: rows unload_busy_refused unload_idle load_again module_reload + probes reload_effect, reload_fallback (amd)"
+		echo "  unload_busy = the unload/reload cycle: rows unload_busy_refused unload_idle load_again module_reload + probes reload_effect, reload_extra, reload_fallback (amd)"
 		echo "always: build_nomysql build_mysql (full mode), shutdown_clean"
 		exit 0
 	fi

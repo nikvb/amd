@@ -122,7 +122,8 @@ Installer checks without touching the system: `./install.sh --dry-run`,
   `GotoIf($["${AMDCAUSE}" = "CONNECTION_ERROR" | "${AMDCAUSE}" = "PROCESSING_ERROR" | "${AMDCAUSE}" = "FATAL_ERROR"]?amd_fallback:continue)`
   must keep working. Full table with sources: README "Channel variables".
 - Wire: config frame `{"config":{"sample_rate":8000,"VID":"..."[,"phone":..][,"country_code":..][,"caller_id":..]}}`
-  (keys in this order), binary slin chunks at `send_schedule`
+  (keys in this order; then the `extra_config` members, then the per-call
+  `AMDWS_EXTRA` members, both empty by default), binary slin chunks at `send_schedule`
   (`500,...,9000`) then every `chunk_bytes` or `fallback_interval_ms`, EOF
   finalisation after `eof_no_audio_streak` empty marks, `{"eof":1}`, CLOSE
   1000. Classification exactly as `amd.py`: `'HUMAN' in text` → HUMAN, else

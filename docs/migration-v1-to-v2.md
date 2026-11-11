@@ -204,7 +204,7 @@ never touched).
    checkout of the branch:
 
    ```bash
-   curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.4/install.sh | bash -s -- -y
+   curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.1.0/install.sh | bash -s -- -y
    ```
 
    It backs up the 1.x module to `app_amd_ws.so.bak.<timestamp>`, builds
