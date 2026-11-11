@@ -56,7 +56,7 @@ Log in as **root** on the telephony server, then:
 As root on the ViciDial telephony server:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y
 ```
 
 The installer detects the running Asterisk, obtains matching headers, installs
@@ -69,16 +69,16 @@ Common variants:
 
 ```bash
 # see what would happen, change nothing
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- --dry-run
 
 # also install the AMDY prompt (insert.wav) and use it as the playback argument
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y --playfile
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y --playfile
 
 # no MySQL dependency, no DB lookup
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- -y --no-db
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- -y --no-db
 
 # remove the module again
-curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.1/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/nikvb/amd/v2.0.3/install.sh | bash -s -- --uninstall
 ```
 
 All flags, exit codes and the header-resolution order are in
